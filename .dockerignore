@@ -1,0 +1,13 @@
+.git
+.env
+*.db
+*.xlsx
+mineru_output/
+input_pdfs/
+processed_pdfs/
+failed_pdfs/
+obsidian_vault/
+__pycache__/
+*.pyc
+test_output/
+data/

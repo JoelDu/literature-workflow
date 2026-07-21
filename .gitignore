@@ -1,0 +1,28 @@
+# 密钥与环境
+.env
+.env.bak
+*.pem
+*_key.txt
+# 数据库与大文件
+*.db
+*.db-shm
+*.db-wal
+*.db.bak.*
+pdf.tmp
+# 环境/缓存
+.venv
+venv/
+__pycache__/
+*.py[cod]
+# 日志/生成物
+*.log
+*.csv
+*.xlsx
+*.docx
+output/
+test_output/
+obsidian_vault/
+data/
+# 本地设置
+.claude/
+.git_broken_backup/

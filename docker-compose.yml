@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  literature-analyzer:
+    build:
+      context: .
+      network: host
+    container_name: lit_analyzer
+    restart: always
+    # ── 全局共享 Key 文件 ──
+    env_file:
+      - /opt/docker_shared/api_keys.env
+    environment:
+      # ── 项目专属配置 ──
+      - TZ=Asia/Shanghai
+      - RUN_MODE=batch
+      - BATCH_PREPARE_TIME=01:00
+      - BATCH_FETCH_TIME_1=07:30
+      - BATCH_FETCH_TIME_2=13:30
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - ALL_PROXY=${ALL_PROXY:-}
+      - WEBHOOK_URL=
+      # 数据文件路径
+      - DB_PATH=./data/batch_tracking.db
+      - EXCEL_OUTPUT_PATH=./data/knowledge_base.xlsx
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # 所有数据目录统一挂载自 /mnt/ripe/literature_analyzer_data/
+      - /mnt/ripe/literature_analyzer_data/input_pdfs:/app/input_pdfs
+      - /mnt/ripe/literature_analyzer_data/processed_pdfs:/app/processed_pdfs
+      - /mnt/ripe/literature_analyzer_data/failed_pdfs:/app/failed_pdfs
+      - /mnt/ripe/literature_analyzer_data/mineru_output:/app/mineru_output
+      - /mnt/ripe/literature_analyzer_data/obsidian_磷化工文献:/app/obsidian_vault
+      - /mnt/ripe/literature_analyzer_data:/app/data
+    # 默认启动常驻守护进程
+    command: ["python", "daemon.py"]

@@ -1,0 +1,14 @@
+pandas
+openpyxl
+langdetect
+openai
+google-genai
+rich
+jinja2
+requests
+python-dotenv
+pydantic
+httpx
+schedule
+tenacity
+numpy
