@@ -138,7 +138,8 @@ def cmd_outline(args):
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
     embedder = _make_embedder(client)
     console.print(f"[cyan]正在为主题「{args.topic}」生成综述大纲...")
-    outline = generate_outline(args.topic, store, embedder, client, model, settings, console)
+    outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
+                               focus=args.focus or "", n_sections=args.sections or 0)
     console.rule(f"[bold green]📋 {outline.title}")
     for i, sec in enumerate(outline.sections, 1):
         console.print(f"[bold]{i}. {sec.heading}[/bold]")
@@ -167,14 +168,28 @@ def cmd_generate(args):
     paper_meta = store.get_paper_meta()
     t0 = time.time()
 
+    focus = args.focus or ""
+
     # Stage A
     if args.outline:
         outline = load_outline_file(args.outline, args.topic)
         console.print(f"[cyan]使用外部大纲: {outline.title}（{len(outline.sections)} 章节）")
     else:
         console.print(f"[cyan]阶段 A：生成大纲...")
-        outline = generate_outline(args.topic, store, embedder, client, model, settings, console)
+        outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
+                                   focus=focus, n_sections=args.sections or 0)
         console.print(f"[green]✔ 大纲: {outline.title}（{len(outline.sections)} 章节）")
+
+    # 字数分配：--words 指定全文目标总字数时，按章节数摊分正文、引言/结论各占约 8%
+    if args.words:
+        ic_target = max(300, min(800, int(args.words * 0.08)))
+        body_per_section = max(400, (args.words - 2 * ic_target) // max(1, len(outline.sections)))
+        section_words = (int(body_per_section * 0.85), int(body_per_section * 1.15))
+        ic_words = (int(ic_target * 0.8), int(ic_target * 1.2))
+        console.print(f"[dim]目标总字数 {args.words}：每章节 {section_words[0]}-{section_words[1]} 字，"
+                      f"引言/结论各 {ic_words[0]}-{ic_words[1]} 字")
+    else:
+        section_words, ic_words = (600, 1000), (300, 500)
 
     # Stage B
     section_evidence = []
@@ -207,7 +222,8 @@ def cmd_generate(args):
             console.print(f"  [yellow]⚠️ 无证据，跳过该章节。")
             continue
         try:
-            drafts.append(write_section(sec, evs, paper_meta, outline.title, client, model))
+            drafts.append(write_section(sec, evs, paper_meta, outline.title, client, model,
+                                        words=section_words, focus=focus))
         except Exception as e:
             failed_sections.append(sec.heading)
             console.print(f"  [red]✖ 章节撰写失败（跳过）: {e}")
@@ -216,7 +232,8 @@ def cmd_generate(args):
         sys.exit(1)
     console.print("[cyan]阶段 C：撰写引言与结论...")
     try:
-        intro, conclusion = write_intro_conclusion(outline, drafts, client, model)
+        intro, conclusion = write_intro_conclusion(outline, drafts, client, model,
+                                                   ic_words=ic_words, focus=focus)
     except Exception as e:
         console.print(f"[yellow]⚠️ 引言/结论生成失败（正文保留）: {e}")
         intro, conclusion = "", ""
@@ -267,11 +284,16 @@ def main():
     p = sub.add_parser("outline", help="生成综述大纲")
     p.add_argument("topic")
     p.add_argument("-o", "--output", help="保存大纲 JSON 的路径")
+    p.add_argument("--focus", help="侧重方向（如：侧重工业应用与成本对比）")
+    p.add_argument("--sections", type=int, help="主体章节数（默认由模型定 3-6 个）")
     p.set_defaults(func=cmd_outline)
 
     p = sub.add_parser("generate", help="生成完整综述")
     p.add_argument("topic")
     p.add_argument("--outline", help="外部大纲文件（JSON 或 markdown）")
+    p.add_argument("--focus", help="侧重方向，贯穿大纲设计与全文写作（如：侧重环保型材料与降解机理）")
+    p.add_argument("--words", type=int, help="目标总字数（自动摊分到各章节与引言/结论）")
+    p.add_argument("--sections", type=int, help="主体章节数（默认由模型定 3-6 个）")
     p.add_argument("--dry-run", action="store_true", help="停在证据阶段，打印证据表")
     p.set_defaults(func=cmd_generate)
 

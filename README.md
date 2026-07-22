@@ -144,8 +144,15 @@ python review.py index [--force]     # 手动建/重建向量索引（换嵌入�
 python review.py enrich [--no-llm]   # 提取结构化元数据：中英标题/DOI/图表/参考文献 → paper_details 等新表
 python review.py search "关键词"      # 检索调试（默认走重排序，--no-rerank 看纯向量结果）
 python review.py outline "主题" -o outline.json   # 只生成大纲（可手工编辑后再传入 generate）
-python review.py generate "主题" [--outline outline.json] [--dry-run]
+python review.py generate "主题" [--outline outline.json] [--dry-run] \
+    [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数]
 ```
+
+生成参数说明：
+- `--focus`：侧重方向（如"侧重环保型材料与降解机理"），贯穿大纲设计、每章写作和引言结论；
+- `--words`：目标总字数，自动摊分到各章节（引言/结论各约 8%）；不指定时每章 600-1000 字；
+- `--sections`：主体章节数；不指定时由模型自定 3-6 个；
+- `--outline`：外部大纲文件（JSON 或 `## 章节标题` + `- 检索问题` 格式的 markdown），完全手工控制章节与检索方向，指定后跳过大纲生成。
 
 - **检索链路**：Qwen3-Embedding-8B（4096 维，跨中英）向量召回 50 候选 → Qwen3-Reranker-8B 重排取 top 24 → DeepSeek-V4-Pro 逐条打分提炼证据（≥6 分保留）→ 只依据证据写作并强制引用标记 → 全局编号与 GB/T 7714 风格参考文献（含 DOI）。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。

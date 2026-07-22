@@ -101,7 +101,8 @@ def _chat_json(client, model: str, prompt: str) -> dict:
 
 # ── Stage A：大纲 ─────────────────────────────────────────────────────────────
 
-def generate_outline(topic: str, store, embedder, client, model, settings, console) -> Outline:
+def generate_outline(topic: str, store, embedder, client, model, settings, console,
+                     focus: str = "", n_sections: int = 0) -> Outline:
     meta = store.get_paper_meta()
     if not meta:
         raise RuntimeError("文献库为空，无法生成大纲。请先运行主管道处理文献。")
@@ -130,7 +131,11 @@ def generate_outline(topic: str, store, embedder, client, model, settings, conso
         line = f"[{i}] 《{m['title']}》({m['year'] or '年份不详'}) {m['tldr']}"
         digest_lines.append(line[:300])
 
+    section_rule = f"恰好 {n_sections} 个主体章节" if n_sections else "3-6 个主体章节"
+    focus_line = (f"\n5. 用户指定的综述侧重方向：{focus}。章节设计必须围绕该侧重展开，"
+                  f"与该侧重关系不大的方向不设章节。") if focus else ""
     prompt = prompts.OUTLINE_PROMPT.format(n=len(digest_lines), topic=topic,
+                                           section_rule=section_rule, focus_line=focus_line,
                                            paper_digest="\n".join(digest_lines))
     data = _chat_json(client, model, prompt)
     outline = Outline.from_dict(data, topic=topic)
@@ -272,7 +277,8 @@ def _best_title(meta: dict) -> str:
 
 
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
-                  review_title: str, client, model, id_prefix_len: int = 8) -> SectionDraft:
+                  review_title: str, client, model, id_prefix_len: int = 8,
+                  words: tuple = (600, 1000), focus: str = "") -> SectionDraft:
     blocks = []
     valid_prefixes = set()
     for i, ev in enumerate(evidence, 1):
@@ -284,9 +290,11 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
             f"（{m.get('year') or '年份不详'}）《{_best_title(m)}》 引用标记 [@{prefix}]\n"
             f"     证据：{ev.summary}"
         )
+    focus_line = f"\n6. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
     prompt = prompts.WRITE_SECTION_PROMPT.format(
         review_title=review_title, heading=section.heading,
-        evidence_blocks="\n".join(blocks))
+        evidence_blocks="\n".join(blocks),
+        words_min=words[0], words_max=words[1], focus_line=focus_line)
     text = _chat(client, model, prompt, json_mode=False).strip()
 
     # 丢弃不在证据集中的引用标记（幻觉引用）
@@ -303,11 +311,14 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
     return SectionDraft(heading=section.heading, markdown=text, cited_doc_ids=cited)
 
 
-def write_intro_conclusion(outline: Outline, drafts: list, client, model) -> tuple:
+def write_intro_conclusion(outline: Outline, drafts: list, client, model,
+                           ic_words: tuple = (300, 500), focus: str = "") -> tuple:
     summaries = "\n".join(
         f"## {d.heading}\n{d.markdown[:200]}..." for d in drafts)
+    focus_line = f"\n4. 本综述整体侧重方向：{focus}，引言的意义阐述与结论的展望均围绕它展开。" if focus else ""
     prompt = prompts.INTRO_CONCLUSION_PROMPT.format(
-        review_title=outline.title, topic=outline.topic, section_summaries=summaries)
+        review_title=outline.title, topic=outline.topic, section_summaries=summaries,
+        ic_min=ic_words[0], ic_max=ic_words[1], focus_line=focus_line)
     data = _chat_json(client, model, prompt)
     return str(data.get("intro", "")), str(data.get("conclusion", ""))
 
