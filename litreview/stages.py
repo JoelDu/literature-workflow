@@ -28,7 +28,8 @@ def _get_fallback_client():
             from openai import OpenAI
             _fallback["client"] = OpenAI(
                 api_key=key,
-                base_url=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"))
+                base_url=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"),
+                timeout=180)
             _fallback["model"] = "deepseek-chat"
     return _fallback["client"], _fallback["model"]
 

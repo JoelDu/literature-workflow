@@ -75,7 +75,7 @@ class MinerUClient:
                 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8), retry=retry_if_exception_type(requests.RequestException), reraise=True)
                 def upload_file():
                     with open(pdf_path, "rb") as f:
-                        return requests.put(upload_url, data=f, timeout=120)
+                        return requests.put(upload_url, data=f, headers={"Content-Type": ""}, timeout=120)
                         
                 resp2 = upload_file()
                 if resp2.status_code != 200:

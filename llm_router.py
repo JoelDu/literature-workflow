@@ -35,7 +35,7 @@ def make_deepseek_client(deepseek_api_key: str = None, quiet: bool = False):
     sf_base = os.getenv("SILICONFLOW_API_BASE")
 
     if sf_key and sf_base:
-        client = OpenAI(api_key=sf_key, base_url=sf_base)
+        client = OpenAI(api_key=sf_key, base_url=sf_base, timeout=180)
         model = os.getenv("DEEPSEEK_MODEL", "deepseek-ai/DeepSeek-V3")
         if not quiet:
             print(f"[LLM Router] 正在使用 硅基流动 (SiliconFlow) {model} 进行无损文献分析。")
@@ -43,6 +43,7 @@ def make_deepseek_client(deepseek_api_key: str = None, quiet: bool = False):
         client = OpenAI(
             api_key=deepseek_api_key or os.getenv("DEEPSEEK_API_KEY", ""),
             base_url=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"),
+            timeout=180,
         )
         model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
         if not quiet:
