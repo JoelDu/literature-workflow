@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y mupdf-tools git && rm -rf /var/lib/apt/
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN pip install --no-cache-dir PyPDF2
 RUN git clone --depth 1 https://github.com/caj2pdf/caj2pdf.git /app/caj2pdf-src
+# 把 caj2pdf 装成可执行命令（wrapper 保证 sys.path 指向源码目录，模块导入正常）
+RUN printf '#!/bin/sh\nexec python3 /app/caj2pdf-src/caj2pdf "$@"\n' > /usr/local/bin/caj2pdf \
+    && chmod +x /usr/local/bin/caj2pdf
 
 # 拷贝项目文件
 COPY . .

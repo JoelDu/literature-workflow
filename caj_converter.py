@@ -75,7 +75,7 @@ def convert_caj_files():
         try:
             # 命令行直接运行 caj2pdf showinfo 校验，或者直接 convert
             result = subprocess.run(
-                ["caj2pdf", "convert", caj_path, pdf_path],
+                ["caj2pdf", "convert", caj_path, "-o", pdf_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True
