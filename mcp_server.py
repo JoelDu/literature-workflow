@@ -181,6 +181,7 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
     from litreview.models import Outline
     from litreview.stages import (generate_outline as _gen, gather_evidence, write_section,
                                   write_intro_conclusion, assemble_review, render_review_note)
+    from litreview.figures import select_section_figures
     job = _jobs[job_id]
     buf = io.StringIO()
     console = Console(file=buf, no_color=True, width=100)
@@ -205,12 +206,15 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             log(f"大纲完成：{outline.title}（{len(outline.sections)} 章节）")
 
         if words:
-            ic_target = max(300, min(800, int(words * 0.08)))
-            per = max(400, (words - 2 * ic_target) // max(1, len(outline.sections)))
+            intro_target = max(300, min(900, int(words * 0.12)))
+            concl_target = max(350, min(1100, int(words * 0.15)))
+            per = max(400, (words - intro_target - concl_target)
+                      // max(1, len(outline.sections)))
             section_words = (int(per * 0.85), int(per * 1.15))
-            ic_words = (int(ic_target * 0.8), int(ic_target * 1.2))
+            intro_words = (int(intro_target * 0.8), int(intro_target * 1.2))
+            concl_words = (int(concl_target * 0.8), int(concl_target * 1.2))
         else:
-            section_words, ic_words = (600, 1000), (300, 500)
+            section_words, intro_words, concl_words = (600, 1000), (300, 500), (400, 700)
 
         section_evidence = []
         for i, sec in enumerate(outline.sections, 1):
@@ -221,20 +225,27 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             log(f"  保留 {len(ev)} 条证据")
 
         drafts = []
+        used_figures = set()
         for i, (sec, evs) in enumerate(zip(outline.sections, section_evidence), 1):
             if not evs:
                 log(f"阶段 C：章节 [{i}] {sec.heading} 无证据，跳过")
                 continue
             log(f"阶段 C：撰写章节 [{i}/{len(outline.sections)}] {sec.heading}")
-            drafts.append(write_section(sec, evs, paper_meta, outline.title, client, model,
-                                        words=section_words, focus=focus))
+            draft = write_section(sec, evs, paper_meta, outline.title, client, model,
+                                  words=section_words, focus=focus)
+            n_figs = select_section_figures(store, reranker, sec, draft, settings,
+                                            console, used_figures)
+            if n_figs:
+                log(f"  插入相关图表 {n_figs} 幅")
+            drafts.append(draft)
         if not drafts:
             raise RuntimeError("所有章节均无证据，请检查主题与文献库是否匹配。")
 
         log("阶段 C：撰写引言与结论...")
         try:
             intro, conclusion = write_intro_conclusion(outline, drafts, client, model,
-                                                       ic_words=ic_words, focus=focus)
+                                                       intro_words=intro_words,
+                                                       concl_words=concl_words, focus=focus)
         except Exception as e:
             log(f"引言/结论生成失败（正文保留）: {e}")
             intro, conclusion = "", ""

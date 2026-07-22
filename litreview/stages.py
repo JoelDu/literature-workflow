@@ -312,13 +312,15 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
 
 
 def write_intro_conclusion(outline: Outline, drafts: list, client, model,
-                           ic_words: tuple = (300, 500), focus: str = "") -> tuple:
+                           intro_words: tuple = (300, 500),
+                           concl_words: tuple = (400, 700), focus: str = "") -> tuple:
     summaries = "\n".join(
         f"## {d.heading}\n{d.markdown[:200]}..." for d in drafts)
     focus_line = f"\n4. 本综述整体侧重方向：{focus}，引言的意义阐述与结论的展望均围绕它展开。" if focus else ""
     prompt = prompts.INTRO_CONCLUSION_PROMPT.format(
         review_title=outline.title, topic=outline.topic, section_summaries=summaries,
-        ic_min=ic_words[0], ic_max=ic_words[1], focus_line=focus_line)
+        intro_min=intro_words[0], intro_max=intro_words[1],
+        concl_min=concl_words[0], concl_max=concl_words[1], focus_line=focus_line)
     data = _chat_json(client, model, prompt)
     return str(data.get("intro", "")), str(data.get("conclusion", ""))
 

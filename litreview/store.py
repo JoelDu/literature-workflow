@@ -284,6 +284,23 @@ class VectorStore:
         conn.close()
         return rows
 
+    def get_assets_for_docs(self, doc_ids: list, captioned_only: bool = True) -> list:
+        """返回指定文献的图表资产 [{doc_id, asset_type, img_path, caption, page_idx}]，供综述插图选图。"""
+        if not doc_ids:
+            return []
+        conn = self._conn()
+        c = conn.cursor()
+        placeholders = ",".join("?" * len(doc_ids))
+        sql = f"""SELECT doc_id, asset_type, img_path, caption, page_idx
+                  FROM paper_assets WHERE doc_id IN ({placeholders})"""
+        if captioned_only:
+            sql += " AND caption != ''"
+        c.execute(sql, list(doc_ids))
+        rows = [{"doc_id": r[0], "asset_type": r[1], "img_path": r[2],
+                 "caption": r[3], "page_idx": r[4]} for r in c.fetchall()]
+        conn.close()
+        return rows
+
     def save_enrichment(self, doc_id: str, details: dict, assets: list, refs: list) -> None:
         """单文档单事务写入 paper_details / paper_assets / paper_references。"""
         conn = self._conn()
