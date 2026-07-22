@@ -157,3 +157,40 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
 - **检索链路**：Qwen3-Embedding-8B（4096 维，跨中英）向量召回 50 候选 → Qwen3-Reranker-8B 重排取 top 24 → DeepSeek-V4-Pro 逐条打分提炼证据（≥6 分保留）→ 只依据证据写作并强制引用标记 → 全局编号与 GB/T 7714 风格参考文献（含 DOI）。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。
 - 配置见 `.env.example` 的 litreview 段；依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`。
+
+## 🔌 MCP Server（在大模型对话中直接调用）
+
+`mcp_server.py` 把文献库检索与综述撰写打包成标准 MCP server（stdio），可被 Claude Code / Claude Desktop / Cherry Studio 等任意 MCP 客户端调用。
+
+**提供 6 个工具**：
+
+| 工具 | 说明 |
+|---|---|
+| `library_status` | 文献库概况（篇数/索引/元数据覆盖） |
+| `search_literature(query, top_k)` | 语义检索文献片段（向量召回 + 重排序，跨中英） |
+| `get_paper_info(keyword, limit)` | 按标题/关键词查论文的结构化元数据（DOI/作者/期刊/TLDR） |
+| `generate_outline(topic, focus, sections)` | 生成综述大纲 JSON（同步，约 1 分钟） |
+| `start_review(topic, focus, words, sections, outline_json)` | 后台启动完整综述生成，立即返回 job_id |
+| `review_status(job_id)` | 查询生成进度/日志尾部/产出文件路径 |
+
+综述生成耗时 7-30 分钟（取决于模型），远超 MCP 工具调用超时，所以采用**后台任务模式**：`start_review` 秒回 job_id，之后随时用 `review_status` 轮询，完成后返回 Obsidian 笔记路径。
+
+**注册（Claude Code）**：
+
+```bash
+claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_server.sh
+```
+
+**其他客户端（Claude Desktop / Cherry Studio 等）** 的 `mcpServers` 配置：
+
+```json
+{
+  "mcpServers": {
+    "literature-review": {
+      "command": "/home/dudu/GoogleDrive/Antigravity/literature_analyzer/mcp_server.sh"
+    }
+  }
+}
+```
+
+`mcp_server.sh` 负责加载密钥（`/opt/docker_shared/api_keys.env`）、清理代理变量、指向生产数据库后启动 server；换机器部署时只需改脚本里的三个路径。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
