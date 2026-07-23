@@ -4,10 +4,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import json
+
 from pypdf import PdfReader, PdfWriter
 
 from litreview.bookintake import (split_pdf_if_needed, stitch_markdown,
-                                  _local_book_meta, _looks_chinese)
+                                  _local_book_meta, _looks_chinese,
+                                  collect_book_assets)
 from litreview.models import Outline, OutlineSection, SectionDraft
 from litreview.stages import assemble_review
 
@@ -50,6 +53,21 @@ def test_local_book_meta_regex():
 def test_looks_chinese():
     assert _looks_chinese("化工原理第三版")
     assert not _looks_chinese("chemical engineering basics")
+
+
+def test_collect_book_assets_path_and_page_offset(tmp_path):
+    """各 part 的图资产：img_path 前缀成 mineru_output 根相对路径，page_idx 跨 part 偏移。"""
+    for i, (img, pg) in enumerate([("a.jpg", 3), ("b.jpg", 5)], 1):
+        d = tmp_path / f"part{i}"
+        d.mkdir()
+        blocks = [{"type": "image", "img_path": f"images/{img}",
+                   "image_caption": [f"图{i}"], "page_idx": pg}]
+        (d / "p_content_list.json").write_text(json.dumps(blocks), encoding="utf-8")
+    assets = collect_book_assets(str(tmp_path), "BOOK_书_deadbeef", n_parts=2, max_pages=180)
+    assert assets[0]["img_path"] == "BOOK_书_deadbeef/part1/images/a.jpg"
+    assert assets[0]["page_idx"] == 3
+    assert assets[1]["img_path"] == "BOOK_书_deadbeef/part2/images/b.jpg"
+    assert assets[1]["page_idx"] == 5 + 180   # part2 偏移一份页数
 
 
 def test_book_citation_is_monograph_M():

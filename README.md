@@ -156,12 +156,13 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
 
 - **检索链路**：Qwen3-Embedding-8B（4096 维，跨中英）向量召回 50 候选 → Qwen3-Reranker-8B 重排取 top 24 → DeepSeek-V4-Pro 逐条打分提炼证据（≥6 分保留）→ 只依据证据写作并强制引用标记 → 全局编号与 GB/T 7714 风格参考文献（含 DOI）。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。
+- **自动插图**：写完每章后，从本章已引用文献（论文或教材）的 `paper_assets` 里按图题与本章主题的重排相关度挑图（过阈值），把真实图片复制进 `reviews/assets/` 并插入正文，图注随全文统一编号。图片会一并嵌入导出的 Word（pandoc `--resource-path` 指向 .md 目录解析相对图路径）。
 - **输出格式**：标准论文式章节编号（`1 引言` → `2..N` 正文各章 → `N+1 结论与展望`），末尾 `参考文献` 不编号；不含摘要/关键字块。生成 Markdown（写入 Obsidian `reviews` 目录）的同时，用 pandoc 自动导出同名 `.docx`（导出前去掉 Obsidian wikilink 后缀，参考文献逐条独立成段），Word 导出失败不影响 markdown 主流程。参考文献按类型区分：论文 `[J]`（带 DOI + Obsidian 回链），教材/图书 `[M]`（`作者. 书名[M]. 版本. 出版地: 出版者, 年.`，无 DOI/回链）。
 - 配置见 `.env.example` 的 litreview 段；依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`；Word 导出依赖系统装有 `pandoc`。
 
 ### 📖 教材/书籍入库（轻量检索语料）
 
-教材、图书可作为**检索语料**加入文献库，供 `search` 与综述引用——但**不做 LLM 全文分析、不生成 Obsidian 笔记**（省钱），只解析成文本入检索库并写一行 Excel：
+教材、图书可作为**检索语料**加入文献库，供 `search` 与综述引用——但**不做 LLM 全文分析、不生成 Obsidian 笔记**（省钱），解析成文本入检索库、抽图入 `paper_assets`（综述可引用教材里的图）、并写一行 Excel：
 
 ```bash
 python review.py add-book 某教材.pdf            # 单本

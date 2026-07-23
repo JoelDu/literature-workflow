@@ -57,6 +57,26 @@ def stitch_markdown(parts_md: list) -> str:
     return "\n\n".join(m.strip() for m in parts_md if m and m.strip())
 
 
+def collect_book_assets(out_root: str, folder_base: str, n_parts: int, max_pages: int) -> list:
+    """从各 part 的 content_list.json 汇总图/表资产，供综述插图引用。
+    img_path 前缀成相对 mineru_output 根的路径（folder_base/part{i}/images/...），
+    page_idx 按 part 顺序偏移为整本页码。复用 enrich 的本地解析器。"""
+    from .enrich import _load_content_list, parse_content_list
+    assets = []
+    for i in range(1, n_parts + 1):
+        part_dir = os.path.join(out_root, f"part{i}")
+        blocks = _load_content_list(part_dir)
+        if not blocks:
+            continue
+        parsed = parse_content_list(blocks, f"{folder_base}/part{i}")
+        offset = (i - 1) * max_pages
+        for a in parsed["assets"]:
+            if a.get("page_idx") is not None:
+                a["page_idx"] = a["page_idx"] + offset
+            assets.append(a)
+    return assets
+
+
 def _looks_chinese(text: str) -> bool:
     """CJK 字符占比 > 20% 判为中文（避免为语言判定再花一次 LLM）。"""
     if not text:
@@ -133,6 +153,9 @@ def add_book(pdf_path: str, settings, console, client=None,
         conn.close()
         raise RuntimeError("MinerU 未返回任何 markdown 内容")
 
+    # 抽取书内图/表 → paper_assets，让综述能引用教材里的图（引用该书的章节时候选）
+    book_assets = collect_book_assets(out_root, f"BOOK_{title}_{doc_id[:8]}", len(parts), max_pages)
+
     lang = "zh" if _looks_chinese(md_text[:3000]) else "en"
     meta = extract_book_meta(md_text[:3000], pdf_path, client, settings, use_llm=use_llm)
 
@@ -157,9 +180,11 @@ def add_book(pdf_path: str, settings, console, client=None,
         "publisher": meta.get("publisher", ""), "pub_place": meta.get("pub_place", ""),
         "edition": meta.get("edition", ""), "year": meta.get("year", ""),
         "isbn": meta.get("isbn", ""), "journal": "", "doi": "", "keywords": "",
-        "n_figures": 0, "n_tables": 0, "source": meta.get("source", "local"),
+        "n_figures": sum(1 for a in book_assets if a["asset_type"] in ("image", "chart")),
+        "n_tables": sum(1 for a in book_assets if a["asset_type"] == "table"),
+        "source": meta.get("source", "local"),
     }
-    store.save_enrichment(doc_id, details, assets=[], refs=[])
+    store.save_enrichment(doc_id, details, assets=book_assets, refs=[])
 
     export_to_excel([{
         "文献ID": doc_id, "标题": title, "文献类型": "教材/图书",
@@ -172,7 +197,9 @@ def add_book(pdf_path: str, settings, console, client=None,
 
     log_run_event(mode="book", event="book_added", title=title, doc_id=doc_id,
                   status="success", extra={"pages": n_pages, "parts": len(parts),
+                                           "figures": len(book_assets),
                                            "source": meta.get("source", "local")})
-    console.print(f"[bold green]✅ 入库：《{title}》(doc_id {doc_id[:8]}，{n_pages} 页，{len(parts)} 份)")
+    console.print(f"[bold green]✅ 入库：《{title}》(doc_id {doc_id[:8]}，{n_pages} 页，"
+                  f"{len(parts)} 份，图表 {len(book_assets)} 项)")
     console.print("[dim]  提示：运行 `python review.py index` 让它进入检索库。")
     return doc_id

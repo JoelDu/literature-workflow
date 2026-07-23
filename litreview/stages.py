@@ -449,14 +449,18 @@ def export_docx(md_path: str) -> str:
     """把渲染好的综述 markdown 转成同名 .docx（pandoc）。
     参考文献行末尾的 Obsidian wikilink（如 " [[标题_docid]]"）只在 Obsidian 里有意义，
     转换前去掉，避免在 Word 里显示成一段没用的方括号文字。
+    正文插图是相对路径（assets/xxx.jpg，相对 .md 所在目录），用 --resource-path
+    告诉 pandoc 去 .md 同目录找图，否则 Word 里图片会缺失。
     """
     with open(md_path, "r", encoding="utf-8") as f:
         content = f.read()
     content = re.sub(r" \[\[[^\]]+\]\]$", "", content, flags=re.MULTILINE)
 
     docx_path = os.path.splitext(md_path)[0] + ".docx"
+    md_dir = os.path.dirname(os.path.abspath(md_path))
     proc = subprocess.run(
-        [_find_pandoc(), "-f", "markdown", "-t", "docx", "-o", docx_path],
+        [_find_pandoc(), "-f", "markdown", "-t", "docx",
+         f"--resource-path={md_dir}", "-o", docx_path],
         input=content.encode("utf-8"), capture_output=True, timeout=60)
     if proc.returncode != 0:
         raise RuntimeError(f"pandoc 转换失败: {proc.stderr.decode('utf-8', 'ignore')}")
