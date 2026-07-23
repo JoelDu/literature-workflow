@@ -14,6 +14,9 @@ import io
 import os
 import sys
 import json
+import time
+import logging
+import functools
 import threading
 import traceback
 from datetime import datetime
@@ -31,6 +34,43 @@ from mcp.server.fastmcp import FastMCP
 
 settings = get_settings()
 mcp = FastMCP("literature-review")
+
+# ── 独立日志（专用 logger + FileHandler，不挂在 root 上，不碰 stdout/stderr）───────
+# mcp 包会给 root logger 装 RichHandler（输出到 stderr），basicConfig 对已有
+# handler 的 root 是空操作，所以这里用独立 logger + propagate=False，确保稳定写文件。
+# 排查"客户端显示已连接又立刻断开"这类问题时看这个文件：
+#   tail -f /home/dudu/GoogleDrive/Antigravity/literature_analyzer/data/mcp_server.log
+_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(_log_dir, exist_ok=True)
+logger = logging.getLogger("mcp_server")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+_file_handler = logging.FileHandler(os.path.join(_log_dir, "mcp_server.log"), encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(_file_handler)
+logger.info(f"MCP server 启动中 (pid={os.getpid()}, cwd={os.getcwd()}, "
+           f"python={sys.executable}, db={settings.DB_PATH})")
+
+
+def _logged_tool():
+    """给工具函数加调用日志（进入/耗时/异常），再套上 @mcp.tool() 注册。"""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            call_repr = ", ".join([repr(a) for a in args] +
+                                  [f"{k}={v!r}" for k, v in kwargs.items()])
+            logger.info(f"→ {fn.__name__}({call_repr})")
+            t0 = time.time()
+            try:
+                result = fn(*args, **kwargs)
+                logger.info(f"← {fn.__name__} 完成，耗时 {time.time()-t0:.1f}s")
+                return result
+            except Exception:
+                logger.error(f"✗ {fn.__name__} 异常，耗时 {time.time()-t0:.1f}s\n"
+                            f"{traceback.format_exc()}")
+                raise
+        return mcp.tool()(wrapper)
+    return deco
 
 # ── 惰性全局单例（矩阵缓存跨调用复用） ─────────────────────────────────────────
 
@@ -71,7 +111,7 @@ def _reranker():
 
 # ── 即时工具 ──────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@_logged_tool()
 def library_status() -> str:
     """查看本地文献库概况：文献数、向量索引状态、元数据提取状态。"""
     s = _store().stats()
@@ -86,7 +126,7 @@ def library_status() -> str:
             f"- 结构化元数据：{n_details} 篇（DOI/中英标题/参考文献/图表）")
 
 
-@mcp.tool()
+@_logged_tool()
 def search_literature(query: str, top_k: int = 8) -> str:
     """在本地文献库中检索与问题最相关的原文片段（向量召回+重排序，支持中英跨语言）。
     返回片段原文与来源论文信息，可据此归纳回答并注明出处。
@@ -119,7 +159,7 @@ def search_literature(query: str, top_k: int = 8) -> str:
     return "\n".join(out)
 
 
-@mcp.tool()
+@_logged_tool()
 def get_paper_info(keyword: str, limit: int = 5) -> str:
     """按标题/关键词查询文献库中论文的结构化元数据（中英标题、DOI、作者、期刊、年份、关键词、TLDR）。
 
@@ -156,7 +196,7 @@ def get_paper_info(keyword: str, limit: int = 5) -> str:
     return "\n".join(out)
 
 
-@mcp.tool()
+@_logged_tool()
 def generate_outline(topic: str, focus: str = "", sections: int = 0) -> str:
     """为综述主题生成大纲（JSON），可人工/由调用方模型修改后传给 start_review 的 outline_json 参数。
     约需 30-90 秒。
@@ -270,7 +310,7 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
         log(f"❌ 失败: {e}")
 
 
-@mcp.tool()
+@_logged_tool()
 def start_review(topic: str, focus: str = "", words: int = 0,
                  sections: int = 0, outline_json: str = "") -> str:
     """后台启动一篇完整综述的生成（约 7-30 分钟，取决于模型），立即返回 job_id。
@@ -297,7 +337,7 @@ def start_review(topic: str, focus: str = "", words: int = 0,
             f"\n预计 7-30 分钟完成，请稍后调用 review_status(\"{job_id}\") 查询进度。")
 
 
-@mcp.tool()
+@_logged_tool()
 def review_status(job_id: str = "") -> str:
     """查询综述生成任务的进度与结果。job_id 留空则返回最近一个任务。"""
     with _jobs_lock:
@@ -318,4 +358,11 @@ def review_status(job_id: str = "") -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    logger.info("MCP server 就绪，进入 stdio 事件循环")
+    try:
+        mcp.run()
+    except Exception:
+        logger.error(f"MCP server 异常退出\n{traceback.format_exc()}")
+        raise
+    finally:
+        logger.info("MCP server 事件循环结束")

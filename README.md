@@ -150,13 +150,11 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
 
 生成参数说明：
 - `--focus`：侧重方向（如"侧重环保型材料与降解机理"），贯穿大纲设计、每章写作和引言结论；
-- `--words`：目标总字数，按写作指南篇幅权重自动摊分（引言约 12%、结论与展望约 15%，其余归主体章节）；不指定时每章 600-1000 字、引言 300-500 字、结论 400-700 字；
+- `--words`：目标总字数，自动摊分到各章节（引言/结论各约 8%）；不指定时每章 600-1000 字；
 - `--sections`：主体章节数；不指定时由模型自定 3-6 个；
 - `--outline`：外部大纲文件（JSON 或 `## 章节标题` + `- 检索问题` 格式的 markdown），完全手工控制章节与检索方向，指定后跳过大纲生成。
 
 - **检索链路**：Qwen3-Embedding-8B（4096 维，跨中英）向量召回 50 候选 → Qwen3-Reranker-8B 重排取 top 24 → DeepSeek-V4-Pro 逐条打分提炼证据（≥6 分保留）→ 只依据证据写作并强制引用标记 → 全局编号与 GB/T 7714 风格参考文献（含 DOI）。
-- **写作规则**（`litreview/prompts.py`，参照 `中文综述写作指南_农业化肥方向.md`）：大纲强制单一主线骨架（总-分-总/现状-危害-对策-展望/现象-机理-策略/正反合，禁止并列拼盘）；每章按微观逻辑链行文（痛点→机制→方案→数据 等），首句为段落论点句，至少一次实质性转折，禁止"张三做了A、李四做了B"式流水罗列，结尾做跨研究上位归纳；引言按"承（现状）→转（点破 Gap）→合（切入角度）"三步展开；结论采用"一问一策"对应式展望（现存问题与建议逐条对应，禁止"前景广阔"式空话）。改动 prompt 需同步递增 `PROMPT_VERSION`（证据缓存 key 的一部分）。
-- **自动插图**：每章写完后从 `paper_assets` 中挑选该章已引用论文的图/表，用 Reranker 按「章节标题 vs 图题」重排，取分数达标的 top-N 复制到 `REVIEW_OUTPUT_DIR/assets/` 并追加 Markdown 图片块（图注标注来源引用），跨章节自动去重。由 `REVIEW_INSERT_FIGURES` / `REVIEW_FIGURES_PER_SECTION` / `REVIEW_FIGURE_MIN_SCORE` 控制；无 reranker（`--no-rerank`）或该章无引用论文时自动跳过。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。
 - 配置见 `.env.example` 的 litreview 段；依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`。
 
@@ -196,3 +194,11 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 ```
 
 `mcp_server.sh` 负责加载密钥（`/opt/docker_shared/api_keys.env`）、清理代理变量、指向生产数据库后启动 server；换机器部署时只需改脚本里的三个路径。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
+
+**日志**：server 启动/就绪/退出以及每次工具调用（入参、耗时、异常堆栈）都会写入 `data/mcp_server.log`（不经过 stdout/stderr，不会污染 stdio 协议流）。排查"客户端显示已连接却立刻断开"一类问题时先看这个文件：
+
+```bash
+tail -f /home/dudu/GoogleDrive/Antigravity/literature_analyzer/data/mcp_server.log
+```
+
+如果连"MCP server 启动中"这条都没出现，说明进程根本没跑起来（传输层/SSH 问题，而非 server 代码本身）；如果启动日志有但没有任何工具调用记录，说明客户端连上后没有发起过请求。
