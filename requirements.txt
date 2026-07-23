@@ -13,3 +13,4 @@ schedule
 tenacity
 numpy
 pypdf
+docxcompose

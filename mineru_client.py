@@ -46,6 +46,9 @@ class MinerUClient:
                     "is_json_md": True,
                     "enable_formula": True,
                     "enable_table": True,
+                    # 让 MinerU 服务端直接渲染 Word（含原生表格/公式/图片），
+                    # 避免本地 pandoc 转换丢表格、糊化学式。zip 里会多一个 .docx。
+                    "extra_formats": ["docx"],
                 }
                 
                 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8), retry=retry_if_exception_type(requests.RequestException), reraise=True)

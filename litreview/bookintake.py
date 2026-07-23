@@ -120,6 +120,22 @@ def extract_book_meta(md_head: str, pdf_path: str, client, settings, use_llm: bo
     return meta
 
 
+def merge_book_docx(part_docx: list, dest_path: str) -> str:
+    """把各 part 的 MinerU 原生 Word 顺序合并成整本 Word（docxcompose，保留表格/公式/图）。
+    part_docx 为按页序排列的 .docx 路径列表（可含 None，会被跳过）。单份时直接另存。"""
+    from docx import Document
+    from docxcompose.composer import Composer
+    paths = [p for p in part_docx if p and os.path.isfile(p)]
+    if not paths:
+        raise RuntimeError("MinerU 未返回任何 Word（docx），无法合并")
+    master = Document(paths[0])
+    composer = Composer(master)
+    for p in paths[1:]:
+        composer.append(Document(p))
+    composer.save(dest_path)
+    return dest_path
+
+
 def export_book_docx(out_root: str, n_parts: int, dest_path: str) -> str:
     """把各 part 的 MinerU markdown 合成一份带图的可读 Word（pandoc）。
     从磁盘读取 part{i}/*.md（可独立于 add_book 重跑），图片相对路径 images/ 前缀成
@@ -171,10 +187,12 @@ def add_book(pdf_path: str, settings, console, client=None,
         parts, n_pages = split_pdf_if_needed(pdf_path, max_pages, workdir)
         console.print(f"[cyan]《{title}》{n_pages} 页 → {len(parts)} 个子任务，逐份 MinerU 解析…")
         parts_md = []
+        part_docx = []          # 各 part 的 MinerU 原生 Word（extra_formats=docx）
         for i, part in enumerate(parts, 1):
             console.print(f"[cyan]  解析 part {i}/{len(parts)} …")
             res = mineru.process_pdf(part, os.path.join(out_root, f"part{i}"), timeout=3600)
             parts_md.append(res.get("markdown", ""))
+            part_docx.append(res.get("docx_path"))
 
     md_text = stitch_markdown(parts_md)
     if not md_text:
@@ -223,13 +241,18 @@ def add_book(pdf_path: str, settings, console, client=None,
         "解析时间": now,
     }], settings.EXCEL_OUTPUT_PATH)
 
-    # 生成一份带图的可读 Word（放在源 PDF 同目录同名），失败不影响入库
+    # 可读 Word：优先合并 MinerU 原生 docx（保留表格/公式/图），
+    # 缺失时才退回本地 pandoc 拼装。失败均不影响入库/检索。
+    dest_docx = os.path.splitext(pdf_path)[0] + ".docx"
     docx_path = ""
     try:
-        docx_path = export_book_docx(out_root, len(parts),
-                                     os.path.splitext(pdf_path)[0] + ".docx")
+        docx_path = merge_book_docx(part_docx, dest_docx)
     except Exception as e:
-        console.print(f"[yellow]⚠️ 可读 Word 生成失败（不影响入库/检索）: {e}")
+        console.print(f"[yellow]⚠️ MinerU 原生 Word 合并失败，改用 pandoc 拼装: {e}")
+        try:
+            docx_path = export_book_docx(out_root, len(parts), dest_docx)
+        except Exception as e2:
+            console.print(f"[yellow]⚠️ 可读 Word 生成失败（不影响入库/检索）: {e2}")
 
     log_run_event(mode="book", event="book_added", title=title, doc_id=doc_id,
                   status="success", extra={"pages": n_pages, "parts": len(parts),
