@@ -91,7 +91,9 @@ def cmd_search(args):
     qvec = embedder.embed_query(args.query)
     reranker = None if args.no_rerank else _make_reranker()
     recall_k = settings.RERANK_CANDIDATES if reranker else args.top_k
-    results = store.search(qvec, top_k=recall_k, max_per_doc=settings.REVIEW_MAX_CHUNKS_PER_DOC)
+    doc_types = None if args.corpus == "all" else [args.corpus]
+    results = store.search(qvec, top_k=recall_k, max_per_doc=settings.REVIEW_MAX_CHUNKS_PER_DOC,
+                           doc_types=doc_types)
     if not results:
         console.print("[yellow]未检索到任何结果（索引可能为空，先运行 index）。")
         return
@@ -128,6 +130,42 @@ def cmd_enrich(args):
     log_run_event(mode="review", event="enrich", status="success",
                   extra={"enriched": report["enriched"], "failed": report["failed"],
                          "with_doi": report["with_doi"], "assets": report["assets"]})
+
+
+def cmd_add_book(args):
+    from litreview.bookintake import add_book
+    max_pages = args.pages or settings.BOOK_SPLIT_PAGES
+    use_llm = settings.REVIEW_ENRICH_LLM and not args.no_llm
+    client = None
+    if use_llm:
+        _require_siliconflow()
+        client, _ = _make_client()
+
+    # 收集待入库 PDF：单文件或目录
+    if os.path.isdir(args.path):
+        pdfs = sorted(os.path.join(args.path, f) for f in os.listdir(args.path)
+                      if f.lower().endswith(".pdf"))
+    elif os.path.isfile(args.path):
+        pdfs = [args.path]
+    else:
+        console.print(f"[bold red]❌ 路径不存在：{args.path}")
+        sys.exit(1)
+    if not pdfs:
+        console.print(f"[yellow]目录中没有 PDF：{args.path}")
+        return
+
+    ok, failed = 0, 0
+    for pdf in pdfs:
+        try:
+            add_book(pdf, settings, console, client=client, max_pages=max_pages, use_llm=use_llm)
+            ok += 1
+        except Exception as e:
+            failed += 1
+            console.print(f"[red]✖ 入库失败 {os.path.basename(pdf)}: {e}")
+            log_run_event(mode="book", event="book_added", title=os.path.basename(pdf),
+                          status="failed", error=str(e))
+    console.print(f"[bold]书籍入库完成：成功 {ok} 本，失败 {failed} 本。"
+                  + ("" if failed else " 运行 `python review.py index` 建索引。"))
 
 
 def cmd_outline(args):
@@ -294,12 +332,20 @@ def main():
     p.add_argument("query")
     p.add_argument("-k", "--top-k", type=int, default=10)
     p.add_argument("--no-rerank", action="store_true", help="只用向量分数，不做重排序")
+    p.add_argument("--corpus", choices=["all", "paper", "book"], default="all",
+                   help="限定检索来源（默认 all=论文+教材混检）")
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("enrich", help="提取结构化元数据（标题中英/DOI/图表/参考文献）")
     p.add_argument("--force", action="store_true", help="全量重新提取")
     p.add_argument("--no-llm", action="store_true", help="只做本地解析，不用 LLM 补缺")
     p.set_defaults(func=cmd_enrich)
+
+    p = sub.add_parser("add-book", help="教材/书籍入库（拆分→MinerU→拼接→直接入检索库，不做 LLM 全文分析）")
+    p.add_argument("path", help="单个 PDF 或包含多本 PDF 的目录")
+    p.add_argument("--pages", type=int, default=None, help="每份最大页数（默认取 BOOK_SPLIT_PAGES=180）")
+    p.add_argument("--no-llm", action="store_true", help="元数据只做本地解析，出版社/版次等留空待手填")
+    p.set_defaults(func=cmd_add_book)
 
     p = sub.add_parser("outline", help="生成综述大纲")
     p.add_argument("topic")

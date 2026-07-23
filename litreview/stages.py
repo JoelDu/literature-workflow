@@ -363,8 +363,27 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
         raw_title = m.get("title", "未知文献")
         authors = _short_authors(m.get("authors", ""), m.get("language", "zh"), raw_title)
         title = _best_title(m)
-        journal = m.get("journal", "")
         year = m.get("year", "")
+
+        if m.get("doc_type") == "book":
+            # GB/T 7714 专著：作者. 书名[M]. [版本.] 出版地: 出版者, 出版年.（无 DOI/wikilink）
+            edition = m.get("edition", "")
+            place = m.get("pub_place", "")
+            publisher = m.get("publisher", "")
+            edition_part = f" {edition}." if edition else ""
+            if place and publisher:
+                imprint = f" {place}: {publisher}, {year}." if year else f" {place}: {publisher}."
+            elif publisher:
+                imprint = f" {publisher}, {year}." if year else f" {publisher}."
+            elif year:
+                imprint = f" {year}."
+            else:
+                imprint = ""
+            references.append((f"[{n}] {authors}. {title}[M].{edition_part}{imprint}").rstrip())
+            continue
+
+        # 期刊论文：作者. 题名[J]. 期刊, 年. DOI: xxx. + 回链 Obsidian 笔记
+        journal = m.get("journal", "")
         tail = ""
         if journal and year:
             tail = f" {journal}, {year}."

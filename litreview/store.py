@@ -101,6 +101,13 @@ class VectorStore:
             raw_text  TEXT NOT NULL
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_refs_doc ON paper_references(doc_id)")
+        # 书籍/教材需要的字段：增量热升级（paper_details 已存在于老库时补列）
+        c.execute("PRAGMA table_info(paper_details)")
+        _pd_cols = {row[1] for row in c.fetchall()}
+        for _col, _decl in (("doc_type", "TEXT DEFAULT 'paper'"), ("publisher", "TEXT"),
+                            ("pub_place", "TEXT"), ("edition", "TEXT"), ("isbn", "TEXT")):
+            if _col not in _pd_cols:
+                c.execute(f"ALTER TABLE paper_details ADD COLUMN {_col} {_decl}")
         conn.commit()
         conn.close()
 
@@ -196,15 +203,27 @@ class VectorStore:
         self._meta = meta
         return self._matrix, self._meta
 
-    def search(self, qvec: np.ndarray, top_k: int = 24, max_per_doc: int = 4) -> list:
+    def _doc_type_map(self) -> dict:
+        """doc_id → doc_type（缺省 'paper'），供来源过滤。"""
+        conn = self._conn()
+        rows = conn.execute("SELECT doc_id, COALESCE(doc_type,'paper') FROM paper_details").fetchall()
+        conn.close()
+        return {d: t for d, t in rows}
+
+    def search(self, qvec: np.ndarray, top_k: int = 24, max_per_doc: int = 4,
+               doc_types: list = None) -> list:
         matrix, meta = self.load_matrix()
         if matrix.shape[0] == 0:
             return []
+        allow = set(doc_types) if doc_types else None
+        dtm = self._doc_type_map() if allow is not None else {}
         scores = matrix @ qvec.astype(np.float32)
         order = np.argsort(-scores)
         results, per_doc = [], {}
         for idx in order:
             m = meta[idx]
+            if allow is not None and dtm.get(m["doc_id"], "paper") not in allow:
+                continue
             if per_doc.get(m["doc_id"], 0) >= max_per_doc:
                 continue
             per_doc[m["doc_id"]] = per_doc.get(m["doc_id"], 0) + 1
@@ -237,7 +256,8 @@ class VectorStore:
         conn = self._conn()
         c = conn.cursor()
         base_sql = """SELECT p.id, p.title, p.language, p.result_json,
-                             d.title_zh, d.title_en, d.doi, d.authors, d.journal, d.year, d.keywords
+                             d.title_zh, d.title_en, d.doi, d.authors, d.journal, d.year, d.keywords,
+                             d.doc_type, d.publisher, d.pub_place, d.edition
                       FROM papers p LEFT JOIN paper_details d ON d.doc_id = p.id"""
         if doc_ids:
             marks = ",".join("?" * len(doc_ids))
@@ -248,11 +268,14 @@ class VectorStore:
         conn.close()
         out = {}
         for (doc_id, title, language, result_json,
-             d_title_zh, d_title_en, d_doi, d_authors, d_journal, d_year, d_keywords) in rows:
+             d_title_zh, d_title_en, d_doi, d_authors, d_journal, d_year, d_keywords,
+             d_doc_type, d_publisher, d_pub_place, d_edition) in rows:
             meta = {"title": title or "", "language": language or "zh",
                     "authors": "", "journal": "", "year": "", "tldr": "",
                     "title_zh": d_title_zh or "", "title_en": d_title_en or "",
-                    "doi": d_doi or "", "keywords": d_keywords or ""}
+                    "doi": d_doi or "", "keywords": d_keywords or "",
+                    "doc_type": d_doc_type or "paper", "publisher": d_publisher or "",
+                    "pub_place": d_pub_place or "", "edition": d_edition or ""}
             if result_json:
                 try:
                     analysis = json.loads(result_json)
@@ -309,14 +332,18 @@ class VectorStore:
             c.execute("BEGIN")
             c.execute("""INSERT OR REPLACE INTO paper_details
                          (doc_id, title, title_zh, title_en, doi, authors, journal, year,
-                          keywords, n_figures, n_tables, n_refs, enriched_at, source)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          keywords, n_figures, n_tables, n_refs, enriched_at, source,
+                          doc_type, publisher, pub_place, edition, isbn)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (doc_id, details.get("title", ""), details.get("title_zh", ""),
                        details.get("title_en", ""), details.get("doi", ""),
                        details.get("authors", ""), details.get("journal", ""),
                        details.get("year", ""), details.get("keywords", ""),
                        details.get("n_figures", 0), details.get("n_tables", 0), len(refs),
-                       datetime.now().strftime("%Y-%m-%d %H:%M:%S"), details.get("source", "local")))
+                       datetime.now().strftime("%Y-%m-%d %H:%M:%S"), details.get("source", "local"),
+                       details.get("doc_type", "paper"), details.get("publisher", ""),
+                       details.get("pub_place", ""), details.get("edition", ""),
+                       details.get("isbn", "")))
             c.execute("DELETE FROM paper_assets WHERE doc_id=?", (doc_id,))
             for a in assets:
                 c.execute("""INSERT INTO paper_assets (doc_id, asset_type, img_path, caption, page_idx)

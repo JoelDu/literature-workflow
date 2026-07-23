@@ -35,6 +35,8 @@
 
 **命令行用法**：`review.py index`（建向量索引）→ `enrich`（提取结构化元数据）→ `search`（检索调试）→ `outline`（先出大纲，可手改）→ `generate`（正式生成，支持指定侧重方向/目标字数/章节数）。
 
+**教材/书籍入库**：`review.py add-book <pdf 或目录>` 走一条轻量通道——把教材当作**检索语料**加入(供 search 与综述引用)，但不做 LLM 全文分析、不进 Obsidian(省钱)，只进 Excel。书籍常超 MinerU 单任务页数上限,会用 pypdf 自动拆分再拼回同一 doc_id。检索时论文与教材默认混用(可用 `--corpus` 限定)；参考文献按类型区分,论文 `[J]`、教材 `[M]`(GB/T 7714)。
+
 ## 三、MCP Server：在对话里直接用
 
 `mcp_server.py` 把整个文献库检索和综述撰写能力包装成标准 MCP 协议 server，Claude Code / Claude Desktop / Cherry Studio 这些客户端配置一下就能在对话里直接调用，不用自己敲命令行。开放了 6 个工具：查库状态、语义检索、查单篇论文元数据、生成大纲、后台起一篇综述（因为耗时 7-30 分钟，用的是"秒回 job_id + 轮询"的异步模式）、查生成进度。

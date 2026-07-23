@@ -12,3 +12,4 @@ httpx
 schedule
 tenacity
 numpy
+pypdf
