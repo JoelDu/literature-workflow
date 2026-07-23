@@ -4,7 +4,7 @@ import os
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-_MAX_DOC_CHARS = 3500  # 每条候选文档送入 reranker 的截断长度
+_MAX_DOC_CHARS = 5000  # 每条候选文档送入 reranker 的截断长度（放宽以容纳更大的书籍块）
 
 
 class Reranker:

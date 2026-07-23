@@ -106,16 +106,16 @@ def test_docs_needing_index_diff():
         conn.close()
 
         todo = store.docs_needing_index()
-        assert {d for d, _ in todo} == {"a" * 64, "b" * 64}  # 未索引的 EXPORTED
+        assert {d for d, _, _ in todo} == {"a" * 64, "b" * 64}  # 未索引的 EXPORTED
 
         # 索引 a 之后，只剩 b
-        md = dict(todo)["a" * 64]
+        md = {d: m for d, m, _ in todo}["a" * 64]
         ids = store.replace_doc_chunks("a" * 64, md_hash(md),
                                        [Chunk(doc_id="a" * 64, chunk_index=0, section_title="", content="x" * 60)])
         store.save_embeddings(ids, np.zeros((1, DIM), dtype=np.float32), "m")
         store.mark_embedded("a" * 64)
         todo2 = store.docs_needing_index()
-        assert {d for d, _ in todo2} == {"b" * 64}
+        assert {d for d, _, _ in todo2} == {"b" * 64}
 
         # 修改 a 的内容 → 重新出现在待索引
         conn = sqlite3.connect(db_path)
@@ -123,7 +123,7 @@ def test_docs_needing_index_diff():
         conn.commit()
         conn.close()
         todo3 = store.docs_needing_index()
-        assert "a" * 64 in {d for d, _ in todo3}
+        assert "a" * 64 in {d for d, _, _ in todo3}
 
 
 def test_dim_mismatch_skipped():

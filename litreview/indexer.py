@@ -30,11 +30,15 @@ def build_index(settings, console, client, force: bool = False) -> dict:
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   BarColumn(), console=console) as progress:
         task = progress.add_task("[cyan]索引中...", total=len(todo))
-        for doc_id, md in todo:
+        for doc_id, md, doc_type in todo:
             progress.update(task, description=f"[cyan]索引 {doc_id[:8]}...")
             try:
-                chunks = split_markdown(doc_id, md, settings.REVIEW_CHUNK_SIZE,
-                                        settings.REVIEW_CHUNK_OVERLAP)
+                # 书籍用更大的块（BOOK_CHUNK_SIZE），论文用默认块
+                if doc_type == "book":
+                    csize, coverlap = settings.BOOK_CHUNK_SIZE, settings.BOOK_CHUNK_OVERLAP
+                else:
+                    csize, coverlap = settings.REVIEW_CHUNK_SIZE, settings.REVIEW_CHUNK_OVERLAP
+                chunks = split_markdown(doc_id, md, csize, coverlap)
                 if not chunks:
                     console.print(f"[yellow]⚠️ {doc_id[:8]} 清洗后无有效内容，跳过。")
                     store.replace_doc_chunks(doc_id, md_hash(md), [])

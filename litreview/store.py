@@ -114,20 +114,23 @@ class VectorStore:
     # ── 索引写入 ──────────────────────────────────────────────────────────
 
     def docs_needing_index(self) -> list:
-        """返回 [(doc_id, mineru_md)]：未索引 / 内容变化 / 上次嵌入未完成的 EXPORTED 文档。"""
+        """返回 [(doc_id, mineru_md, doc_type)]：未索引 / 内容变化 / 上次嵌入未完成的 EXPORTED 文档。
+        doc_type 供索引时按类型选块大小（书籍块更大）。"""
         conn = self._conn()
         c = conn.cursor()
         c.execute("""
-            SELECT p.id, p.mineru_md, m.md_hash, m.embedded
-            FROM papers p LEFT JOIN review_index_meta m ON m.doc_id = p.id
+            SELECT p.id, p.mineru_md, m.md_hash, m.embedded, COALESCE(d.doc_type, 'paper')
+            FROM papers p
+            LEFT JOIN review_index_meta m ON m.doc_id = p.id
+            LEFT JOIN paper_details d ON d.doc_id = p.id
             WHERE p.status = 'EXPORTED' AND p.mineru_md IS NOT NULL AND p.mineru_md != ''
         """)
         rows = c.fetchall()
         conn.close()
         out = []
-        for doc_id, md, old_hash, embedded in rows:
+        for doc_id, md, old_hash, embedded, doc_type in rows:
             if old_hash is None or old_hash != md_hash(md) or not embedded:
-                out.append((doc_id, md))
+                out.append((doc_id, md, doc_type))
         return out
 
     def replace_doc_chunks(self, doc_id: str, content_hash: str, chunks: list) -> list:

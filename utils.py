@@ -55,6 +55,10 @@ class Settings(BaseModel):
     REVIEW_ENRICH_LLM: bool = True           # enrich 时是否用 LLM 补缺元数据
     REVIEW_CHUNK_SIZE: int = 1000
     REVIEW_CHUNK_OVERLAP: int = 150
+    # 教材/书籍单独用更大的块（书讲得散，大块保完整概念）。字符按原始 len 计，
+    # 4800 原始字符≈3000 汉字（实测中文 1 汉字≈1.6 原始字符）；英文同口径。
+    BOOK_CHUNK_SIZE: int = 4800
+    BOOK_CHUNK_OVERLAP: int = 600
     REVIEW_TOP_K: int = 24
     REVIEW_MAX_CHUNKS_PER_DOC: int = 4
     REVIEW_MIN_SCORE: int = 6
@@ -109,6 +113,8 @@ def get_settings() -> Settings:
                 "REVIEW_ENRICH_LLM": os.getenv("REVIEW_ENRICH_LLM", "true").lower() == "true",
                 "REVIEW_CHUNK_SIZE": int(os.getenv("REVIEW_CHUNK_SIZE", "1000")),
                 "REVIEW_CHUNK_OVERLAP": int(os.getenv("REVIEW_CHUNK_OVERLAP", "150")),
+                "BOOK_CHUNK_SIZE": int(os.getenv("BOOK_CHUNK_SIZE", "4800")),
+                "BOOK_CHUNK_OVERLAP": int(os.getenv("BOOK_CHUNK_OVERLAP", "600")),
                 "REVIEW_TOP_K": int(os.getenv("REVIEW_TOP_K", "24")),
                 "REVIEW_MAX_CHUNKS_PER_DOC": int(os.getenv("REVIEW_MAX_CHUNKS_PER_DOC", "4")),
                 "REVIEW_MIN_SCORE": int(os.getenv("REVIEW_MIN_SCORE", "6")),

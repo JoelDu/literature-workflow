@@ -177,7 +177,7 @@ def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) ->
     prompt = prompts.MAP_PROMPT.format(
         heading=heading, questions=questions_text,
         title=m.get("title", "未知"), year=m.get("year") or "年份不详",
-        chunk_content=chunk.content[:4000],
+        chunk_content=chunk.content[:5000],
     )
     data = _chat_json(client, model, prompt)
     score = int(data.get("score", 0))
