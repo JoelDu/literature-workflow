@@ -46,9 +46,10 @@ class MinerUClient:
                     "is_json_md": True,
                     "enable_formula": True,
                     "enable_table": True,
-                    # 让 MinerU 服务端直接渲染 Word（含原生表格/公式/图片），
-                    # 避免本地 pandoc 转换丢表格、糊化学式。zip 里会多一个 .docx。
-                    "extra_formats": ["docx"],
+                    # 让 MinerU 服务端把所有支持的格式都渲染出来一并取回本地
+                    # （docx 供阅读、html/latex 备用），硬盘充足、按页计费不因此变。
+                    # 默认已含 markdown+json；这里补足 docx/html/latex 三种。
+                    "extra_formats": ["docx", "html", "latex"],
                 }
                 
                 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8), retry=retry_if_exception_type(requests.RequestException), reraise=True)
