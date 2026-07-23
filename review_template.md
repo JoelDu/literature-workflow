@@ -11,23 +11,24 @@ model: "{{ model }}"
 
 # {{ title }}
 
-## 引言
+## 1 引言
 
 {{ intro }}
 
 {% for section in sections %}
-## {{ section.heading }}
+## {{ loop.index + 1 }} {{ section.heading }}
 
 {{ section.markdown }}
 
 {% endfor %}
-## 结论与展望
+## {{ sections|length + 2 }} 结论与展望
 
 {{ conclusion }}
 
 ## 参考文献
 
 {% for ref in references %}{{ ref }}
+
 {% endfor %}
 
 ---

@@ -2,7 +2,9 @@
 import os
 import re
 import json
+import shutil
 import hashlib
+import subprocess
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -412,3 +414,31 @@ def render_review_note(review: ReviewDoc, paper_meta: dict, settings,
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
     return out_path
+
+
+def _find_pandoc() -> str:
+    p = shutil.which("pandoc")
+    if p:
+        return p
+    fallback = os.path.expanduser("~/.local/bin/pandoc")
+    if os.path.exists(fallback):
+        return fallback
+    raise RuntimeError("未找到 pandoc，请先安装（如 apt install pandoc 或放到 PATH 里）。")
+
+
+def export_docx(md_path: str) -> str:
+    """把渲染好的综述 markdown 转成同名 .docx（pandoc）。
+    参考文献行末尾的 Obsidian wikilink（如 " [[标题_docid]]"）只在 Obsidian 里有意义，
+    转换前去掉，避免在 Word 里显示成一段没用的方括号文字。
+    """
+    with open(md_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    content = re.sub(r" \[\[[^\]]+\]\]$", "", content, flags=re.MULTILINE)
+
+    docx_path = os.path.splitext(md_path)[0] + ".docx"
+    proc = subprocess.run(
+        [_find_pandoc(), "-f", "markdown", "-t", "docx", "-o", docx_path],
+        input=content.encode("utf-8"), capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"pandoc 转换失败: {proc.stderr.decode('utf-8', 'ignore')}")
+    return docx_path

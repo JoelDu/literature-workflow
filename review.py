@@ -157,7 +157,7 @@ def cmd_generate(args):
     from litreview.store import VectorStore
     from litreview.stages import (generate_outline, load_outline_file, gather_evidence,
                                   write_section, write_intro_conclusion,
-                                  assemble_review, render_review_note)
+                                  assemble_review, render_review_note, export_docx)
     from litreview.figures import select_section_figures
 
     client, model = _make_client()
@@ -256,6 +256,12 @@ def cmd_generate(args):
     template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
     out_path = render_review_note(review, paper_meta, settings, template_path, model)
 
+    docx_path = ""
+    try:
+        docx_path = export_docx(out_path)
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Word 导出失败（markdown 已正常生成）: {e}")
+
     elapsed = int(time.time() - t0)
     console.rule("[bold green]✅ 综述生成完成")
     if failed_sections:
@@ -264,11 +270,13 @@ def cmd_generate(args):
     console.print(f"章节: {len(review.sections)} 个 | 引用文献: {review.doc_count} 篇 | "
                   f"证据: {review.evidence_count} 条 | 耗时: {elapsed}s")
     console.print(f"输出: [bold cyan]{out_path}[/bold cyan]")
+    if docx_path:
+        console.print(f"Word: [bold cyan]{docx_path}[/bold cyan]")
     log_run_event(mode="review", event="review_generated", title=review.title,
                   status="success",
                   extra={"topic": args.topic, "sections": len(review.sections),
                          "cited_docs": review.doc_count, "elapsed_s": elapsed,
-                         "output": out_path})
+                         "output": out_path, "docx": docx_path})
 
 
 def main():

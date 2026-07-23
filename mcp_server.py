@@ -220,7 +220,8 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                     n_sections: int, outline_json: str):
     from litreview.models import Outline
     from litreview.stages import (generate_outline as _gen, gather_evidence, write_section,
-                                  write_intro_conclusion, assemble_review, render_review_note)
+                                  write_intro_conclusion, assemble_review, render_review_note,
+                                  export_docx)
     from litreview.figures import select_section_figures
     job = _jobs[job_id]
     buf = io.StringIO()
@@ -295,14 +296,22 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
         template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
         out_path = render_review_note(review, paper_meta, settings, template_path, model)
 
+        docx_path = ""
+        try:
+            docx_path = export_docx(out_path)
+        except Exception as e:
+            log(f"⚠️ Word 导出失败（markdown 已正常生成）: {e}")
+
         with _jobs_lock:
             job["status"] = "done"
             job["output"] = out_path
+            job["docx"] = docx_path
             job["summary"] = (f"《{review.title}》：{len(review.sections)} 章节、"
                               f"引用 {review.doc_count} 篇、证据 {review.evidence_count} 条")
-        log(f"✅ 完成，输出: {out_path}")
+        log(f"✅ 完成，输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else ""))
         log_run_event(mode="review", event="review_generated", title=review.title,
-                      status="success", extra={"topic": topic, "via": "mcp", "output": out_path})
+                      status="success", extra={"topic": topic, "via": "mcp",
+                                               "output": out_path, "docx": docx_path})
     except Exception as e:
         with _jobs_lock:
             job["status"] = "failed"
@@ -314,7 +323,8 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
 def start_review(topic: str, focus: str = "", words: int = 0,
                  sections: int = 0, outline_json: str = "") -> str:
     """后台启动一篇完整综述的生成（约 7-30 分钟，取决于模型），立即返回 job_id。
-    用 review_status 查询进度；完成后综述 markdown 会写入 Obsidian 文献库的 reviews 目录。
+    用 review_status 查询进度；完成后综述 markdown（写入 Obsidian 文献库的 reviews 目录）
+    和 Word（.docx，同目录同名）会一起生成。
 
     Args:
         topic: 综述主题（必填）
@@ -327,7 +337,7 @@ def start_review(topic: str, focus: str = "", words: int = 0,
     running = [j for j in _jobs.values() if j["status"] == "running"]
     with _jobs_lock:
         _jobs[job_id] = {"status": "running", "topic": topic, "log": [],
-                         "output": "", "error": "", "summary": "",
+                         "output": "", "docx": "", "error": "", "summary": "",
                          "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     threading.Thread(target=_run_review_job, daemon=True,
                      args=(job_id, topic, focus, words, sections, outline_json)).start()
@@ -352,6 +362,8 @@ def review_status(job_id: str = "") -> str:
         if job["status"] == "done":
             lines.append(f"结果: {job['summary']}")
             lines.append(f"文件: {job['output']}")
+            if job.get("docx"):
+                lines.append(f"Word: {job['docx']}")
         elif job["status"] == "failed":
             lines.append(f"错误: {job['error'][:400]}")
         return "\n".join(lines)
