@@ -7,8 +7,10 @@
 """
 import os
 import re
+import glob
 import sqlite3
 import tempfile
+import subprocess
 from datetime import datetime
 
 from utils import calculate_pdf_hash, export_to_excel, log_run_event
@@ -118,6 +120,32 @@ def extract_book_meta(md_head: str, pdf_path: str, client, settings, use_llm: bo
     return meta
 
 
+def export_book_docx(out_root: str, n_parts: int, dest_path: str) -> str:
+    """把各 part 的 MinerU markdown 合成一份带图的可读 Word（pandoc）。
+    从磁盘读取 part{i}/*.md（可独立于 add_book 重跑），图片相对路径 images/ 前缀成
+    part{i}/images/ 并用 --resource-path=out_root 让 pandoc 找到图。"""
+    from .stages import _find_pandoc
+    parts_md = []
+    for i in range(1, n_parts + 1):
+        part_dir = os.path.join(out_root, f"part{i}")
+        mds = glob.glob(os.path.join(part_dir, "*.md"))
+        if not mds:
+            continue
+        with open(max(mds, key=os.path.getsize), "r", encoding="utf-8") as f:
+            txt = f.read()
+        txt = re.sub(r"(!\[[^\]]*\]\()images/", rf"\1part{i}/images/", txt)
+        parts_md.append(txt)
+    if not parts_md:
+        raise RuntimeError("未找到任何 part 的 markdown，无法生成 Word")
+    proc = subprocess.run(
+        [_find_pandoc(), "-f", "markdown", "-t", "docx",
+         f"--resource-path={out_root}", "-o", dest_path],
+        input="\n\n".join(parts_md).encode("utf-8"), capture_output=True, timeout=600)
+    if proc.returncode != 0:
+        raise RuntimeError(f"pandoc 转换失败: {proc.stderr.decode('utf-8', 'ignore')}")
+    return dest_path
+
+
 def add_book(pdf_path: str, settings, console, client=None,
             max_pages: int = 180, use_llm: bool = True) -> str:
     """把一本书 PDF 入库为可检索语料。返回 doc_id。已入库(EXPORTED)则跳过。"""
@@ -195,11 +223,22 @@ def add_book(pdf_path: str, settings, console, client=None,
         "解析时间": now,
     }], settings.EXCEL_OUTPUT_PATH)
 
+    # 生成一份带图的可读 Word（放在源 PDF 同目录同名），失败不影响入库
+    docx_path = ""
+    try:
+        docx_path = export_book_docx(out_root, len(parts),
+                                     os.path.splitext(pdf_path)[0] + ".docx")
+    except Exception as e:
+        console.print(f"[yellow]⚠️ 可读 Word 生成失败（不影响入库/检索）: {e}")
+
     log_run_event(mode="book", event="book_added", title=title, doc_id=doc_id,
                   status="success", extra={"pages": n_pages, "parts": len(parts),
                                            "figures": len(book_assets),
+                                           "docx": docx_path,
                                            "source": meta.get("source", "local")})
     console.print(f"[bold green]✅ 入库：《{title}》(doc_id {doc_id[:8]}，{n_pages} 页，"
                   f"{len(parts)} 份，图表 {len(book_assets)} 项)")
+    if docx_path:
+        console.print(f"[green]  可读 Word: {docx_path}")
     console.print("[dim]  提示：运行 `python review.py index` 让它进入检索库。")
     return doc_id
