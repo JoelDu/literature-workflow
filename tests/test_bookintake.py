@@ -1,6 +1,7 @@
 """书籍入库单元测试（无网络：拆分/拼接/本地元数据/[M] 引用分流）。"""
 import os
 import sys
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -10,7 +11,8 @@ from pypdf import PdfReader, PdfWriter
 
 from litreview.bookintake import (split_pdf_if_needed, stitch_markdown,
                                   _local_book_meta, _looks_chinese,
-                                  collect_book_assets)
+                                  collect_book_assets, extract_epub_meta,
+                                  epub_asset_relpath)
 from litreview.models import Outline, OutlineSection, SectionDraft
 from litreview.stages import assemble_review
 
@@ -92,3 +94,59 @@ def test_book_citation_is_monograph_M():
     assert "机械工业出版社" in book_line and "北京" in book_line and "第3版" in book_line
     assert "DOI" not in book_line and "[[" not in book_line
     assert "DOI: 10.1234/abcd" in paper_line and "[[" in paper_line
+
+
+def _make_epub(path):
+    container = ("<?xml version='1.0'?>"
+                 "<container version='1.0' xmlns='urn:oasis:names:tc:opendocument:xmlns:container'>"
+                 "<rootfiles><rootfile full-path='OEBPS/content.opf' "
+                 "media-type='application/oebps-package+xml'/></rootfiles></container>")
+    opf = ("<?xml version='1.0'?>"
+           "<package xmlns='http://www.idpf.org/2007/opf'>"
+           "<metadata xmlns:dc='http://purl.org/dc/elements/1.1/'>"
+           "<dc:title>测试书</dc:title><dc:creator>张三</dc:creator>"
+           "<dc:publisher>测试出版社</dc:publisher><dc:date>2020-01-01</dc:date>"
+           "<dc:identifier>urn:isbn:9780000000000</dc:identifier>"
+           "</metadata></package>")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/epub+zip")
+        z.writestr("META-INF/container.xml", container)
+        z.writestr("OEBPS/content.opf", opf)
+    return path
+
+
+def test_extract_epub_meta_reads_opf_dc_fields(tmp_path):
+    epub = _make_epub(str(tmp_path / "书.epub"))
+    meta = extract_epub_meta(epub)
+    assert meta["title"] == "测试书"
+    assert meta["authors"] == "张三"
+    assert meta["publisher"] == "测试出版社"
+    assert meta["year"] == "2020"
+    assert meta["isbn"] == "9780000000000"
+    assert meta["doc_type"] == "book"
+
+
+def test_extract_epub_meta_falls_back_to_filename_on_bad_zip(tmp_path):
+    bad = tmp_path / "损坏的书.epub"
+    bad.write_bytes(b"not a zip")
+    meta = extract_epub_meta(str(bad))
+    assert meta["title"] == "损坏的书"
+    assert meta["authors"] == ""
+
+
+def test_epub_asset_relpath_does_not_double_prefix_out_root(tmp_path, monkeypatch):
+    """回归测试：pandoc --extract-media 打出的 src 已含 out_root 前缀，
+    不能再和 out_root 拼接一次，否则算出的相对路径对不上真实文件位置。"""
+    monkeypatch.chdir(tmp_path)
+    mineru_dir = "./mineru_output"
+    out_root = os.path.join(mineru_dir, "BOOK_test_deadbeef")
+    real_img = os.path.join(out_root, "images", "pic.png")
+    os.makedirs(os.path.dirname(real_img))
+    open(real_img, "wb").close()
+
+    # pandoc 实测行为：markdown 里打印的 src 就是这个相对 CWD 的路径
+    src_from_pandoc = out_root + "/images/pic.png"
+    rel = epub_asset_relpath(src_from_pandoc, mineru_dir)
+
+    assert rel == "BOOK_test_deadbeef/images/pic.png"
+    assert os.path.isfile(os.path.join(mineru_dir, rel))

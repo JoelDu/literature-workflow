@@ -8,10 +8,12 @@
 import os
 import re
 import glob
+import zipfile
 import sqlite3
 import tempfile
 import subprocess
 from datetime import datetime
+from xml.etree import ElementTree as ET
 
 from utils import calculate_pdf_hash, export_to_excel, log_run_event
 from mineru_client import MinerUClient
@@ -261,6 +263,197 @@ def add_book(pdf_path: str, settings, console, client=None,
                                            "source": meta.get("source", "local")})
     console.print(f"[bold green]✅ 入库：《{title}》(doc_id {doc_id[:8]}，{n_pages} 页，"
                   f"{len(parts)} 份，图表 {len(book_assets)} 项)")
+    if docx_path:
+        console.print(f"[green]  可读 Word: {docx_path}")
+    console.print("[dim]  提示：运行 `python review.py index` 让它进入检索库。")
+    return doc_id
+
+
+# ----------------------------------------------------------------------------
+# EPUB：数字文本，无需 MinerU / 拆分。pandoc 直接 epub→markdown（入库）+ epub→docx（阅读）。
+# ----------------------------------------------------------------------------
+_DC = "{http://purl.org/dc/elements/1.1/}"
+_CONTAINER_NS = "{urn:oasis:names:tc:opendocument:xmlns:container}"
+
+
+def extract_epub_meta(epub_path: str) -> dict:
+    """从 EPUB 的 OPF(dc: 元数据)本地读取书名/作者/出版社/年份/ISBN。读不到则回退文件名。"""
+    title = os.path.splitext(os.path.basename(epub_path))[0]
+    meta = {"title": title, "doc_type": "book", "authors": "", "publisher": "",
+            "pub_place": "", "edition": "", "year": "", "isbn": "", "source": "epub"}
+    try:
+        with zipfile.ZipFile(epub_path) as z:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_path = container.find(f".//{_CONTAINER_NS}rootfile").get("full-path")
+            opf = ET.fromstring(z.read(opf_path))
+
+            def _vals(tag):
+                return [e.text.strip() for e in opf.iter(f"{_DC}{tag}") if e.text and e.text.strip()]
+
+            titles = _vals("title")
+            if titles:
+                meta["title"] = titles[0]                 # OPF 书名优先于文件名
+            meta["authors"] = ", ".join(_vals("creator"))
+            pubs = _vals("publisher")
+            if pubs:
+                meta["publisher"] = pubs[0]
+            for d in _vals("date"):
+                ym = _YEAR_RE.search(d)
+                if ym:
+                    meta["year"] = ym.group(0)
+                    break
+            for ident in _vals("identifier"):
+                digits = re.sub(r"[^0-9Xx]", "", ident)
+                if "isbn" in ident.lower() or len(digits) in (10, 13):
+                    meta["isbn"] = ident.split(":")[-1].strip()
+                    break
+    except Exception:
+        pass  # 元数据缺失不阻断入库
+    return meta
+
+
+def epub_asset_relpath(src: str, mineru_output_dir: str) -> str:
+    """pandoc epub --extract-media 输出的图片 src 转成 mineru_output 根相对路径。
+
+    pandoc 打印的 src 已经是相对当前工作目录的路径（本身就带 out_root 前缀），
+    不能再和 out_root 拼接，否则路径重复、图片找不到（曾用真实 EPUB 测出此坑）。
+    """
+    absimg = os.path.abspath(src)
+    try:
+        return os.path.relpath(absimg, os.path.abspath(mineru_output_dir))
+    except ValueError:
+        return src
+
+
+def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = True) -> str:
+    """把一本 EPUB 入库为可检索语料（pandoc 转换，无 MinerU）。返回 doc_id。已入库则跳过。"""
+    if not os.path.isfile(epub_path):
+        raise FileNotFoundError(epub_path)
+    fallback_title = os.path.splitext(os.path.basename(epub_path))[0]
+    doc_id = calculate_pdf_hash(epub_path)   # 按文件字节 hash → 幂等
+
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    conn = sqlite3.connect(settings.DB_PATH)
+    conn.execute("PRAGMA busy_timeout=30000")
+    row = conn.execute("SELECT status FROM papers WHERE id=?", (doc_id,)).fetchone()
+    if row and row[0] == "EXPORTED":
+        conn.close()
+        console.print(f"[dim]已入库，跳过：《{fallback_title}》")
+        return doc_id
+
+    from .stages import _find_pandoc
+    pandoc = _find_pandoc()
+    folder_base = f"BOOK_{fallback_title}_{doc_id[:8]}"
+    out_root = os.path.join(settings.MINERU_OUTPUT_DIR, folder_base)
+    os.makedirs(out_root, exist_ok=True)
+
+    # epub → markdown（并把内嵌图片抽到 out_root/media/）
+    proc = subprocess.run(
+        [pandoc, "-f", "epub", "-t", "gfm", f"--extract-media={out_root}", epub_path],
+        capture_output=True, timeout=600)
+    if proc.returncode != 0:
+        conn.close()
+        raise RuntimeError(f"pandoc epub→markdown 失败: {proc.stderr.decode('utf-8', 'ignore')[:300]}")
+    raw_md = proc.stdout.decode("utf-8", "ignore").strip()
+    if not raw_md:
+        conn.close()
+        raise RuntimeError("EPUB 解析为空")
+
+    # 图片资产（先于清洗抽取）：pandoc 图注可能是 markdown ![alt](src) 或 HTML <img ...>，两种都收
+    assets = []
+
+    def _add_asset(src, cap):
+        src = (src or "").strip()
+        if not src:
+            return
+        assets.append({"asset_type": "image", "img_path": epub_asset_relpath(src, settings.MINERU_OUTPUT_DIR),
+                       "caption": (cap or "").strip(), "page_idx": None})
+
+    for m in re.finditer(r"!\[([^\]]*)\]\(([^)\s]+)", raw_md):
+        _add_asset(m.group(2), m.group(1))
+    for m in re.finditer(r"<img\b[^>]*>", raw_md, re.IGNORECASE):
+        src = re.search(r'src\s*=\s*"([^"]+)"', m.group(0))
+        alt = re.search(r'alt\s*=\s*"([^"]*)"', m.group(0))
+        _add_asset(src.group(1) if src else "", alt.group(1) if alt else "")
+
+    # 清洗 epub 章节包裹 HTML（<div>/<span id>/<figure>），保留 figcaption 文本供检索
+    md_text = raw_md
+    md_text = re.sub(r"<span[^>]*></span>", "", md_text)
+    md_text = re.sub(r"</?div[^>]*>", "", md_text)
+    md_text = re.sub(r"</?figure[^>]*>", "", md_text)
+    md_text = re.sub(r"<figcaption[^>]*>(.*?)</figcaption>", r"\1", md_text, flags=re.DOTALL)
+    md_text = re.sub(r"\n{3,}", "\n\n", md_text).strip()
+    with open(os.path.join(out_root, "full.md"), "w", encoding="utf-8") as f:
+        f.write(md_text)
+
+    lang = "zh" if _looks_chinese(md_text[:3000]) else "en"
+    meta = extract_epub_meta(epub_path)
+    # 仅在本地元数据缺作者时才动用一次小 LLM 调用补齐
+    if use_llm and client is not None and not meta.get("authors"):
+        try:
+            from .stages import _chat_json
+            data = _chat_json(client, settings.REVIEW_MODEL, BOOK_META_PROMPT.format(
+                filename=os.path.basename(epub_path), md_head=md_text[:2500]))
+            for k in ("authors", "publisher", "pub_place", "edition", "year"):
+                v = str(data.get(k, "") or "").strip()
+                if v and not meta.get(k):
+                    meta[k] = v
+            meta["source"] = "epub+llm"
+        except Exception:
+            pass
+
+    # pandoc epub 的 --extract-media 按原书内部路径平铺进 out_root（无 media/ 子目录）
+    images_dir = out_root
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """INSERT OR REPLACE INTO papers
+           (id, title, pdf_path, language, mineru_md, images_dir, status, processed_at)
+           VALUES (?,?,?,?,?,?, 'EXPORTED', ?)""",
+        (doc_id, meta["title"], epub_path, lang, md_text, images_dir, now))
+    conn.commit()
+    conn.close()
+
+    details = {
+        "title": meta["title"],
+        "title_zh": meta["title"] if lang == "zh" else "",
+        "title_en": meta["title"] if lang == "en" else "",
+        "doc_type": "book", "authors": meta.get("authors", ""),
+        "publisher": meta.get("publisher", ""), "pub_place": meta.get("pub_place", ""),
+        "edition": meta.get("edition", ""), "year": meta.get("year", ""),
+        "isbn": meta.get("isbn", ""), "journal": "", "doi": "", "keywords": "",
+        "n_figures": len(assets), "n_tables": 0,
+        "source": meta.get("source", "epub"),
+    }
+    store.save_enrichment(doc_id, details, assets=assets, refs=[])
+
+    export_to_excel([{
+        "文献ID": doc_id, "标题": meta["title"], "文献类型": "教材/图书(EPUB)",
+        "作者": meta.get("authors", ""), "年份": meta.get("year", ""),
+        "出版社": meta.get("publisher", ""), "出版地": meta.get("pub_place", ""),
+        "版次": meta.get("edition", ""), "ISBN": meta.get("isbn", ""),
+        "文件路径": epub_path, "语言": lang, "状态": "EXPORTED",
+        "解析时间": now,
+    }], settings.EXCEL_OUTPUT_PATH)
+
+    # epub → docx（pandoc 原生，供阅读），放源文件同目录同名
+    dest_docx = os.path.splitext(epub_path)[0] + ".docx"
+    docx_path = ""
+    try:
+        p2 = subprocess.run([pandoc, "-f", "epub", "-t", "docx", epub_path, "-o", dest_docx],
+                            capture_output=True, timeout=600)
+        if p2.returncode == 0:
+            docx_path = dest_docx
+        else:
+            console.print(f"[yellow]⚠️ epub→docx 失败（不影响入库/检索）: "
+                          f"{p2.stderr.decode('utf-8', 'ignore')[:200]}")
+    except Exception as e:
+        console.print(f"[yellow]⚠️ 可读 Word 生成失败（不影响入库/检索）: {e}")
+
+    log_run_event(mode="book", event="book_added", title=meta["title"], doc_id=doc_id,
+                  status="success", extra={"format": "epub", "figures": len(assets),
+                                           "docx": docx_path, "source": meta.get("source", "epub")})
+    console.print(f"[bold green]✅ 入库(EPUB)：《{meta['title']}》"
+                  f"(doc_id {doc_id[:8]}，图片 {len(assets)} 项)")
     if docx_path:
         console.print(f"[green]  可读 Word: {docx_path}")
     console.print("[dim]  提示：运行 `python review.py index` 让它进入检索库。")
