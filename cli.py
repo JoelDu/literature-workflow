@@ -116,6 +116,8 @@ def run_doctor():
         ("笔记目录 (OBSIDIAN_VAULT_DIR)", settings.OBSIDIAN_VAULT_DIR),
         ("归档目录 (PROCESSED_PDF_DIR)", settings.PROCESSED_PDF_DIR),
         ("失败目录 (FAILED_PDF_DIR)", settings.FAILED_PDF_DIR),
+        ("教材输入目录 (BOOK_INPUT_DIR)", settings.BOOK_INPUT_DIR),
+        ("教材解析目录 (BOOK_OUTPUT_DIR)", settings.BOOK_OUTPUT_DIR),
         ("持久数据 (data/)", os.path.dirname(settings.EXCEL_OUTPUT_PATH))
     ]
     all_dirs_ok = True

@@ -141,17 +141,23 @@ def cmd_add_book(args):
         _require_siliconflow()
         client, _ = _make_client()
 
+    # 不传路径时默认扫描统一的书籍输入目录（与 INPUT_PDF_DIR 平行，自动创建）
+    path = args.path or settings.BOOK_INPUT_DIR
+    if not args.path:
+        os.makedirs(path, exist_ok=True)
+        console.print(f"[dim]未指定路径，扫描默认书籍目录：{path}")
+
     # 收集待入库文件（PDF/EPUB）：单文件或目录
-    if os.path.isdir(args.path):
-        files = sorted(os.path.join(args.path, f) for f in os.listdir(args.path)
+    if os.path.isdir(path):
+        files = sorted(os.path.join(path, f) for f in os.listdir(path)
                        if f.lower().endswith((".pdf", ".epub")))
-    elif os.path.isfile(args.path):
-        files = [args.path]
+    elif os.path.isfile(path):
+        files = [path]
     else:
-        console.print(f"[bold red]❌ 路径不存在：{args.path}")
+        console.print(f"[bold red]❌ 路径不存在：{path}")
         sys.exit(1)
     if not files:
-        console.print(f"[yellow]目录中没有 PDF/EPUB：{args.path}")
+        console.print(f"[yellow]目录中没有 PDF/EPUB：{path}")
         return
 
     ok, failed = 0, 0
@@ -345,7 +351,8 @@ def main():
     p.set_defaults(func=cmd_enrich)
 
     p = sub.add_parser("add-book", help="教材/书籍入库（PDF 走 MinerU 拆分拼接；EPUB 走 pandoc；均不做 LLM 全文分析）")
-    p.add_argument("path", help="单个 PDF/EPUB 或包含多本的目录")
+    p.add_argument("path", nargs="?", default=None,
+                  help="单个 PDF/EPUB 或包含多本的目录；不传则默认扫描 BOOK_INPUT_DIR（默认 ./input_books）")
     p.add_argument("--pages", type=int, default=None, help="PDF 每份最大页数（默认取 BOOK_SPLIT_PAGES=180；EPUB 忽略）")
     p.add_argument("--no-llm", action="store_true", help="元数据只做本地解析，出版社/版次等留空待手填")
     p.set_defaults(func=cmd_add_book)

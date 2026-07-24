@@ -37,6 +37,8 @@ class FakeSettings:
     def __init__(self, tmp_dir, **overrides):
         self.REVIEW_OUTPUT_DIR = tmp_dir
         self.DB_PATH = os.path.join(tmp_dir, "batch_tracking.db")
+        self.MINERU_OUTPUT_DIR = "./mineru_output"
+        self.BOOK_OUTPUT_DIR = "./book_output"
         self.REVIEW_INSERT_FIGURES = True
         self.REVIEW_FIGURES_PER_SECTION = 2
         self.REVIEW_FIGURE_MIN_SCORE = 0.2
@@ -69,15 +71,28 @@ def _write_fake_image(tmp_path, rel_path):
 def test_resolve_asset_path_found(tmp_path):
     tmp = str(tmp_path)
     _write_fake_image(tmp, "paperA/images/fig1.jpg")
-    db_path = os.path.join(tmp, "batch_tracking.db")
-    resolved = _resolve_asset_path("paperA/images/fig1.jpg", db_path)
+    settings = FakeSettings(tmp)
+    resolved = _resolve_asset_path("paperA/images/fig1.jpg", settings)
     assert resolved.endswith("fig1.jpg")
     assert os.path.isfile(resolved)
 
 
 def test_resolve_asset_path_missing(tmp_path):
-    db_path = os.path.join(str(tmp_path), "batch_tracking.db")
-    assert _resolve_asset_path("nope/images/x.jpg", db_path) == ""
+    settings = FakeSettings(str(tmp_path))
+    assert _resolve_asset_path("nope/images/x.jpg", settings) == ""
+
+
+def test_resolve_asset_path_found_under_book_output_dir(tmp_path):
+    """教材图表存在 BOOK_OUTPUT_DIR（与 MINERU_OUTPUT_DIR 平行）下，也要能解析到。"""
+    tmp = str(tmp_path)
+    full = os.path.join(tmp, "book_output", "化工原理_deadbeef", "images", "fig1.jpg")
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as f:
+        f.write(b"\xff\xd8\xff\xe0fake-jpeg")
+    settings = FakeSettings(tmp)
+    resolved = _resolve_asset_path("化工原理_deadbeef/images/fig1.jpg", settings)
+    assert resolved.endswith("fig1.jpg")
+    assert os.path.isfile(resolved)
 
 
 def test_clean_caption_collapses_whitespace():

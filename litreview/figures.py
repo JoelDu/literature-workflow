@@ -17,13 +17,22 @@ def _clean_caption(caption: str) -> str:
     return _WS_RE.sub(" ", caption or "").strip()
 
 
-def _resolve_asset_path(img_path: str, db_path: str) -> str:
-    """paper_assets.img_path（相对 mineru_output 根）→ 绝对路径；找不到返回空。"""
-    for base in (os.path.join(os.getcwd(), "mineru_output"),
-                 os.path.join(os.path.dirname(os.path.abspath(db_path)), "mineru_output")):
-        candidate = os.path.join(base, img_path)
-        if os.path.isfile(candidate):
-            return candidate
+def _resolve_asset_path(img_path: str, settings) -> str:
+    """paper_assets.img_path（相对 MINERU_OUTPUT_DIR 或 BOOK_OUTPUT_DIR 根）→ 绝对路径；找不到返回空。
+
+    论文图表存在 MINERU_OUTPUT_DIR 下，教材/书籍图表存在 BOOK_OUTPUT_DIR 下（两者互不混放），
+    img_path 本身不记录是哪一个，所以两个根都试；每个根既按 CWD 又按 DB 文件所在目录找一遍
+    （CWD 和 DB_PATH 目录不一致时——例如 mcp_server.sh 里 DB_PATH 指向别处——仍能找到文件）。
+    """
+    db_dir = os.path.dirname(os.path.abspath(settings.DB_PATH))
+    for out_dir in (settings.MINERU_OUTPUT_DIR, getattr(settings, "BOOK_OUTPUT_DIR", None)):
+        if not out_dir:
+            continue
+        basename = os.path.basename(os.path.normpath(out_dir))
+        for base in (os.path.join(os.getcwd(), basename), os.path.join(db_dir, basename)):
+            candidate = os.path.join(base, img_path)
+            if os.path.isfile(candidate):
+                return candidate
     return ""
 
 
@@ -64,7 +73,7 @@ def select_section_figures(store, reranker, section, draft, settings, console,
     blocks = []
     for idx, score in picked:
         a = assets[idx]
-        src = _resolve_asset_path(a["img_path"], settings.DB_PATH)
+        src = _resolve_asset_path(a["img_path"], settings)
         if not src:
             continue
         dest_name = f"{a['doc_id'][:8]}_{os.path.basename(a['img_path'])}"

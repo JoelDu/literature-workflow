@@ -35,7 +35,7 @@
 
 **命令行用法**：`review.py index`（建向量索引）→ `enrich`（提取结构化元数据）→ `search`（检索调试）→ `outline`（先出大纲，可手改）→ `generate`（正式生成，支持指定侧重方向/目标字数/章节数）。
 
-**教材/书籍入库**：`review.py add-book <pdf/epub 或目录>` 走一条轻量通道——把教材当作**检索语料**加入(供 search 与综述引用)，但不做 LLM 全文分析、不进 Obsidian(省钱)，只进 Excel。按扩展名自动分流两条路径：PDF 常超 MinerU 单任务页数上限，会用 pypdf 自动拆分再拼回同一 doc_id；EPUB 是数字文本，直接用 pandoc 转 markdown 入库（无需 MinerU），元数据优先读 EPUB 自带的 OPF/dc 字段。检索时论文与教材默认混用(可用 `--corpus` 限定)；参考文献按类型区分,论文 `[J]`、教材 `[M]`(GB/T 7714)。
+**教材/书籍入库**：`review.py add-book [pdf/epub 或目录]` 走一条轻量通道——把教材当作**检索语料**加入(供 search 与综述引用)，但不做 LLM 全文分析、不进 Obsidian(省钱)，只进 Excel。按扩展名自动分流两条路径：PDF 常超 MinerU 单任务页数上限，会用 pypdf 自动拆分再拼回同一 doc_id；EPUB 是数字文本，直接用 pandoc 转 markdown 入库（无需 MinerU），元数据优先读 EPUB 自带的 OPF/dc 字段。输入输出目录与论文流水线平行、独立管理：不传路径时默认扫 `BOOK_INPUT_DIR`(`./input_books`)，解析结果按`书名_doc_id前8位`分子文件夹落进 `BOOK_OUTPUT_DIR`(`./book_output`)，不与论文的 `MINERU_OUTPUT_DIR` 混放。检索时论文与教材默认混用(可用 `--corpus` 限定)；参考文献按类型区分,论文 `[J]`、教材 `[M]`(GB/T 7714)。
 
 ## 三、MCP Server：在对话里直接用
 

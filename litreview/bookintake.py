@@ -63,7 +63,7 @@ def stitch_markdown(parts_md: list) -> str:
 
 def collect_book_assets(out_root: str, folder_base: str, n_parts: int, max_pages: int) -> list:
     """从各 part 的 content_list.json 汇总图/表资产，供综述插图引用。
-    img_path 前缀成相对 mineru_output 根的路径（folder_base/part{i}/images/...），
+    img_path 前缀成相对 BOOK_OUTPUT_DIR 根的路径（folder_base/part{i}/images/...），
     page_idx 按 part 顺序偏移为整本页码。复用 enrich 的本地解析器。"""
     from .enrich import _load_content_list, parse_content_list
     assets = []
@@ -182,7 +182,8 @@ def add_book(pdf_path: str, settings, console, client=None,
         return doc_id
 
     mineru = MinerUClient(settings.MINERU_API_KEY)
-    out_root = os.path.join(settings.MINERU_OUTPUT_DIR, f"BOOK_{title}_{doc_id[:8]}")
+    folder_base = f"{title}_{doc_id[:8]}"
+    out_root = os.path.join(settings.BOOK_OUTPUT_DIR, folder_base)
     os.makedirs(out_root, exist_ok=True)
 
     with tempfile.TemporaryDirectory() as workdir:
@@ -202,7 +203,7 @@ def add_book(pdf_path: str, settings, console, client=None,
         raise RuntimeError("MinerU 未返回任何 markdown 内容")
 
     # 抽取书内图/表 → paper_assets，让综述能引用教材里的图（引用该书的章节时候选）
-    book_assets = collect_book_assets(out_root, f"BOOK_{title}_{doc_id[:8]}", len(parts), max_pages)
+    book_assets = collect_book_assets(out_root, folder_base, len(parts), max_pages)
 
     lang = "zh" if _looks_chinese(md_text[:3000]) else "en"
     meta = extract_book_meta(md_text[:3000], pdf_path, client, settings, use_llm=use_llm)
@@ -343,8 +344,8 @@ def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = Tru
 
     from .stages import _find_pandoc
     pandoc = _find_pandoc()
-    folder_base = f"BOOK_{fallback_title}_{doc_id[:8]}"
-    out_root = os.path.join(settings.MINERU_OUTPUT_DIR, folder_base)
+    folder_base = f"{fallback_title}_{doc_id[:8]}"
+    out_root = os.path.join(settings.BOOK_OUTPUT_DIR, folder_base)
     os.makedirs(out_root, exist_ok=True)
 
     # epub → markdown（并把内嵌图片抽到 out_root/media/）
@@ -366,7 +367,7 @@ def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = Tru
         src = (src or "").strip()
         if not src:
             return
-        assets.append({"asset_type": "image", "img_path": epub_asset_relpath(src, settings.MINERU_OUTPUT_DIR),
+        assets.append({"asset_type": "image", "img_path": epub_asset_relpath(src, settings.BOOK_OUTPUT_DIR),
                        "caption": (cap or "").strip(), "page_idx": None})
 
     for m in re.finditer(r"!\[([^\]]*)\]\(([^)\s]+)", raw_md):

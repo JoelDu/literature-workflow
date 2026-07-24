@@ -67,6 +67,8 @@ class Settings(BaseModel):
     REVIEW_OUTPUT_DIR: str = "./obsidian_vault/reviews"
     REVIEW_AUTO_INDEX: bool = True           # 导出后自动增量更新向量索引
     BOOK_SPLIT_PAGES: int = 180              # 教材入库时每份 PDF 最大页数（≤ MinerU 单任务上限）
+    BOOK_INPUT_DIR: str = "./input_books"    # add-book 不传路径时默认扫描此目录（与 INPUT_PDF_DIR 平行）
+    BOOK_OUTPUT_DIR: str = "./book_output"   # 教材解析结果根目录，每本书一个子文件夹（与 MINERU_OUTPUT_DIR 平行、互不混放）
     REVIEW_INSERT_FIGURES: bool = True       # 综述是否自动插入相关论文图表
     REVIEW_FIGURES_PER_SECTION: int = 2      # 每章节最多插图数
     REVIEW_FIGURE_MIN_SCORE: float = 0.2     # 图题 rerank 相关度阈值（低于不插）
@@ -123,6 +125,8 @@ def get_settings() -> Settings:
                 "REVIEW_OUTPUT_DIR": os.getenv("REVIEW_OUTPUT_DIR", "./obsidian_vault/reviews"),
                 "REVIEW_AUTO_INDEX": os.getenv("REVIEW_AUTO_INDEX", "true").lower() == "true",
                 "BOOK_SPLIT_PAGES": int(os.getenv("BOOK_SPLIT_PAGES", "180")),
+                "BOOK_INPUT_DIR": os.getenv("BOOK_INPUT_DIR", "./input_books"),
+                "BOOK_OUTPUT_DIR": os.getenv("BOOK_OUTPUT_DIR", "./book_output"),
                 "REVIEW_INSERT_FIGURES": os.getenv("REVIEW_INSERT_FIGURES", "true").lower() == "true",
                 "REVIEW_FIGURES_PER_SECTION": int(os.getenv("REVIEW_FIGURES_PER_SECTION", "2")),
                 "REVIEW_FIGURE_MIN_SCORE": float(os.getenv("REVIEW_FIGURE_MIN_SCORE", "0.2")),

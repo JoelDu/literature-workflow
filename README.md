@@ -165,14 +165,16 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
 教材、图书可作为**检索语料**加入文献库，供 `search` 与综述引用——但**不做 LLM 全文分析、不生成 Obsidian 笔记**（省钱），解析成文本入检索库、抽图入 `paper_assets`（综述可引用教材里的图）、并写一行 Excel。支持 **PDF**（走 MinerU）与 **EPUB**（走 pandoc，无需 MinerU），按扩展名自动分流：
 
 ```bash
-python review.py add-book 某教材.pdf            # 单本 PDF
+python review.py add-book 某教材.pdf            # 单本 PDF（放哪都行，直接给路径）
 python review.py add-book 某教材.epub           # 单本 EPUB
-python review.py add-book ./books/              # 批量（目录内所有 PDF/EPUB 混合）
+python review.py add-book ./books/              # 批量（指定目录内所有 PDF/EPUB 混合）
+python review.py add-book                       # 不传路径：扫描默认书籍目录 BOOK_INPUT_DIR
 python review.py add-book 大部头.pdf --no-llm    # 元数据只本地解析，出版社/版次留空待手填
 python review.py index                          # 入库后建索引（与论文共用检索库）
 python review.py search "某概念" --corpus book   # 只在教材中检索（默认 all=论文+教材混检）
 ```
 
+- **统一管理目录**：`BOOK_INPUT_DIR`（默认 `./input_books`）与 `MINERU_OUTPUT_DIR`平行——`add-book` 不传路径时默认扫描这里；解析结果落进 `BOOK_OUTPUT_DIR`（默认 `./book_output`，与 `MINERU_OUTPUT_DIR` 平行、不跟论文的解析结果混放），每本书按 `书名_doc_id前8位` 单独建一个子文件夹（拆分出的 PDF 分册、EPUB 抽出的图、full.md 等都在里面）。两个目录都可在 `.env` 里改。
 - **PDF 自动拆分**：书籍常超 MinerU 单任务页数上限，`add-book` 会用 `pypdf` 按 `BOOK_SPLIT_PAGES`（默认 180）把大 PDF 切成多份、逐份解析后拼回**同一 doc_id**（按整本 PDF 哈希，重复运行幂等）。
 - **EPUB 直接转换**：数字文本无需拆分/MinerU，`pandoc` 直接 epub→markdown 入库（`--extract-media` 抽图入 `paper_assets`）+ epub→docx 生成可读 Word（源文件同目录同名）。`--pages` 对 EPUB 无效。
 - **元数据**：PDF 书名取文件名；EPUB 优先读 OPF 的 `dc:title/creator/publisher/date/identifier`（读不到才回退文件名）。年份/ISBN 本地正则提取；作者/出版社/出版地/版次缺失时由**每本一次前置页 LLM 小调用**补齐（仅送封面/版权页附近 ~2500 字，几分钱级；`--no-llm` 可关，或本地元数据已齐全时自动跳过 LLM 调用）。
