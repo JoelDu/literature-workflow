@@ -4,6 +4,8 @@ import shutil
 from datetime import datetime
 
 from dotenv import load_dotenv
+load_dotenv()
+
 from rich.console import Console
 from rich.progress import (
     Progress, SpinnerColumn, TextColumn, BarColumn,
@@ -15,7 +17,6 @@ from llm_router import LLMRouter
 from utils import init_dirs, generate_obsidian_note, export_to_excel, get_settings, calculate_pdf_hash, extract_original_abstract, load_processed_hashes, save_processed_hash, log_run_event
 
 # ── 强前置校验配置 ──────────────────────────────────────────────────────────
-load_dotenv()
 settings = get_settings()
 
 console = Console()

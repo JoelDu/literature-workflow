@@ -3,6 +3,8 @@ import time
 import schedule
 from datetime import datetime
 from dotenv import load_dotenv
+load_dotenv()
+
 from rich.console import Console
 
 # 导入共享配置与管道
@@ -11,7 +13,6 @@ import batch_pipeline
 from utils import get_settings, init_dirs
 
 # ── 强前置配置校验 ──────────────────────────────────────────────────────────
-load_dotenv()
 settings = get_settings()
 
 console = Console()

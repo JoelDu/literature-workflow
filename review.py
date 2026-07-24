@@ -13,12 +13,13 @@ import json
 import argparse
 
 from dotenv import load_dotenv
+load_dotenv()
+
 from rich.console import Console
 from rich.table import Table
 
 from utils import get_settings, log_run_event
 
-load_dotenv()
 console = Console()
 
 try:

@@ -3,6 +3,8 @@ import sys
 import sqlite3
 import argparse
 from dotenv import load_dotenv
+load_dotenv()
+
 from rich.console import Console
 from rich.table import Table
 
@@ -12,7 +14,6 @@ from mineru_client import MinerUClient
 from llm_router import LLMRouter
 import batch_pipeline
 
-load_dotenv()
 console = Console()
 
 try:
@@ -223,8 +224,9 @@ def reset_tasks(failed_only=False, doc_id=None):
 def show_history(days=7):
     """读取 data/pipeline_history.jsonl，分析最近数天的运行状况并生成可视化报告。"""
     console.rule(f"[bold cyan]📅 Literature Analyzer 运行历史 (最近 {days} 天)")
-    
-    history_file = "./data/pipeline_history.jsonl"
+
+    from utils import _data_dir
+    history_file = os.path.join(_data_dir(), "pipeline_history.jsonl")
     if not os.path.exists(history_file):
         console.print("[yellow]暂无运行历史记录日志。[/yellow]")
         return

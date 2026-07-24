@@ -24,6 +24,8 @@ shutil.move = _safe_move_hijack
 from datetime import datetime
 
 from dotenv import load_dotenv
+load_dotenv()
+
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -33,7 +35,6 @@ from llm_router import LLMRouter
 from utils import init_dirs, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event
 
 # ── 配置获取 ──────────────────────────────────────────────────────────────────
-load_dotenv()
 settings = get_settings()
 
 console = Console()

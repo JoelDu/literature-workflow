@@ -367,10 +367,17 @@ def export_to_excel(rows: list[dict], excel_path: str) -> None:
 
 # ── 运行历史日志记录 ─────────────────────────────────────────────────────────
 
-def log_run_event(mode: str, event: str, title: str = "", doc_id: str = "", status: str = "success", error: str = "", extra: dict = None) -> None:
-    """在 data/pipeline_history.jsonl 中追加一条事件记录，方便 cli 查询运行历史与统计。
+def _data_dir() -> str:
+    """运行日志/历史的落盘目录，跟 DB_PATH 同一个根，不单独硬编码相对路径
+    （否则裸跑 CLI 时会散落到 CWD 而不是 DB_PATH 实际所在的数据盘）。
     """
-    history_file = "./data/pipeline_history.jsonl"
+    return os.path.dirname(os.getenv("DB_PATH", "./data/batch_tracking.db")) or "."
+
+
+def log_run_event(mode: str, event: str, title: str = "", doc_id: str = "", status: str = "success", error: str = "", extra: dict = None) -> None:
+    """在 <DB_PATH 所在目录>/pipeline_history.jsonl 中追加一条事件记录，方便 cli 查询运行历史与统计。
+    """
+    history_file = os.path.join(_data_dir(), "pipeline_history.jsonl")
     os.makedirs(os.path.dirname(history_file), exist_ok=True)
     
     log_entry = {
@@ -420,8 +427,8 @@ class TeeLogger:
     def isatty(self):
         return hasattr(self.terminal, "isatty") and self.terminal.isatty()
 
-# 自动重定向 stdout 和 stderr 到 data/app.log
-sys.stdout = TeeLogger("./data/app.log", sys.stdout)
-sys.stderr = TeeLogger("./data/app.log", sys.stderr)
+# 自动重定向 stdout 和 stderr 到 <DB_PATH 所在目录>/app.log
+sys.stdout = TeeLogger(os.path.join(_data_dir(), "app.log"), sys.stdout)
+sys.stderr = TeeLogger(os.path.join(_data_dir(), "app.log"), sys.stderr)
 
 
