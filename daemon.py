@@ -75,6 +75,44 @@ def batch_prepare_job():
         send_notification("Batch 提交异常", f"发生错误:\n{str(e)}")
 
 
+def book_intake_job():
+    console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始每日教材定时入库...[/bold cyan]")
+    try:
+        from litreview.bookintake import run_scheduled_intake
+        from llm_router import make_deepseek_client
+        # 统一构造一次 SiliconFlow 客户端：既供 add_book/add_epub 的元数据补全用，
+        # 也供后面自动建索引（embeddings 无论如何都需要它，跟 REVIEW_ENRICH_LLM 无关）
+        client, _ = make_deepseek_client(quiet=True)
+        use_llm = settings.REVIEW_ENRICH_LLM
+        report = run_scheduled_intake(settings, console, client=client if use_llm else None, use_llm=use_llm)
+
+        if report["scanned"] == 0:
+            console.print("[dim]教材输入目录为空，守护进程保持静默。")
+            return
+
+        msg = (
+            f"扫描教材总数: {report['scanned']}\n"
+            f"成功入库: {report['ok']} 本\n"
+            f"入库失败: {report['failed']} 本\n"
+            f"页数预算用完、留到下一晚: {report['deferred']} 本\n"
+            f"本轮用页: {report['pages_used']}/{settings.BOOK_DAILY_PAGE_BUDGET}"
+        )
+        console.print(f"[bold green]{msg}")
+        if report["ok"] > 0 or report["failed"] > 0:
+            send_notification("每日教材入库报告", msg)
+
+        # 有新书成功入库时，自动增量更新检索索引（异常隔离：失败不影响入库结果）
+        if report["ok"] > 0 and settings.REVIEW_AUTO_INDEX:
+            try:
+                from litreview.indexer import build_index
+                build_index(settings, console, client)
+            except Exception as e:
+                console.print(f"[yellow]⚠️ 综述索引自动更新失败（不影响入库，可手动运行 review.py index）: {e}")
+    except Exception as e:
+        console.print(f"[red]教材定时入库发生异常: {e}")
+        send_notification("教材定时入库异常", f"发生错误:\n{str(e)}")
+
+
 def batch_fetch_job():
     console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始拉取 Batch 结果...[/bold cyan]")
     try:
@@ -122,6 +160,12 @@ def main():
         # 启动即时执行一次
         realtime_job()
         schedule.every(settings.SCAN_INTERVAL_MINUTES).minutes.do(realtime_job)
+
+    # 教材定时入库：与论文的 RUN_MODE 无关，固定每天跑一次（不做冷启动即时执行，
+    # 否则容器重启时间不对就会在非预期时刻触发一次）
+    console.print(f"调度策略: 每日 {settings.BOOK_INTAKE_TIME} 定时入库教材，"
+                  f"每晚最多处理 {settings.BOOK_DAILY_PAGE_BUDGET} 页 PDF")
+    schedule.every().day.at(settings.BOOK_INTAKE_TIME).do(book_intake_job)
 
     # 主循环
     while True:

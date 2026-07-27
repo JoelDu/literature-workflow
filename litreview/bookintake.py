@@ -459,3 +459,53 @@ def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = Tru
         console.print(f"[green]  可读 Word: {docx_path}")
     console.print("[dim]  提示：运行 `python review.py index` 让它进入检索库。")
     return doc_id
+
+
+def run_scheduled_intake(settings, console, client=None, use_llm: bool = True) -> dict:
+    """定时任务用：扫描 BOOK_INPUT_DIR，按 PDF 总页数预算逐本入库。
+
+    每晚额度用完就停，剩下的书留到下一次运行（不会漏，只是延后）。第一本书
+    即使单本页数就超过预算也会处理完（否则超大部头会永远排不到），只有
+    "已经处理过至少一本、再加下一本会超预算"时才会推迟。EPUB 走 pandoc、
+    不占 MinerU 页数配额，因此不计入预算。
+    """
+    from pypdf import PdfReader
+
+    report = {"scanned": 0, "ok": 0, "failed": 0, "deferred": 0, "pages_used": 0}
+    book_dir = settings.BOOK_INPUT_DIR
+    if not os.path.isdir(book_dir):
+        return report
+
+    files = sorted(f for f in os.listdir(book_dir) if f.lower().endswith((".pdf", ".epub")))
+    report["scanned"] = len(files)
+    budget = settings.BOOK_DAILY_PAGE_BUDGET
+    used = 0
+
+    for fname in files:
+        path = os.path.join(book_dir, fname)
+        try:
+            if fname.lower().endswith(".epub"):
+                add_epub(path, settings, console, client=client, use_llm=use_llm)
+                report["ok"] += 1
+                continue
+
+            n_pages = len(PdfReader(path).pages)
+            if used > 0 and used + n_pages > budget:
+                report["deferred"] += 1
+                console.print(f"[yellow]📚 今晚教材页数预算已用完（{used}/{budget}），"
+                              f"《{fname}》留到下一晚")
+                continue
+
+            add_book(path, settings, console, client=client,
+                     max_pages=settings.BOOK_SPLIT_PAGES, use_llm=use_llm)
+            used += n_pages
+            report["ok"] += 1
+        except Exception as e:
+            report["failed"] += 1
+            console.print(f"[red]✖ 教材定时入库失败 {fname}: {e}")
+            log_run_event(mode="book", event="book_added", title=fname,
+                          status="failed", error=str(e))
+
+    report["pages_used"] = used
+    return report
+    return doc_id

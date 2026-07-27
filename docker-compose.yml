@@ -18,6 +18,9 @@ services:
       # 及时入库调度（间隔驱动）
       - BATCH_SCAN_INTERVAL_MINUTES=30
       - BATCH_FETCH_INTERVAL_MINUTES=120
+      # 教材每日定时入库：凌晨 3 点，每晚最多处理 2000 页 PDF
+      - BOOK_INTAKE_TIME=03:00
+      - BOOK_DAILY_PAGE_BUDGET=2000
       # host 网络下代理直接用宿主机回环地址（覆盖 env_file 里 172.17.0.1 的旧值）。
       # ALL_PROXY 置空：socks5 代理需要 httpx[socks]，镜像里没装，留着会让 openai 客户端初始化崩溃。
       - HTTP_PROXY=http://127.0.0.1:20171
@@ -39,6 +42,8 @@ services:
       - /mnt/ripe/literature_analyzer_data/failed_pdfs:/app/failed_pdfs
       - /mnt/ripe/literature_analyzer_data/mineru_output:/app/mineru_output
       - /mnt/ripe/literature_analyzer_data/obsidian_磷化工文献:/app/obsidian_vault
+      - /mnt/ripe/literature_analyzer_data/input_books:/app/input_books
+      - /mnt/ripe/literature_analyzer_data/book_output:/app/book_output
       - /mnt/ripe/literature_analyzer_data:/app/data
     # 默认启动常驻守护进程
     command: ["python", "daemon.py"]

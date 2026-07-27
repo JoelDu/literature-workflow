@@ -9,10 +9,11 @@ import json
 
 from pypdf import PdfReader, PdfWriter
 
+import litreview.bookintake as bookintake
 from litreview.bookintake import (split_pdf_if_needed, stitch_markdown,
                                   _local_book_meta, _looks_chinese,
                                   collect_book_assets, extract_epub_meta,
-                                  epub_asset_relpath)
+                                  epub_asset_relpath, run_scheduled_intake)
 from litreview.models import Outline, OutlineSection, SectionDraft
 from litreview.stages import assemble_review
 
@@ -150,3 +151,68 @@ def test_epub_asset_relpath_does_not_double_prefix_out_root(tmp_path, monkeypatc
 
     assert rel == "BOOK_test_deadbeef/images/pic.png"
     assert os.path.isfile(os.path.join(mineru_dir, rel))
+
+
+class _FakeSettings:
+    def __init__(self, book_input_dir, budget):
+        self.BOOK_INPUT_DIR = book_input_dir
+        self.BOOK_DAILY_PAGE_BUDGET = budget
+        self.BOOK_SPLIT_PAGES = 180
+
+
+def test_run_scheduled_intake_defers_once_budget_exceeded(tmp_path, monkeypatch):
+    """预算用完后，后续的书留到下一晚；但已经在处理中的第一本不受影响。"""
+    _make_pdf(str(tmp_path / "a_6p.pdf"), 6)
+    _make_pdf(str(tmp_path / "b_6p.pdf"), 6)
+    _make_pdf(str(tmp_path / "c_2p.pdf"), 2)
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+
+    settings = _FakeSettings(str(tmp_path), budget=10)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    # a(6) 处理；b(6) 会让 6+6=12>10，推迟；c(2) 6+2=8<=10，处理
+    assert processed == ["a_6p.pdf", "c_2p.pdf"]
+    assert report == {"scanned": 3, "ok": 2, "failed": 0, "deferred": 1, "pages_used": 8}
+
+
+def test_run_scheduled_intake_first_book_may_exceed_budget_alone(tmp_path, monkeypatch):
+    """预算比第一本书还小时，第一本仍然要处理（否则超大部头永远排不到），
+    但后面的书就都要推迟了。"""
+    _make_pdf(str(tmp_path / "big.pdf"), 8)
+    _make_pdf(str(tmp_path / "small.pdf"), 1)
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+
+    settings = _FakeSettings(str(tmp_path), budget=5)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert processed == ["big.pdf"]
+    assert report["ok"] == 1 and report["deferred"] == 1 and report["pages_used"] == 8
+
+
+def test_run_scheduled_intake_epub_does_not_count_toward_budget(tmp_path, monkeypatch):
+    """EPUB 走 pandoc，不占 MinerU 页数预算，不该影响后续 PDF 的可用额度。"""
+    _make_epub(str(tmp_path / "a_book.epub"))
+    _make_pdf(str(tmp_path / "b_4p.pdf"), 4)
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_epub",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+
+    settings = _FakeSettings(str(tmp_path), budget=4)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert processed == ["a_book.epub", "b_4p.pdf"]
+    assert report == {"scanned": 2, "ok": 2, "failed": 0, "deferred": 0, "pages_used": 4}
+
+
+class _QuietConsole:
+    def print(self, *a, **k):
+        pass
