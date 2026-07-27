@@ -14,7 +14,8 @@
 
 **两种运行模式**，由 `daemon.py` 常驻进程调度：
 - **实时模式**：每 10 分钟扫一次 `input_pdfs/`，来了新文件立刻处理
-- **批处理模式**：攒一批走 SiliconFlow 的 Batch API，成本打 5 折；每天凌晨 1 点自动提交、7:30 和 13:30 自动拉结果，容器重启时还会做冷启动检测补跑
+- **批处理模式**：攒一批走 SiliconFlow 的 Batch API，成本打 5 折；按固定间隔轮询提交/拉结果（默认每 30 分钟提交、每 120 分钟拉取，`BATCH_SCAN_INTERVAL_MINUTES`/`BATCH_FETCH_INTERVAL_MINUTES` 可调），容器重启时还会做冷启动检测补跑
+- **教材定时入库**：与上面两种模式互不干扰，固定每天 `BOOK_INTAKE_TIME`（默认 03:00）跑一次，按 `BOOK_DAILY_PAGE_BUDGET`（默认 2000 页）预算逐本处理 `BOOK_INPUT_DIR` 里的教材，用不完的页数留到下一晚，详见下方"教材/书籍入库"
 
 **生产级的细节打磨**（这些是踩过坑之后加的）：
 - SHA-256 哈希去重，重复的 PDF 不会重复烧 token
@@ -36,6 +37,8 @@
 **命令行用法**：`review.py index`（建向量索引）→ `enrich`（提取结构化元数据）→ `search`（检索调试）→ `outline`（先出大纲，可手改）→ `generate`（正式生成，支持指定侧重方向/目标字数/章节数）。
 
 **教材/书籍入库**：`review.py add-book [pdf/epub 或目录]` 走一条轻量通道——把教材当作**检索语料**加入(供 search 与综述引用)，但不做 LLM 全文分析、不进 Obsidian(省钱)，只进 Excel。按扩展名自动分流两条路径：PDF 常超 MinerU 单任务页数上限，会用 pypdf 自动拆分再拼回同一 doc_id；EPUB 是数字文本，直接用 pandoc 转 markdown 入库（无需 MinerU），元数据优先读 EPUB 自带的 OPF/dc 字段。输入输出目录与论文流水线平行、独立管理：不传路径时默认扫 `BOOK_INPUT_DIR`(`./input_books`)，解析结果按`书名_doc_id前8位`分子文件夹落进 `BOOK_OUTPUT_DIR`(`./book_output`)，不与论文的 `MINERU_OUTPUT_DIR` 混放。检索时论文与教材默认混用(可用 `--corpus` 限定)；参考文献按类型区分,论文 `[J]`、教材 `[M]`(GB/T 7714)。
+
+**教材每日定时入库**：不用手动逐本跑 `add-book`——`daemon.py` 固定每天 `BOOK_INTAKE_TIME`（默认 03:00）扫一次 `BOOK_INPUT_DIR`，按文件名排序、PDF 累计页数不超过 `BOOK_DAILY_PAGE_BUDGET`（默认 2000）逐本入库，超预算的留到下一晚（排在最前的第一本例外，哪怕单本就超预算也会处理完，避免超大部头永远排不上）；EPUB 走 pandoc 不占用这个页数预算。成功入库后自动增量建索引（`REVIEW_AUTO_INDEX`）。想不等到凌晨立即跑一次，可执行 `python -c "import daemon; daemon.book_intake_job()"`。
 
 ## 三、MCP Server：在对话里直接用
 

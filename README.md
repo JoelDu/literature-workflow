@@ -8,7 +8,8 @@
 - **智能大模型分析**：集成 **硅基流动 (SiliconFlow) DeepSeek V3** 进行无损文献分析（当前已统一中英文路由至 DeepSeek V3 保证稳定性）。
 - **双模运行机制**：
   - **实时模式** (`RUN_MODE=realtime`)：常驻守护进程，每隔固定时间（默认 10 分钟）自动扫描 `input_pdfs/` 目录并即刻处理，生成 Obsidian 笔记与 Excel 记录。
-  - **批处理模式** (`RUN_MODE=batch`)：利用大模型的 Batch API，享受 **50% 的成本折扣**。常驻守护进程会在每天凌晨 `01:00` 自动提交任务，并在 `07:30` 和 `13:30` 自动拉取结果，同时支持容器启动瞬间的冷启动检测，确保完美错峰。
+  - **批处理模式** (`RUN_MODE=batch`)：利用大模型的 Batch API，享受 **50% 的成本折扣**。常驻守护进程按固定间隔轮询：每 `BATCH_SCAN_INTERVAL_MINUTES`（默认 30）分钟扫描并提交任务，每 `BATCH_FETCH_INTERVAL_MINUTES`（默认 120）分钟拉取结果，同时支持容器启动瞬间的冷启动检测，确保完美错峰。
+  - **教材定时入库**：与上述 `RUN_MODE` 无关，固定每天 `BOOK_INTAKE_TIME`（默认 `03:00`）跑一次，详见下方「教材/书籍入库」小节。
 - **运行历史与状态追踪**：
   - **历史日志统计**：每次运行的解析、提交、拉取、导出状态和异常均会持久化记入 `data/pipeline_history.jsonl` 中。
   - **可视化看板**：提供 `python cli.py history`（查看每日处理成功/失败统计与失败详情）以及 `python cli.py status`（查看当前任务分布）命令行看板，方便进行日常运维与统计。
@@ -179,6 +180,10 @@ python review.py search "某概念" --corpus book   # 只在教材中检索（�
 - **EPUB 直接转换**：数字文本无需拆分/MinerU，`pandoc` 直接 epub→markdown 入库（`--extract-media` 抽图入 `paper_assets`）+ epub→docx 生成可读 Word（源文件同目录同名）。`--pages` 对 EPUB 无效。
 - **元数据**：PDF 书名取文件名；EPUB 优先读 OPF 的 `dc:title/creator/publisher/date/identifier`（读不到才回退文件名）。年份/ISBN 本地正则提取；作者/出版社/出版地/版次缺失时由**每本一次前置页 LLM 小调用**补齐（仅送封面/版权页附近 ~2500 字，几分钱级；`--no-llm` 可关，或本地元数据已齐全时自动跳过 LLM 调用）。
 - **依赖**：PDF 拆分依赖 `pypdf`；EPUB 转换依赖系统装有 `pandoc`；元数据 LLM 补齐依赖 `SILICONFLOW_API_KEY`。加入教材后语料变大，建议把 `RERANK_CANDIDATES` 调大（50→150）以保检索准确率。
+- **每日定时入库（守护进程）**：`daemon.py` 固定每天 `BOOK_INTAKE_TIME`（默认 `03:00`，本地时区）自动扫描 `BOOK_INPUT_DIR`，按文件名排序逐本处理，PDF 累计页数一旦超过 `BOOK_DAILY_PAGE_BUDGET`（默认 2000）就推迟到下一晚（但排在最前、单本就超预算的大部头仍会处理完，避免永远排不上）；EPUB 走 pandoc 不占该页数预算。成功入库后若 `REVIEW_AUTO_INDEX` 开启会自动增量建索引。手动立即触发一次（不等到凌晨）：
+  ```bash
+  python -c "import daemon; daemon.book_intake_job()"
+  ```
 
 ## 🔌 MCP Server（在大模型对话中直接调用）
 
