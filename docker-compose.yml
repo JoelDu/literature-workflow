@@ -21,6 +21,12 @@ services:
       # 教材每日定时入库：凌晨 3 点，每晚最多处理 2000 页 PDF
       - BOOK_INTAKE_TIME=03:00
       - BOOK_DAILY_PAGE_BUDGET=2000
+      # 文档嵌入交给宿主机的夜间任务（crontab 里的 nightly_index.py，0-7 点，08:00 收工）。
+      # 容器内 build_index 只报待办不干活：本地 8B 嵌一篇论文约 24 分钟、占 15G 内存，
+      # 白天被 batch_fetch（每 120 分钟）触发一次就能把机器占死。
+      # 注意 .dockerignore 排除了 .env，容器配置只认这里，改 .env 对容器无效。
+      # 重排不受影响，仍走硅基流动在线 API。
+      - REVIEW_EMBED_BACKEND=local
       # host 网络下代理直接用宿主机回环地址（覆盖 env_file 里 172.17.0.1 的旧值）。
       # ALL_PROXY 置空：socks5 代理需要 httpx[socks]，镜像里没装，留着会让 openai 客户端初始化崩溃。
       - HTTP_PROXY=http://127.0.0.1:20171
