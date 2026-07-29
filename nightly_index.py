@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""夜间本地嵌入入库：00:05 起跑，08:00 收工，可跨夜断点续跑。
+"""夜间本地嵌入入库：22:05 起跑，08:00 收工（10 小时窗口），可跨夜断点续跑。
 
 **必须用系统 python 跑**（torch + sentence-transformers 装在那儿，.venv_lit 没有）：
 
@@ -39,7 +39,9 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 CHUNK_BATCH = 4            # 实测最优；再大也只快个位数百分比，反而拉长丢失窗口
-MAX_HOURS = 8              # 兜底：任何一次运行都不超过 8 小时，防手动误跑跑通宵
+# 兜底上限，防手动误跑跑通宵。**必须 ≥ 夜间窗口长度**：窗口是 22:00–08:00 共 10 小时，
+# 这里若填 8，22:05 起跑的那次会被 min(次日08:00, 起跑+8h) 砍到 06:05 收工，白少两小时。
+MAX_HOURS = 10
 
 _stop = False
 
@@ -66,7 +68,7 @@ def load_env(path: str):
 def deadline_at(hhmm: str) -> datetime:
     """下一个 hhmm 时刻，但最多 MAX_HOURS 小时后。
 
-    cron 只在 0–7 点拉起，正常总是当天 08:00。加上限是防手动在白天误跑：
+    cron 只在 22–23 点和 0–7 点拉起，正常总是次日/当天 08:00。加上限是防手动在白天误跑：
     那样 deadline 会滚到第二天 08:00，机器被占十几个小时。
     """
     now = datetime.now()
