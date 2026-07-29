@@ -34,7 +34,12 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 权重加载进度条在 cron 日志里是几千字符的乱码，关掉
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 CHUNK_BATCH = 4            # 实测最优；再大也只快个位数百分比，反而拉长丢失窗口
+MAX_HOURS = 8              # 兜底：任何一次运行都不超过 8 小时，防手动误跑跑通宵
 
 _stop = False
 
@@ -59,10 +64,17 @@ def load_env(path: str):
 
 
 def deadline_at(hhmm: str) -> datetime:
+    """下一个 hhmm 时刻，但最多 MAX_HOURS 小时后。
+
+    cron 只在 0–7 点拉起，正常总是当天 08:00。加上限是防手动在白天误跑：
+    那样 deadline 会滚到第二天 08:00，机器被占十几个小时。
+    """
     now = datetime.now()
     h, m = (int(x) for x in hhmm.split(":"))
     d = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    return d + timedelta(days=1) if d <= now else d
+    if d <= now:
+        d += timedelta(days=1)
+    return min(d, now + timedelta(hours=MAX_HOURS))
 
 
 def fmt(sec: float) -> str:
@@ -166,12 +178,13 @@ def main() -> int:
                 chars = sum(len(c) for _, c in sub)
                 done_chunks += len(sub)
                 done_chars += chars
-                rate = done_chars / max(time.time() - t_start, 1e-6)
-                eta = f"，按当前速度剩余 {fmt((len(pending) - i - len(sub)) * chars / len(sub) / max(rate, 1e-6))}" \
-                    if rate > 0 else ""
+                # 成本单位是 chunk 不是字符：实测约 60 秒/块且对块长不敏感，
+                # 短块的"字符/小时"会难看好几倍（678 字符也要 272 秒），拿它估时会严重跑偏
+                sec_per_chunk = (time.time() - t_start) / done_chunks
+                left = len(pending) - i - len(sub)
+                eta = f"，本篇剩余约 {fmt(left * sec_per_chunk)}" if left else ""
                 print(f"    {i + len(sub):>4}/{len(pending)} 块  {chars:>5} 字符  "
-                      f"{time.time() - t0:5.1f}s  累计 {rate * 3600 / 10000:.1f} 万字符/小时{eta}",
-                      flush=True)
+                      f"{time.time() - t0:5.1f}s  均 {sec_per_chunk:.0f}s/块{eta}", flush=True)
 
             # 只有全部 chunk 都拿到向量才算这篇完成，半截的下次自动接着跑
             if not store.chunks_needing_embedding(doc_id):
@@ -191,7 +204,8 @@ def main() -> int:
     why = "到点收工" if out_of_time and not _stop else ("被中断" if _stop else "全部做完")
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {why}：完成 {done_docs} 篇 / {done_chunks} 块 / "
           f"{done_chars} 字符，耗时 {fmt(used)}"
-          f"（{done_chars / max(used, 1e-6) * 3600 / 10000:.1f} 万字符/小时）", flush=True)
+          f"（{used / max(done_chunks, 1):.0f} 秒/块，"
+          f"{done_chars / max(used, 1e-6) * 3600 / 10000:.1f} 万字符/小时）", flush=True)
     left = len(store.docs_needing_index())
     if left:
         print(f"       仍有 {left} 篇待索引，下次启动自动接着跑（已完成的块不会重算）", flush=True)
