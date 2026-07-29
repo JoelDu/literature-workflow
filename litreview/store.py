@@ -179,6 +179,31 @@ class VectorStore:
         conn.commit()
         conn.close()
 
+    def doc_index_state(self, doc_id: str):
+        """返回 (md_hash, n_chunks, embedded)；从未索引过则返回 None。
+
+        供夜间断点续跑判断：md_hash 未变说明分块结果仍然有效，可跳过
+        replace_doc_chunks（它会 DELETE 掉上一晚已算好的向量）。
+        """
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT md_hash, n_chunks, embedded FROM review_index_meta WHERE doc_id=?",
+            (doc_id,),
+        ).fetchone()
+        conn.close()
+        return row
+
+    def chunks_needing_embedding(self, doc_id: str) -> list:
+        """返回该文档尚未嵌入的 [(chunk_id, content), ...]，按 chunk_index 排序。"""
+        conn = self._conn()
+        rows = conn.execute(
+            """SELECT chunk_id, content FROM review_chunks
+               WHERE doc_id=? AND embedding IS NULL ORDER BY chunk_index""",
+            (doc_id,),
+        ).fetchall()
+        conn.close()
+        return rows
+
     # ── 检索 ──────────────────────────────────────────────────────────────
 
     def load_matrix(self, force_reload: bool = False):

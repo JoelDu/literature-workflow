@@ -48,6 +48,11 @@ class Settings(BaseModel):
     EMBEDDING_DIM: int = 4096
     EMBEDDING_BATCH_SIZE: int = 32
     EMBEDDING_QUERY_INSTRUCTION: str = "给定一个中文或英文的检索问题，找出能回答该问题的文献段落"
+    # remote=文档嵌入走在线 API；local=交给夜间任务 nightly_index.py 用本地权重跑。
+    # 查询侧（mcp_server/review.py）永远走在线：本地单条要 195 秒冷启动，做不了交互。
+    REVIEW_EMBED_BACKEND: str = "local"
+    LOCAL_EMBEDDING_MODEL_PATH: str = "/mnt/ripe/models/Qwen3-Embedding-8B"
+    NIGHTLY_INDEX_DEADLINE: str = "08:00"     # 夜间嵌入任务的收工时间（HH:MM，到点存盘退出）
     RERANK_MODEL: str = "Qwen/Qwen3-Reranker-8B"
     RERANK_ENABLE: bool = True
     RERANK_CANDIDATES: int = 50              # 向量召回候选数（rerank 后取 REVIEW_TOP_K）
@@ -123,6 +128,10 @@ def get_settings() -> Settings:
                 "REVIEW_MAX_CHUNKS_PER_DOC": int(os.getenv("REVIEW_MAX_CHUNKS_PER_DOC", "4")),
                 "REVIEW_MIN_SCORE": int(os.getenv("REVIEW_MIN_SCORE", "6")),
                 "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "10")),
+                "REVIEW_EMBED_BACKEND": os.getenv("REVIEW_EMBED_BACKEND", "local"),
+                "LOCAL_EMBEDDING_MODEL_PATH": os.getenv("LOCAL_EMBEDDING_MODEL_PATH",
+                                                        "/mnt/ripe/models/Qwen3-Embedding-8B"),
+                "NIGHTLY_INDEX_DEADLINE": os.getenv("NIGHTLY_INDEX_DEADLINE", "08:00"),
                 "REVIEW_MAP_CONCURRENCY": int(os.getenv("REVIEW_MAP_CONCURRENCY", "8")),
                 "REVIEW_OUTPUT_DIR": os.getenv("REVIEW_OUTPUT_DIR", "./obsidian_vault/reviews"),
                 "REVIEW_AUTO_INDEX": os.getenv("REVIEW_AUTO_INDEX", "true").lower() == "true",

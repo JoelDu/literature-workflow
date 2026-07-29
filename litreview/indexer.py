@@ -7,8 +7,22 @@ from .embedder import Embedder
 
 
 def build_index(settings, console, client, force: bool = False) -> dict:
-    """幂等增量索引。force=True 时全量重建。每文档独立事务，单篇失败不影响其余。"""
+    """幂等增量索引（走在线嵌入 API）。force=True 时全量重建。
+
+    每文档独立事务，单篇失败不影响其余。
+
+    REVIEW_EMBED_BACKEND=local 时本函数只报告待办、不做任何事：本地 8B 嵌入
+    单篇论文要跑约 24 分钟，绝不能让白天的 batch_fetch/教材入库当场触发。
+    嵌入统一交给夜间任务 nightly_index.py（00:05–08:00，可断点续跑）。
+    """
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+
+    if getattr(settings, "REVIEW_EMBED_BACKEND", "remote") == "local":
+        todo = store.docs_needing_index()
+        console.print(f"[dim]嵌入后端=local：{len(todo)} 篇待索引留给夜间任务处理，此处跳过。")
+        return {"total": len(todo), "indexed": 0, "failed": 0, "chunks": 0,
+                "deferred": len(todo)}
+
     embedder = Embedder(client, settings.EMBEDDING_MODEL, settings.EMBEDDING_DIM,
                         settings.EMBEDDING_BATCH_SIZE)
 
