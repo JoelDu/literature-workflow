@@ -93,12 +93,14 @@ def book_intake_job():
         msg = (
             f"扫描教材总数: {report['scanned']}\n"
             f"成功入库: {report['ok']} 本\n"
-            f"入库失败: {report['failed']} 本\n"
+            f"已入库跳过并归档: {report['skipped']} 本\n"
+            f"入库失败(下一晚重试): {report['failed']} 本\n"
+            f"文件损坏已隔离: {report['quarantined']} 本\n"
             f"页数预算用完、留到下一晚: {report['deferred']} 本\n"
             f"本轮用页: {report['pages_used']}/{settings.BOOK_DAILY_PAGE_BUDGET}"
         )
         console.print(f"[bold green]{msg}")
-        if report["ok"] > 0 or report["failed"] > 0:
+        if report["ok"] > 0 or report["failed"] > 0 or report["quarantined"] > 0:
             send_notification("每日教材入库报告", msg)
 
         # 有新书成功入库时，自动增量更新检索索引（异常隔离：失败不影响入库结果）

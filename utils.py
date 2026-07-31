@@ -74,6 +74,8 @@ class Settings(BaseModel):
     BOOK_SPLIT_PAGES: int = 180              # 教材入库时每份 PDF 最大页数（≤ MinerU 单任务上限）
     BOOK_INPUT_DIR: str = "./input_books"    # add-book 不传路径时默认扫描此目录（与 INPUT_PDF_DIR 平行）
     BOOK_OUTPUT_DIR: str = "./book_output"   # 教材解析结果根目录，每本书一个子文件夹（与 MINERU_OUTPUT_DIR 平行、互不混放）
+    BOOK_PROCESSED_DIR: str = "./processed_books"  # 已入库的教材原件归档（与 PROCESSED_PDF_DIR 平行）
+    BOOK_FAILED_DIR: str = "./failed_books"        # 文件本身损坏、重试也没意义的教材（与 FAILED_PDF_DIR 平行）
     BOOK_INTAKE_TIME: str = "03:00"           # 每日教材定时入库任务启动时间（HH:MM，本地时区）
     BOOK_DAILY_PAGE_BUDGET: int = 2000        # 每晚最多处理的 PDF 总页数，用完留到下一晚（EPUB 走 pandoc 不占此预算）
     REVIEW_INSERT_FIGURES: bool = True       # 综述是否自动插入相关论文图表
@@ -138,6 +140,8 @@ def get_settings() -> Settings:
                 "BOOK_SPLIT_PAGES": int(os.getenv("BOOK_SPLIT_PAGES", "180")),
                 "BOOK_INPUT_DIR": os.getenv("BOOK_INPUT_DIR", "./input_books"),
                 "BOOK_OUTPUT_DIR": os.getenv("BOOK_OUTPUT_DIR", "./book_output"),
+                "BOOK_PROCESSED_DIR": os.getenv("BOOK_PROCESSED_DIR", "./processed_books"),
+                "BOOK_FAILED_DIR": os.getenv("BOOK_FAILED_DIR", "./failed_books"),
                 "BOOK_INTAKE_TIME": os.getenv("BOOK_INTAKE_TIME", "03:00"),
                 "BOOK_DAILY_PAGE_BUDGET": int(os.getenv("BOOK_DAILY_PAGE_BUDGET", "2000")),
                 "REVIEW_INSERT_FIGURES": os.getenv("REVIEW_INSERT_FIGURES", "true").lower() == "true",

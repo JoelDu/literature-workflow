@@ -21,6 +21,11 @@ services:
       # 教材每日定时入库：凌晨 3 点，每晚最多处理 2000 页 PDF
       - BOOK_INTAKE_TIME=03:00
       - BOOK_DAILY_PAGE_BUDGET=2000
+      # 入库成功/已入库的教材原件移到这里，损坏的移到那里。都必须移出 input_books：
+      # 留在输入目录的旧书每晚会被重新计一遍页数预算，几本大部头就能吃光当晚额度，
+      # 新书永远排不上（2026-07-30 修复的死锁）。
+      - BOOK_PROCESSED_DIR=./processed_books
+      - BOOK_FAILED_DIR=./failed_books
       # 文档嵌入交给宿主机的夜间任务（crontab 里的 nightly_index.py，0-7 点，08:00 收工）。
       # 容器内 build_index 只报待办不干活：本地 8B 嵌一篇论文约 24 分钟、占 15G 内存，
       # 白天被 batch_fetch（每 120 分钟）触发一次就能把机器占死。
@@ -50,6 +55,8 @@ services:
       - /mnt/ripe/literature_analyzer_data/obsidian_磷化工文献:/app/obsidian_vault
       - /mnt/ripe/literature_analyzer_data/input_books:/app/input_books
       - /mnt/ripe/literature_analyzer_data/book_output:/app/book_output
+      - /mnt/ripe/literature_analyzer_data/processed_books:/app/processed_books
+      - /mnt/ripe/literature_analyzer_data/failed_books:/app/failed_books
       - /mnt/ripe/literature_analyzer_data:/app/data
     # 默认启动常驻守护进程
     command: ["python", "daemon.py"]

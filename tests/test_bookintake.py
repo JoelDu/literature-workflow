@@ -1,6 +1,7 @@
 """书籍入库单元测试（无网络：拆分/拼接/本地元数据/[M] 引用分流）。"""
 import os
 import sys
+import sqlite3
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -158,6 +159,21 @@ class _FakeSettings:
         self.BOOK_INPUT_DIR = book_input_dir
         self.BOOK_DAILY_PAGE_BUDGET = budget
         self.BOOK_SPLIT_PAGES = 180
+        # 子目录即可：扫描只认 .pdf/.epub 后缀，目录名不会被当成书
+        self.BOOK_PROCESSED_DIR = os.path.join(book_input_dir, "processed_books")
+        self.BOOK_FAILED_DIR = os.path.join(book_input_dir, "failed_books")
+        self.DB_PATH = os.path.join(book_input_dir, "no_such.db")
+
+
+def _make_db_with_book(db_path, pdf_path, status="EXPORTED"):
+    """建一个只含 papers 表的库，把 pdf_path 的内容哈希登记成已入库。"""
+    from utils import calculate_pdf_hash
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE IF NOT EXISTS papers (id TEXT PRIMARY KEY, status TEXT)")
+    conn.execute("INSERT OR REPLACE INTO papers (id, status) VALUES (?, ?)",
+                 (calculate_pdf_hash(pdf_path), status))
+    conn.commit()
+    conn.close()
 
 
 def test_run_scheduled_intake_defers_once_budget_exceeded(tmp_path, monkeypatch):
@@ -175,7 +191,8 @@ def test_run_scheduled_intake_defers_once_budget_exceeded(tmp_path, monkeypatch)
 
     # a(6) 处理；b(6) 会让 6+6=12>10，推迟；c(2) 6+2=8<=10，处理
     assert processed == ["a_6p.pdf", "c_2p.pdf"]
-    assert report == {"scanned": 3, "ok": 2, "failed": 0, "deferred": 1, "pages_used": 8}
+    assert report == {"scanned": 3, "ok": 2, "skipped": 0, "failed": 0,
+                      "quarantined": 0, "deferred": 1, "pages_used": 8}
 
 
 def test_run_scheduled_intake_first_book_may_exceed_budget_alone(tmp_path, monkeypatch):
@@ -210,7 +227,158 @@ def test_run_scheduled_intake_epub_does_not_count_toward_budget(tmp_path, monkey
     report = run_scheduled_intake(settings, console=_QuietConsole())
 
     assert processed == ["a_book.epub", "b_4p.pdf"]
-    assert report == {"scanned": 2, "ok": 2, "failed": 0, "deferred": 0, "pages_used": 4}
+    assert report == {"scanned": 2, "ok": 2, "skipped": 0, "failed": 0,
+                      "quarantined": 0, "deferred": 0, "pages_used": 4}
+
+
+def test_run_scheduled_intake_skipped_book_does_not_eat_budget(tmp_path, monkeypatch):
+    """回归：已入库的书不该占页数预算。
+
+    它曾经占——`add_book` 内部跳过时页数已经记上了，而已入库的原件一直留在输入
+    目录，于是每晚先被重新收费一遍。真实库里按字母序靠前的三本大部头（449+928+499
+    页）就吃掉 1876/2000，后面 32 本新书连续多晚一本都排不上，日志却报"成功入库 8 本"。
+    """
+    old = _make_pdf(str(tmp_path / "a_old_8p.pdf"), 8)   # 已入库，不该计预算
+    _make_pdf(str(tmp_path / "b_new_3p.pdf"), 3)         # 新书，预算只剩 4 页时仍应处理
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+
+    settings = _FakeSettings(str(tmp_path), budget=4)
+    settings.DB_PATH = str(tmp_path / "tracking.db")
+    _make_db_with_book(settings.DB_PATH, old)
+
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert processed == ["b_new_3p.pdf"]        # 旧书没重跑，新书没被挤掉
+    assert report["skipped"] == 1 and report["ok"] == 1 and report["deferred"] == 0
+    assert report["pages_used"] == 3            # 旧书那 8 页没算进来
+    # 旧书被移出输入目录，下一晚不再参与扫描
+    assert not os.path.exists(old)
+    assert os.path.exists(os.path.join(settings.BOOK_PROCESSED_DIR, "a_old_8p.pdf"))
+
+
+def test_run_scheduled_intake_moves_ingested_book_and_its_docx(tmp_path, monkeypatch):
+    """入库成功后原件连同 MinerU 生成的同名 .docx 一起归档，输入目录不残留。"""
+    pdf = _make_pdf(str(tmp_path / "book_2p.pdf"), 2)
+    docx = str(tmp_path / "book_2p.docx")
+    with open(docx, "wb") as f:
+        f.write(b"fake docx")
+
+    monkeypatch.setattr(bookintake, "add_book", lambda path, *a, **k: "docid")
+
+    settings = _FakeSettings(str(tmp_path), budget=100)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert report["ok"] == 1
+    assert not os.path.exists(pdf) and not os.path.exists(docx)
+    assert os.path.exists(os.path.join(settings.BOOK_PROCESSED_DIR, "book_2p.pdf"))
+    assert os.path.exists(os.path.join(settings.BOOK_PROCESSED_DIR, "book_2p.docx"))
+
+
+def test_run_scheduled_intake_quarantines_unreadable_pdf(tmp_path, monkeypatch):
+    """PDF 本身坏了（pypdf 读不出页数）→ 隔离，别每晚白试；后面的书照常处理。"""
+    bad = str(tmp_path / "a_broken.pdf")
+    with open(bad, "wb") as f:
+        f.write(b"%PDF-1.4 truncated garbage")
+    _make_pdf(str(tmp_path / "b_good_2p.pdf"), 2)
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+    monkeypatch.setattr(bookintake, "log_run_event", lambda **k: None)
+
+    settings = _FakeSettings(str(tmp_path), budget=100)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert processed == ["b_good_2p.pdf"]
+    assert report["quarantined"] == 1 and report["ok"] == 1 and report["failed"] == 0
+    assert not os.path.exists(bad)
+    assert os.path.exists(os.path.join(settings.BOOK_FAILED_DIR, "a_broken.pdf"))
+
+
+def test_run_scheduled_intake_keeps_book_in_place_on_network_failure(tmp_path, monkeypatch):
+    """MinerU/网络类失败不隔离、不归档——原地留着等下一晚重试。"""
+    pdf = _make_pdf(str(tmp_path / "book_2p.pdf"), 2)
+
+    def _boom(*a, **k):
+        raise RuntimeError("所有配置的 MinerU API Keys 均尝试失败")
+    monkeypatch.setattr(bookintake, "add_book", _boom)
+    monkeypatch.setattr(bookintake, "log_run_event", lambda **k: None)
+
+    settings = _FakeSettings(str(tmp_path), budget=100)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert report["failed"] == 1 and report["quarantined"] == 0 and report["ok"] == 0
+    assert os.path.exists(pdf)          # 还在输入目录，下一晚会重试
+    assert not os.path.exists(os.path.join(settings.BOOK_FAILED_DIR, "book_2p.pdf"))
+
+
+def test_run_scheduled_intake_keeps_encrypted_pdf_for_human(tmp_path, monkeypatch):
+    """加密/DRM 的 PDF 文件本身没坏，只是需要人工去壳：算 failed 原地留着，
+    不能当成"损坏"扔进 failed_books——那是第一次扫到就永久埋掉。"""
+    enc = str(tmp_path / "a_encrypted.pdf")
+    w = PdfWriter()
+    w.add_blank_page(width=200, height=200)
+    w.encrypt("pw")
+    with open(enc, "wb") as f:
+        w.write(f)
+    _make_pdf(str(tmp_path / "b_good_2p.pdf"), 2)
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+    monkeypatch.setattr(bookintake, "log_run_event", lambda **k: None)
+
+    settings = _FakeSettings(str(tmp_path), budget=100)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert processed == ["b_good_2p.pdf"]           # 后面的书照常处理
+    assert report["failed"] == 1 and report["quarantined"] == 0
+    assert os.path.exists(enc)                      # 还在输入目录，等人工处理
+    assert not os.path.exists(os.path.join(settings.BOOK_FAILED_DIR, "a_encrypted.pdf"))
+
+
+def test_run_scheduled_intake_reraises_transient_db_error(tmp_path, monkeypatch):
+    """查重时撞上锁超时等瞬时故障，绝不能吞成"没入过库"。
+
+    吞掉的后果是把一本已入库的大部头重跑一遍 MinerU 并重新收费，正是页数预算
+    被吃光、新书连续多晚排不上的那个 bug 的复现路径。正确做法是抛出去记 failed，
+    原件原地留到下一晚重试。
+    """
+    _make_pdf(str(tmp_path / "book_2p.pdf"), 2)
+
+    processed = []
+    monkeypatch.setattr(bookintake, "add_book",
+                        lambda path, *a, **k: processed.append(os.path.basename(path)))
+    monkeypatch.setattr(bookintake, "log_run_event", lambda **k: None)
+
+    def _locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(bookintake.sqlite3, "connect", _locked)
+
+    settings = _FakeSettings(str(tmp_path), budget=100)
+    report = run_scheduled_intake(settings, console=_QuietConsole())
+
+    assert processed == []                          # 没有被当成新书重跑
+    assert report["failed"] == 1 and report["skipped"] == 0 and report["ok"] == 0
+    assert report["pages_used"] == 0                # 也没有被重新收费
+    assert os.path.exists(str(tmp_path / "book_2p.pdf"))
+
+
+def test_move_book_aside_never_overwrites_same_name(tmp_path):
+    """归档目录已有同名文件时改存 .1 后缀，先前那份不能被静默销毁。"""
+    dest = tmp_path / "processed"
+    dest.mkdir()
+    (dest / "book.pdf").write_bytes(b"first")
+    src = tmp_path / "book.pdf"
+    src.write_bytes(b"second")
+
+    assert bookintake._move_book_aside(str(src), str(dest), _QuietConsole())
+    assert (dest / "book.pdf").read_bytes() == b"first"     # 原来那份完好
+    assert (dest / "book.1.pdf").read_bytes() == b"second"  # 新来的另存
+    assert not src.exists()
 
 
 class _QuietConsole:

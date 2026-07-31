@@ -461,6 +461,139 @@ def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = Tru
     return doc_id
 
 
+def _already_ingested(path: str, settings) -> bool:
+    """整本内容哈希已在库且 EXPORTED —— 这本书之前入过库了。
+
+    定时任务必须在**动页数预算之前**问这一句。`add_book`/`add_epub` 内部虽然也会
+    跳过已入库的书，但那时页数已经记到预算头上了：已入库的原件一直躺在输入目录里，
+    于是每晚都先被"重新收费"一遍，按字母序靠前的几本大部头就能吃光当晚额度，
+    真正的新书永远排不上（曾造成连续多晚 0 实际入库，日志里却报"成功入库 N 本"）。
+
+    只有"表还不存在"（全新部署）才当作没入过库。锁超时之类的**瞬时**故障必须抛出去：
+    夜间脚本 nightly_index.py 与本任务并发写同一个库，此处若把锁超时也吞成 False，
+    一本已入库的大部头就会被重跑一遍 MinerU 并重新收费，正是上面这个饿死 bug 的复现路径。
+    """
+    doc_id = calculate_pdf_hash(path)
+    conn = None
+    try:
+        conn = sqlite3.connect(settings.DB_PATH)
+        conn.execute("PRAGMA busy_timeout=30000")
+        row = conn.execute("SELECT status FROM papers WHERE id=?", (doc_id,)).fetchone()
+    except sqlite3.Error as e:
+        if "no such table" in str(e).lower():
+            return False    # 库还没建起来（全新部署）→ 当作没入过，照常走入库
+        raise               # 锁超时等瞬时故障 → 上层记 failed、原地留到下一晚重试
+    finally:
+        if conn is not None:
+            conn.close()
+    return bool(row and row[0] == "EXPORTED")
+
+
+def _unique_dest(dest_dir: str, name: str) -> str:
+    """目标目录里已有同名文件时，给新来的加 .1/.2 后缀，绝不覆盖。
+
+    归档/隔离目录里同名文件是很可能的（不同书重名、同一本书重下），
+    直接 shutil.move 会把先前那份静默销毁，没有报错也没有备份。
+    """
+    base, ext = os.path.splitext(name)
+    cand = os.path.join(dest_dir, name)
+    i = 1
+    while os.path.exists(cand):
+        cand = os.path.join(dest_dir, f"{base}.{i}{ext}")
+        i += 1
+    return cand
+
+
+def _move_book_aside(path: str, dest_dir: str, console) -> bool:
+    """把书从输入目录移到归档/隔离目录，连同 MinerU 生成的同名 .docx 一起带走。
+    移动失败只告警不抛错——归档不成功也不该影响入库结果本身。"""
+    import shutil
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        for src in (path, os.path.splitext(path)[0] + ".docx"):
+            if os.path.exists(src):
+                dest = _unique_dest(dest_dir, os.path.basename(src))
+                if os.path.basename(dest) != os.path.basename(src):
+                    console.print(f"[dim]  {dest_dir} 已有同名文件，改存为 "
+                                  f"{os.path.basename(dest)}")
+                shutil.move(src, dest)
+        return True
+    except Exception as e:
+        console.print(f"[yellow]⚠️ 移动 {os.path.basename(path)} 到 {dest_dir} 失败"
+                      f"（不影响入库结果，但它下次还会被扫到）: {e}")
+        return False
+
+
+def _pdf_page_count(path: str):
+    """读 PDF 页数，并判断读不出来时**是不是该永久隔离**。
+
+    返回 (页数, 结论, 错误信息)，结论 ∈ {"ok", "corrupt", "transient"}。
+
+    区分是必要的：pypdf 的 FileNotDecryptedError（加密/DRM）也是 PdfReadError 的子类，
+    而加密书本身没坏，只是需要人工去壳；OSError/PermissionError 更是挂载抖动之类的
+    临时问题。这两类若一律按"文件损坏"扔进 BOOK_FAILED_DIR，第一次扫到就永久埋掉了。
+    """
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError, FileNotDecryptedError
+    try:
+        return len(PdfReader(path).pages), "ok", ""
+    except FileNotDecryptedError as e:
+        return None, "transient", f"PDF 已加密/有 DRM，需人工去壳: {e}"
+    except PdfReadError as e:
+        return None, "corrupt", str(e)          # 截断、根本不是 PDF 等结构性损坏
+    except Exception as e:                      # OSError/PermissionError 等
+        return None, "transient", str(e)
+
+
+def ingest_one(path: str, settings, console, client=None, use_llm: bool = True,
+               max_pages: int = None, budget_left: int = None, archive: bool = True):
+    """单本书过完"已入库 / 文件能不能读 / 预算够不够"三道闸，返回 (结果, 页数)。
+
+    结果 ∈ {"skipped", "quarantined", "deferred", "ok"}；页数只对 PDF 有意义（EPUB 记 0）。
+    瞬时故障（加密、读盘出错、MinerU/网络失败）一律抛出去，由调用方记为 failed、
+    原件原地留着等下次重试。
+
+    定时任务与手动 `review.py add-book` 共用这一份，避免两条路行为分叉——
+    早先手动入库那条路不查重也不隔离，坏文件会一直躺在输入目录里被反复重扫。
+
+    budget_left=None 表示不限页数预算；archive=False 表示不搬动原件
+    （手动指定输入目录以外的路径时用，别去动用户自己放的文件）。
+    """
+    fname = os.path.basename(path)
+
+    if _already_ingested(path, settings):
+        console.print(f"[dim]已入库，{'归档出输入目录' if archive else '跳过'}：《{fname}》")
+        if archive:
+            _move_book_aside(path, settings.BOOK_PROCESSED_DIR, console)
+        return "skipped", 0
+
+    if fname.lower().endswith(".epub"):
+        add_epub(path, settings, console, client=client, use_llm=use_llm)
+        if archive:
+            _move_book_aside(path, settings.BOOK_PROCESSED_DIR, console)
+        return "ok", 0
+
+    n_pages, verdict, err = _pdf_page_count(path)
+    if verdict == "corrupt":
+        console.print(f"[red]✖ PDF 文件损坏，隔离不再重试 {fname}: {err}")
+        log_run_event(mode="book", event="book_added", title=fname,
+                      status="quarantined", error=f"PDF 无法解析: {err}")
+        if archive:
+            _move_book_aside(path, settings.BOOK_FAILED_DIR, console)
+        return "quarantined", 0
+    if verdict == "transient":
+        raise RuntimeError(f"PDF 暂时读不了（原地保留，下次重试）: {err}")
+
+    if budget_left is not None and n_pages > budget_left:
+        return "deferred", n_pages
+
+    add_book(path, settings, console, client=client,
+             max_pages=max_pages or settings.BOOK_SPLIT_PAGES, use_llm=use_llm)
+    if archive:
+        _move_book_aside(path, settings.BOOK_PROCESSED_DIR, console)
+    return "ok", n_pages
+
+
 def run_scheduled_intake(settings, console, client=None, use_llm: bool = True) -> dict:
     """定时任务用：扫描 BOOK_INPUT_DIR，按 PDF 总页数预算逐本入库。
 
@@ -468,10 +601,15 @@ def run_scheduled_intake(settings, console, client=None, use_llm: bool = True) -
     即使单本页数就超过预算也会处理完（否则超大部头会永远排不到），只有
     "已经处理过至少一本、再加下一本会超预算"时才会推迟。EPUB 走 pandoc、
     不占 MinerU 页数配额，因此不计入预算。
-    """
-    from pypdf import PdfReader
 
-    report = {"scanned": 0, "ok": 0, "failed": 0, "deferred": 0, "pages_used": 0}
+    每本书按固定顺序过三道闸（见 `ingest_one`），顺序本身是有讲究的：
+      1. 已入库 → 归档到 BOOK_PROCESSED_DIR，**不计预算、不算成功**（见 `_already_ingested`）。
+      2. pypdf 判定文件结构坏了 → 隔离到 BOOK_FAILED_DIR，别每晚白试。加密/读盘出错
+         以及 MinerU/网络类失败不走这条路，原地留着等下一晚重试。
+      3. 预算够不够。
+    """
+    report = {"scanned": 0, "ok": 0, "skipped": 0, "failed": 0,
+              "quarantined": 0, "deferred": 0, "pages_used": 0}
     book_dir = settings.BOOK_INPUT_DIR
     if not os.path.isdir(book_dir):
         return report
@@ -484,23 +622,22 @@ def run_scheduled_intake(settings, console, client=None, use_llm: bool = True) -
     for fname in files:
         path = os.path.join(book_dir, fname)
         try:
-            if fname.lower().endswith(".epub"):
-                add_epub(path, settings, console, client=client, use_llm=use_llm)
-                report["ok"] += 1
-                continue
-
-            n_pages = len(PdfReader(path).pages)
-            if used > 0 and used + n_pages > budget:
+            # used==0 时传 None：第一本即使单本就超预算也要处理完，否则超大部头永远排不到
+            result, n_pages = ingest_one(
+                path, settings, console, client=client, use_llm=use_llm,
+                max_pages=settings.BOOK_SPLIT_PAGES,
+                budget_left=None if used == 0 else budget - used)
+            if result == "deferred":
                 report["deferred"] += 1
                 console.print(f"[yellow]📚 今晚教材页数预算已用完（{used}/{budget}），"
                               f"《{fname}》留到下一晚")
-                continue
-
-            add_book(path, settings, console, client=client,
-                     max_pages=settings.BOOK_SPLIT_PAGES, use_llm=use_llm)
-            used += n_pages
-            report["ok"] += 1
+            elif result == "ok":
+                used += n_pages
+                report["ok"] += 1
+            else:                       # skipped / quarantined
+                report[result] += 1
         except Exception as e:
+            # MinerU 超时、网络抖动等：原地留着，下一晚自动重试
             report["failed"] += 1
             console.print(f"[red]✖ 教材定时入库失败 {fname}: {e}")
             log_run_event(mode="book", event="book_added", title=fname,
@@ -508,4 +645,3 @@ def run_scheduled_intake(settings, console, client=None, use_llm: bool = True) -
 
     report["pages_used"] = used
     return report
-    return doc_id

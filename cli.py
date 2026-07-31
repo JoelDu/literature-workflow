@@ -326,7 +326,11 @@ def show_history(days=7):
         console.print(table)
         
         # 打印最近 5 次失败事件的详细原因以供排查
-        console.print("\n[bold red]🚨 最近 5 次处理失败事件详情:[/bold red]")
+        # quarantined（书籍入库判定文件损坏、已挪进 failed_books 不再重试）是**终态**，
+        # 比普通 failed 更需要人看一眼，所以一并列出——否则它只在发生当晚推送过一次，
+        # 事后完全查不到痕迹。
+        _BAD = {"failed": "失败", "quarantined": "已隔离(不再重试)"}
+        console.print("\n[bold red]🚨 最近 5 次失败/隔离事件详情:[/bold red]")
         fail_count = 0
         with open(history_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -337,21 +341,22 @@ def show_history(days=7):
                     continue
                 try:
                     entry = json.loads(line)
-                    if entry.get("status") == "failed":
+                    label = _BAD.get(entry.get("status"))
+                    if label:
                         ts = entry.get("timestamp")
                         mode = entry.get("mode")
                         event = entry.get("event")
                         title = entry.get("title", "")
                         error = entry.get("error", "")
-                        
+
                         title_info = f"文献: '{title}' | " if title else ""
-                        console.print(f"  [{ts}] [{mode}] {event} 失败 | {title_info}原因: [red]{error}[/red]")
+                        console.print(f"  [{ts}] [{mode}] {event} {label} | {title_info}原因: [red]{error}[/red]")
                         fail_count += 1
                 except Exception:
                     continue
-                    
+
             if fail_count == 0:
-                console.print("[green]  ✔ 最近没有发现任何处理失败事件。[/green]")
+                console.print("[green]  ✔ 最近没有发现任何失败或隔离事件。[/green]")
                 
     except Exception as e:
         console.print(f"[bold red]加载历史记录失败: {e}[/bold red]")

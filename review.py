@@ -134,7 +134,7 @@ def cmd_enrich(args):
 
 
 def cmd_add_book(args):
-    from litreview.bookintake import add_book, add_epub
+    from litreview.bookintake import ingest_one
     max_pages = args.pages or settings.BOOK_SPLIT_PAGES
     use_llm = settings.REVIEW_ENRICH_LLM and not args.no_llm
     client = None
@@ -161,20 +161,29 @@ def cmd_add_book(args):
         console.print(f"[yellow]目录中没有 PDF/EPUB：{path}")
         return
 
-    ok, failed = 0, 0
+    # 与定时任务共用 ingest_one：查重跳过 + 坏文件隔离，两条路行为一致。
+    # 只有位于 BOOK_INPUT_DIR 里的文件才会被搬走——用户显式指定的别处路径不去动。
+    input_dir = os.path.abspath(settings.BOOK_INPUT_DIR)
+    ok = skipped = quarantined = failed = 0
     for path in files:
         try:
-            if os.path.splitext(path)[1].lower() == ".epub":
-                add_epub(path, settings, console, client=client, use_llm=use_llm)
+            result, _ = ingest_one(
+                path, settings, console, client=client, use_llm=use_llm,
+                max_pages=max_pages,
+                archive=os.path.abspath(os.path.dirname(path)) == input_dir)
+            if result == "skipped":
+                skipped += 1
+            elif result == "quarantined":
+                quarantined += 1
             else:
-                add_book(path, settings, console, client=client, max_pages=max_pages, use_llm=use_llm)
-            ok += 1
+                ok += 1
         except Exception as e:
             failed += 1
             console.print(f"[red]✖ 入库失败 {os.path.basename(path)}: {e}")
             log_run_event(mode="book", event="book_added", title=os.path.basename(path),
                           status="failed", error=str(e))
-    console.print(f"[bold]书籍入库完成：成功 {ok} 本，失败 {failed} 本。"
+    console.print(f"[bold]书籍入库完成：成功 {ok} 本，已入库跳过 {skipped} 本，"
+                  f"文件损坏隔离 {quarantined} 本，失败 {failed} 本。"
                   + ("" if failed else " 运行 `python review.py index` 建索引。"))
 
 
