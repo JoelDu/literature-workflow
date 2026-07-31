@@ -57,8 +57,16 @@ class LocalEmbedder:
             self._model.encode(texts, batch_size=self.batch_size,
                                show_progress_bar=False),
             dtype=np.float32)
-        if mat.shape != (len(texts), self.dim):
-            raise ValueError(f"本地嵌入维度不符：期望 {(len(texts), self.dim)}，实得 {mat.shape}")
+        if mat.ndim != 2 or mat.shape[0] != len(texts):
+            raise ValueError(f"本地嵌入形状不符：期望 {(len(texts), self.dim)}，实得 {mat.shape}")
+        if mat.shape[1] > self.dim:
+            # MRL 截断，等价于线上 Embedder 传给服务端的 dimensions=self.dim。
+            # 两条路的向量要能混在同一张 review_chunks 表里用，这里就不能只做形状断言
+            # 然后硬崩——截断后下面的重新归一化是必须的（MRL 规范要求）。
+            mat = mat[:, :self.dim]
+        elif mat.shape[1] < self.dim:
+            raise ValueError(f"本地嵌入维度 {mat.shape[1]} 小于配置的 EMBEDDING_DIM "
+                             f"{self.dim}，无法补齐，请检查模型或配置。")
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         if progress_cb:

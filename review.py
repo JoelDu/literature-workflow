@@ -44,13 +44,19 @@ def _make_client():
 
 
 def cmd_index(args):
-    _require_siliconflow()
     from litreview.indexer import build_index
-    client, _ = _make_client()
+    # 嵌入后端=local 时 build_index 只报待办、把活留给夜间脚本，全程不碰 SiliconFlow，
+    # 不该因为没配 key 就把命令整个挡掉（本地方案的默认部署就是不配 key 的）。
+    client = None
+    if getattr(settings, "REVIEW_EMBED_BACKEND", "local") != "local":
+        _require_siliconflow()
+        client, _ = _make_client()
     report = build_index(settings, console, client, force=args.force)
-    log_run_event(mode="review", event="index_build", status="success",
-                  extra={"indexed": report["indexed"], "failed": report["failed"],
-                         "chunks": report["chunks"]})
+    deferred = report.get("deferred", 0)
+    log_run_event(mode="review", event="index_build",
+                  status="deferred" if deferred else "success",
+                  extra={k: report.get(k, 0)
+                         for k in ("total", "indexed", "failed", "chunks", "deferred")})
 
 
 def cmd_status(args):

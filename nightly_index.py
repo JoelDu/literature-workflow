@@ -30,6 +30,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -93,7 +94,14 @@ def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     load_env(os.path.join(here, ".env"))
 
-    db_path = os.getenv("DB_PATH", os.path.join(here, "batch_tracking.db"))
+    # 默认值必须与 utils.Settings 的 "./data/batch_tracking.db" 指同一个文件：
+    # 早先这里默认的是 <repo>/batch_tracking.db，.env 里一旦漏了 DB_PATH，本脚本会
+    # 静默新建一个空库、打印"无待索引文档"再以退出码 0 收工，看不出任何异常。
+    db_path = os.getenv("DB_PATH") or os.path.join(here, "data", "batch_tracking.db")
+    if not os.path.exists(db_path):
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 数据库不存在：{db_path}\n"
+              f"       （检查 .env 的 DB_PATH；本脚本不新建空库，免得静默空跑）", flush=True)
+        return 2
     dim = int(os.getenv("EMBEDDING_DIM", "4096"))
     # 标识与线上保持一致：已实证两者同属一个向量空间，混用无碍（见 local_embedder 文档串）
     model_label = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
@@ -104,7 +112,7 @@ def main() -> int:
     book_overlap = int(os.getenv("BOOK_CHUNK_OVERLAP", "600"))
 
     from litreview.store import VectorStore, md_hash
-    from litreview.chunker import split_markdown
+    from litreview.chunker import split_markdown, chunk_params_for
 
     store = VectorStore(db_path, dim)
     todo = store.docs_needing_index()
@@ -140,7 +148,7 @@ def main() -> int:
     emb = LocalEmbedder(model_path, dim, batch_size=CHUNK_BATCH,
                         threads=int(os.getenv("EMBED_THREADS", "12")))
 
-    done_docs = done_chunks = done_chars = 0
+    done_docs = done_chunks = done_chars = failed_docs = 0
     t_start = time.time()
     out_of_time = False
 
@@ -150,52 +158,62 @@ def main() -> int:
                 out_of_time = True
                 break
 
-            state = store.doc_index_state(doc_id)
-            if state and state[0] == md_hash(md):
-                # ── 续跑：分块结果仍然有效，绝不能重新 replace（会删掉已算好的向量）
-                pending = store.chunks_needing_embedding(doc_id)
-                print(f"  ▶ {doc_id[:8]} [{doc_type}] 续跑 {len(pending)}/{state[1]} 块", flush=True)
-            else:
-                # ── 新文档或正文变了：重新分块，旧向量本来就作废了
-                csize, coverlap = ((book_size, book_overlap) if doc_type == "book"
-                                   else (review_size, review_overlap))
-                chunks = split_markdown(doc_id, md, csize, coverlap)
-                if not chunks:
-                    print(f"  ⚠ {doc_id[:8]} 清洗后无有效内容，跳过", flush=True)
-                    store.replace_doc_chunks(doc_id, md_hash(md), [])
+            # 单篇出错只跳过这一篇：这个循环没有排序，哪篇会炸每晚都不一样，
+            # 让异常冒出去等于一个坏文档就报销掉整晚（其余待办一块都不嵌，也不打汇总）。
+            try:
+                state = store.doc_index_state(doc_id)
+                if state and state[0] == md_hash(md):
+                    # ── 续跑：分块结果仍然有效，绝不能重新 replace（会删掉已算好的向量）
+                    pending = store.chunks_needing_embedding(doc_id)
+                    print(f"  ▶ {doc_id[:8]} [{doc_type}] 续跑 {len(pending)}/{state[1]} 块",
+                          flush=True)
+                else:
+                    # ── 新文档或正文变了：重新分块，旧向量本来就作废了
+                    csize, coverlap = chunk_params_for(doc_type, review_size, review_overlap,
+                                                       book_size, book_overlap)
+                    chunks = split_markdown(doc_id, md, csize, coverlap)
+                    if not chunks:
+                        print(f"  ⚠ {doc_id[:8]} 清洗后无有效内容，跳过", flush=True)
+                        store.replace_doc_chunks(doc_id, md_hash(md), [])
+                        store.mark_embedded(doc_id)
+                        continue
+                    ids = store.replace_doc_chunks(doc_id, md_hash(md), chunks)
+                    pending = list(zip(ids, [c.content for c in chunks]))
+                    print(f"  ▶ {doc_id[:8]} [{doc_type}] 新索引 {len(pending)} 块", flush=True)
+
+                for i in range(0, len(pending), CHUNK_BATCH):
+                    if _stop or (dl and datetime.now() >= dl):
+                        out_of_time = True
+                        break
+                    sub = pending[i:i + CHUNK_BATCH]
+                    t0 = time.time()
+                    vecs = emb.embed_texts([c for _, c in sub])
+                    store.save_embeddings([cid for cid, _ in sub], vecs, model_label)
+                    chars = sum(len(c) for _, c in sub)
+                    done_chunks += len(sub)
+                    done_chars += chars
+                    # 成本单位是 chunk 不是字符：实测约 60 秒/块且对块长不敏感，
+                    # 短块的"字符/小时"会难看好几倍（678 字符也要 272 秒），拿它估时会严重跑偏
+                    sec_per_chunk = (time.time() - t_start) / done_chunks
+                    left = len(pending) - i - len(sub)
+                    eta = f"，本篇剩余约 {fmt(left * sec_per_chunk)}" if left else ""
+                    print(f"    {i + len(sub):>4}/{len(pending)} 块  {chars:>5} 字符  "
+                          f"{time.time() - t0:5.1f}s  均 {sec_per_chunk:.0f}s/块{eta}", flush=True)
+
+                # 只有全部 chunk 都拿到向量才算这篇完成，半截的下次自动接着跑
+                if not store.chunks_needing_embedding(doc_id):
                     store.mark_embedded(doc_id)
-                    continue
-                ids = store.replace_doc_chunks(doc_id, md_hash(md), chunks)
-                pending = list(zip(ids, [c.content for c in chunks]))
-                print(f"  ▶ {doc_id[:8]} [{doc_type}] 新索引 {len(pending)} 块", flush=True)
-
-            for i in range(0, len(pending), CHUNK_BATCH):
-                if _stop or (dl and datetime.now() >= dl):
-                    out_of_time = True
-                    break
-                sub = pending[i:i + CHUNK_BATCH]
-                t0 = time.time()
-                vecs = emb.embed_texts([c for _, c in sub])
-                store.save_embeddings([cid for cid, _ in sub], vecs, model_label)
-                chars = sum(len(c) for _, c in sub)
-                done_chunks += len(sub)
-                done_chars += chars
-                # 成本单位是 chunk 不是字符：实测约 60 秒/块且对块长不敏感，
-                # 短块的"字符/小时"会难看好几倍（678 字符也要 272 秒），拿它估时会严重跑偏
-                sec_per_chunk = (time.time() - t_start) / done_chunks
-                left = len(pending) - i - len(sub)
-                eta = f"，本篇剩余约 {fmt(left * sec_per_chunk)}" if left else ""
-                print(f"    {i + len(sub):>4}/{len(pending)} 块  {chars:>5} 字符  "
-                      f"{time.time() - t0:5.1f}s  均 {sec_per_chunk:.0f}s/块{eta}", flush=True)
-
-            # 只有全部 chunk 都拿到向量才算这篇完成，半截的下次自动接着跑
-            if not store.chunks_needing_embedding(doc_id):
-                store.mark_embedded(doc_id)
-                done_docs += 1
-                print(f"  ✔ {doc_id[:8]} 完成", flush=True)
-            else:
-                left = len(store.chunks_needing_embedding(doc_id))
-                print(f"  ⏸ {doc_id[:8]} 未跑完，还差 {left} 块，明晚接着跑", flush=True)
+                    done_docs += 1
+                    print(f"  ✔ {doc_id[:8]} 完成", flush=True)
+                else:
+                    left = len(store.chunks_needing_embedding(doc_id))
+                    print(f"  ⏸ {doc_id[:8]} 未跑完，还差 {left} 块，明晚接着跑", flush=True)
+            except Exception as e:
+                failed_docs += 1
+                print(f"  ✖ {doc_id[:8]} 出错，跳过这一篇（其余继续）: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                traceback.print_exc()
+                continue
 
             if out_of_time:
                 break
@@ -205,13 +223,14 @@ def main() -> int:
     used = time.time() - t_start
     why = "到点收工" if out_of_time and not _stop else ("被中断" if _stop else "全部做完")
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {why}：完成 {done_docs} 篇 / {done_chunks} 块 / "
-          f"{done_chars} 字符，耗时 {fmt(used)}"
+          f"{done_chars} 字符" + (f"，出错跳过 {failed_docs} 篇" if failed_docs else "")
+          + f"，耗时 {fmt(used)}"
           f"（{used / max(done_chunks, 1):.0f} 秒/块，"
           f"{done_chars / max(used, 1e-6) * 3600 / 10000:.1f} 万字符/小时）", flush=True)
     left = len(store.docs_needing_index())
     if left:
         print(f"       仍有 {left} 篇待索引，下次启动自动接着跑（已完成的块不会重算）", flush=True)
-    return 0
+    return 1 if failed_docs else 0      # 有跳过的篇目就带非零退出码，别让 cron 看着像全绿
 
 
 if __name__ == "__main__":

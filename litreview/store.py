@@ -31,6 +31,7 @@ class VectorStore:
         self.dim = dim
         self._matrix = None       # np.ndarray (n, dim)
         self._meta = None         # list[dict] 与矩阵行对应
+        self._fingerprint = None  # 建矩阵那一刻的库指纹，用于发现别的进程写入的新向量
         self.ensure_schema()
 
     def _conn(self) -> sqlite3.Connection:
@@ -206,9 +207,30 @@ class VectorStore:
 
     # ── 检索 ──────────────────────────────────────────────────────────────
 
+    def _embed_fingerprint(self) -> tuple:
+        """"已嵌入内容"的轻量指纹：(已嵌入文档数, 最新一次索引时间)。
+
+        嵌入现在由**另一个进程**（夜间的 nightly_index.py）写入，本进程的
+        `save_embeddings` 失效缓存管不着它。MCP server 是长驻进程，一旦缓存过矩阵，
+        夜里新嵌的书就永远检索不到，得手动重启——而 library_status 又照常报出新数目，
+        表现为"统计说有、检索说没有"的静默分裂。
+
+        指纹只查 review_index_meta（一篇一行，几百行）。不查
+        `COUNT(*) FROM review_chunks WHERE embedding IS NOT NULL`——那是几十万行、
+        每行 16KB BLOB 的表，每次检索都全表扫一遍代价太大。
+        """
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(indexed_at), '') FROM review_index_meta "
+            "WHERE embedded=1").fetchone()
+        conn.close()
+        return row
+
     def load_matrix(self, force_reload: bool = False):
-        if self._matrix is not None and not force_reload:
+        fingerprint = self._embed_fingerprint()
+        if self._matrix is not None and not force_reload and fingerprint == self._fingerprint:
             return self._matrix, self._meta
+        self._fingerprint = fingerprint
         conn = self._conn()
         c = conn.cursor()
         c.execute("""SELECT chunk_id, doc_id, section_title, content, embedding

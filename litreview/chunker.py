@@ -7,6 +7,17 @@ import re
 from dataclasses import dataclass
 
 
+def chunk_params_for(doc_type: str, review_size: int, review_overlap: int,
+                     book_size: int, book_overlap: int):
+    """按文档类型选块大小：书籍块更大（正文连贯、检索时要的上下文更长）。
+
+    索引编排有两份实现（白天 indexer.build_index 走在线嵌入，夜间 nightly_index.py
+    走本地权重、能断点续跑），**这条映射必须是同一份**——否则加了新 doc_type 只改一边，
+    两边分块结果就会悄悄不一致，同一篇文献白天夜里算出的块边界都对不上。
+    """
+    return (book_size, book_overlap) if doc_type == "book" else (review_size, review_overlap)
+
+
 @dataclass
 class Chunk:
     doc_id: str
