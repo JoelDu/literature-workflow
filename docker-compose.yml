@@ -41,6 +41,8 @@ services:
       # 数据文件路径
       - DB_PATH=./data/batch_tracking.db
       - EXCEL_OUTPUT_PATH=./data/knowledge_base.xlsx
+      # 运行日志按天落 data/app-YYYY-MM-DD.log，超期自动删；0 = 永久保留
+      - LOG_RETENTION_DAYS=30
     logging:
       driver: "json-file"
       options:

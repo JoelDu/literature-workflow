@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import json
+import time
 import hashlib
 import shutil
 from pathlib import Path
@@ -419,19 +420,65 @@ def log_run_event(mode: str, event: str, title: str = "", doc_id: str = "", stat
 # ── 运行日志本地重定向 (TeeLogger) ─────────────────────────────────────────────
 
 class TeeLogger:
-    def __init__(self, filepath, original_stream):
+    """把 stdout/stderr 原样转发到终端，同时写一份 <log_dir>/<prefix>-YYYY-MM-DD.log。
+
+    日期必须在**每次写入时**现算，不能在 __init__ 里定死：daemon 是常驻进程，一跑
+    就是好几天，定死的话整整一周的日志会全堆进它启动那天的文件里，等于没分天。
+    """
+
+    def __init__(self, log_dir, original_stream, prefix="app", retention_days=30):
         self.terminal = original_stream
-        self.filepath = filepath
+        self.log_dir = log_dir
+        self.prefix = prefix
+        self.retention_days = retention_days
+        self._day = None        # 当前打开的是哪一天的文件
+        self._fh = None
         try:
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+
+    def current_path(self) -> str:
+        return os.path.join(self.log_dir, f"{self.prefix}-{datetime.now():%Y-%m-%d}.log")
+
+    def _handle(self):
+        """返回今天那份文件的句柄；跨天时自动换新文件并清理过期日志。"""
+        day = datetime.now().strftime("%Y-%m-%d")
+        if day != self._day or self._fh is None:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+            # 追加模式：daemon 与手敲的 CLI 会同时写同一个文件，靠 O_APPEND 保证互不截断
+            self._fh = open(self.current_path(), "a", encoding="utf-8")
+            self._day = day
+            self._prune()
+        return self._fh
+
+    def _prune(self):
+        """删掉超过保留期的日志。跨天换文件时顺带做一次，不另起线程/定时器。"""
+        if self.retention_days <= 0:      # 配 0 或负数 = 永久保留
+            return
+        cutoff = time.time() - self.retention_days * 86400
+        try:
+            for name in os.listdir(self.log_dir):
+                if not (name.startswith(f"{self.prefix}-") and name.endswith(".log")):
+                    continue
+                path = os.path.join(self.log_dir, name)
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
         except Exception:
             pass
 
     def write(self, message):
         self.terminal.write(message)
         try:
-            with open(self.filepath, "a", encoding="utf-8") as f:
-                f.write(message)
+            fh = self._handle()
+            fh.write(message)
+            # 常驻进程不显式 flush 的话，tail 出来的日志会滞后好几个钟头
+            fh.flush()
         except Exception:
             pass
 
@@ -440,12 +487,27 @@ class TeeLogger:
             self.terminal.flush()
         except Exception:
             pass
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+            except Exception:
+                pass
 
     def isatty(self):
         return hasattr(self.terminal, "isatty") and self.terminal.isatty()
 
-# 自动重定向 stdout 和 stderr 到 <DB_PATH 所在目录>/app.log
-sys.stdout = TeeLogger(os.path.join(_data_dir(), "app.log"), sys.stdout)
-sys.stderr = TeeLogger(os.path.join(_data_dir(), "app.log"), sys.stderr)
+
+def _log_retention_days() -> int:
+    """坏值一律退回默认 30 天：这段在 import 期执行，抛异常会让整个项目起不来。"""
+    try:
+        return int(os.getenv("LOG_RETENTION_DAYS", "30"))
+    except (TypeError, ValueError):
+        return 30
+
+
+# 自动重定向 stdout 和 stderr 到 <DB_PATH 所在目录>/app-YYYY-MM-DD.log（按天一份）
+_retention = _log_retention_days()
+sys.stdout = TeeLogger(_data_dir(), sys.stdout, retention_days=_retention)
+sys.stderr = TeeLogger(_data_dir(), sys.stderr, retention_days=_retention)
 
 
