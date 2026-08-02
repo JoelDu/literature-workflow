@@ -253,6 +253,14 @@ def extract_original_abstract(text: str) -> str:
     return ""
 
 
+# MinerU 偶尔会「解析成功」却吐出空的 full.md（扫描件糊了、PDF 只有图层、页面全是
+# 不可提取的矢量图都会这样）。这种正文送进 LLM，模型只能凭标题瞎编，等于往知识库里
+# 灌污染数据；走 Batch 时更糟——错误要等几小时后拉结果才暴露。所以在解析出口直接拦掉。
+# 200 这个阈值取得很松：真实论文正文普遍 8000 字符以上，实测出问题的那篇是 0 字符，
+# 中间隔着两个数量级，不会误伤短文。
+MIN_MARKDOWN_CHARS = 200
+
+
 def extract_key_sections(text: str, max_chars: int = 40000) -> str:
     """
     智能提取论文关键章节（摘要、引言、方法、结果、结论），

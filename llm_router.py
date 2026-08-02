@@ -36,7 +36,15 @@ def make_deepseek_client(deepseek_api_key: str = None, quiet: bool = False):
 
     if sf_key and sf_base:
         client = OpenAI(api_key=sf_key, base_url=sf_base, timeout=180)
-        model = os.getenv("DEEPSEEK_MODEL", "deepseek-ai/DeepSeek-V3")
+        # 默认值曾是 deepseek-ai/DeepSeek-V3，2026-07-24 之后它在硅基流动上任何请求都返回
+        # 429「System is too busy now」（同步、Batch 都一样，Pro/ 前缀版同症状），等于彻底不可用。
+        # 更阴的是走 Batch 时这个错只会以一句 "Request failed: Unknown error." 出现在错误文件里，
+        # 从日志上根本看不出是模型的问题。
+        # 换 V3.1-Terminus 的原因：整个账户里只有 V3、V3.1-Terminus、R1 三个模型支持 batch 推理
+        # （其余包括 V3.2 / V4-Pro / V4-Flash 提交时就报 20088 not support batch inference），
+        # 而 V3 已废、R1 是推理模型不适合做结构化抽取，Terminus 是唯一实测跑通的。
+        # ⚠️ 换模型前务必先确认它支持 batch，否则阶段 1 会在提交时直接 400。
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-ai/DeepSeek-V3.1-Terminus")
         if not quiet:
             print(f"[LLM Router] 正在使用 硅基流动 (SiliconFlow) {model} 进行无损文献分析。")
     else:

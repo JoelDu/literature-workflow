@@ -14,7 +14,7 @@ from rich.progress import (
 
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
-from utils import init_dirs, generate_obsidian_note, export_to_excel, get_settings, calculate_pdf_hash, extract_original_abstract, load_processed_hashes, save_processed_hash, log_run_event
+from utils import init_dirs, generate_obsidian_note, export_to_excel, get_settings, calculate_pdf_hash, extract_original_abstract, load_processed_hashes, save_processed_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 强前置校验配置 ──────────────────────────────────────────────────────────
 settings = get_settings()
@@ -89,6 +89,18 @@ def main():
                 output_folder = os.path.join(settings.MINERU_OUTPUT_DIR, f"{title}_{doc_id[:8]}")
                 mineru_res = mineru_client.process_pdf(pdf_path, output_folder)
                 md_text = mineru_res["markdown"]
+
+                # 空正文按永久失败处理（同 batch_pipeline）：MinerU 返回 success 不代表抽出了字，
+                # 扫描件 / 纯图版 PDF 常常只给个空 full.md。放行的话 LLM 只能靠标题编，
+                # 编出来的东西还会被当成正常结果写进 Obsidian 和 Excel。
+                if len(md_text.strip()) < MIN_MARKDOWN_CHARS:
+                    err_msg = f"MinerU 解析出的正文只有 {len(md_text.strip())} 字符（阈值 {MIN_MARKDOWN_CHARS}），大概率是扫描件或纯图版 PDF"
+                    console.print(f"[red]正文为空，跳过 {filename}: {err_msg}")
+                    shutil.move(pdf_path, os.path.join(settings.FAILED_PDF_DIR, filename))
+                    log_run_event(mode="realtime", event="paper_processed", title=title, doc_id=doc_id,
+                                  status="failed", error=err_msg, extra={"stage": "mineru", "type": "empty_markdown"})
+                    progress.advance(main_task)
+                    continue
 
                 images = []
                 if mineru_res["images_dir"] and os.path.exists(mineru_res["images_dir"]):

@@ -1,64 +1,106 @@
+# 一份 compose 同时服务三种场景：作者的宿主机、云服务器、别人的笔记本。
+# 差异全部通过仓库根目录的 .env 注入，默认值一律取「可移植」的那一套：
+# 桥接网络、无代理、密钥读本地 .env、嵌入走在线 API、数据放 ./data。
+# 宿主机专属的那套（/mnt/ripe 数据盘、host 网络、本地代理、共享 Key 文件、本地嵌入）
+# 由本机 .env 覆盖回来，见 .env.example 末尾的「部署环境」段。
 services:
   literature-analyzer:
+    # 显式给镜像命名，别用 compose 自动生成的「目录名-服务名」。
+    # 有了固定 tag，「本机 docker save → 传到服务器 docker load → 直接 up」这条路才成立：
+    # 服务器上镜像名对得上就不会触发构建。这很关键 —— 服务器拉不动 Docker Hub，
+    # 而且 1.8G 内存 build（pip 装 pandas+numpy）本来就吃力。
+    # 全新机器首次部署仍然用 docker compose up -d --build，会自动构建并打上这个 tag。
+    image: ${IMAGE_NAME:-lit-analyzer:1.0}
     build:
       context: .
-      network: host
-    container_name: lit_analyzer
+      # 构建期要 git clone caj2pdf。作者机器上出网必须过宿主机回环代理，只能用 host；
+      # 普通机器直连，用 default（Docker Desktop 不支持构建期 host 网络，别改默认值）。
+      network: ${DOCKER_BUILD_NETWORK:-default}
+    # 同一台机器上要跑多套（比如「自己用」和「给别人用」各一份）时，容器名必须区分开，
+    # 否则第二套起不来：Docker 的容器名全局唯一，冲突时直接报 name is already in use。
+    # 换名字的同时记得改 DATA_ROOT，不然两套会共用同一个数据库和 vault，比冲突更糟。
+    container_name: ${CONTAINER_NAME:-lit_analyzer}
     restart: always
-    # 与 llm_batch_server/trendradar 同款：宿主机网络，容器内直接用 127.0.0.1 的代理
-    # （宿主机防火墙拦截 docker 网桥→宿主机端口，bridge 模式下容器完全断网）
-    network_mode: host
-    # ── 全局共享 Key 文件 ──
+    # 作者机器上防火墙拦 docker 网桥→宿主机端口，bridge 下容器完全断网，只能用 host。
+    # 云服务器/别人的电脑没这问题，用标准 bridge。
+    network_mode: ${DOCKER_NETWORK_MODE:-bridge}
     env_file:
-      - /opt/docker_shared/api_keys.env
+      # 先读仓库根目录 .env —— 新用户唯一需要填的文件。
+      # 再读可选的共享 Key 文件，后者覆盖前者（作者机器用它集中管理所有项目的 Key）。
+      # 两个都是 required: false：新装用户没有第二个，服务器上两个可能都靠环境变量给。
+      - path: .env
+        required: false
+      - path: ${SHARED_ENV_FILE:-./.env.shared}
+        required: false
     environment:
-      # ── 项目专属配置 ──
-      - TZ=Asia/Shanghai
-      - RUN_MODE=batch
+      # ⚠️ 这里的每一项都必须写成 ${VAR:-默认值}。写死的话会静默盖掉用户在 .env 里的设置——
+      # 用户改了配置却不生效，而且从日志上完全看不出为什么。
+      - TZ=${TZ:-Asia/Shanghai}
+      - RUN_MODE=${RUN_MODE:-batch}
       # 及时入库调度（间隔驱动）
-      - BATCH_SCAN_INTERVAL_MINUTES=30
-      - BATCH_FETCH_INTERVAL_MINUTES=120
-      # 教材每日定时入库：凌晨 3 点，每晚最多处理 2000 页 PDF
-      - BOOK_INTAKE_TIME=03:00
-      - BOOK_DAILY_PAGE_BUDGET=2000
-      # 入库成功/已入库的教材原件移到这里，损坏的移到那里。都必须移出 input_books：
-      # 留在输入目录的旧书每晚会被重新计一遍页数预算，几本大部头就能吃光当晚额度，
-      # 新书永远排不上（2026-07-30 修复的死锁）。
+      - BATCH_SCAN_INTERVAL_MINUTES=${BATCH_SCAN_INTERVAL_MINUTES:-30}
+      - BATCH_FETCH_INTERVAL_MINUTES=${BATCH_FETCH_INTERVAL_MINUTES:-120}
+      # 教材每日定时入库：默认凌晨 3 点，每晚最多处理 2000 页 PDF
+      - BOOK_INTAKE_TIME=${BOOK_INTAKE_TIME:-03:00}
+      - BOOK_DAILY_PAGE_BUDGET=${BOOK_DAILY_PAGE_BUDGET:-2000}
+      # remote = 嵌入走硅基流动在线 API，任何机器都跑得动，默认值。
+      # local  = 交给宿主机的夜间任务（crontab 里的 nightly_index.py），容器内 build_index
+      #          只报待办不干活。本地 8B 嵌一篇论文约 24 分钟、占 15G 内存，只有大内存
+      #          宿主机才配得起——2C2G 的云服务器上设 local 等于永远不建索引。
+      - REVIEW_EMBED_BACKEND=${REVIEW_EMBED_BACKEND:-remote}
+      # 默认无代理（直连）。作者机器上 host 网络 + 宿主机回环代理，由 .env 覆盖。
+      #
+      # 变量名故意加 LIT_ 前缀，不能直接用 ${HTTP_PROXY:-}：compose 做变量替换时
+      # shell 环境的优先级高于 .env，而 HTTP_PROXY 恰恰是最容易被 export 的变量之一。
+      # 一旦用户 shell 里挂着代理，它会被悄悄注进容器；bridge 模式下 127.0.0.1 指的是
+      # 容器自己的回环，所有外部请求变成 connection refused，而配置文件上完全看不出来。
+      # ALL_PROXY 恒定置空：socks5 需要 httpx[socks]，镜像里没装，留着会让 openai 客户端初始化崩溃。
+      - HTTP_PROXY=${LIT_HTTP_PROXY:-}
+      - HTTPS_PROXY=${LIT_HTTPS_PROXY:-}
+      - ALL_PROXY=
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      # ── 以下全是容器内部路径，一律写死，故意不接受 .env 覆盖 ──
+      # 必须与下面 volumes 的挂载点逐一对应。要换数据存放位置请改 DATA_ROOT，别改这里。
+      #
+      # 为什么必须逐条写死：.env 同时被宿主机侧的 CLI / nightly_index.py 读取，那边填的
+      # 是宿主机绝对路径（如 /mnt/ripe/.../input_pdfs）。.env 一旦作为 env_file 注入容器，
+      # 这些路径会跟着进来，而容器里没有 /mnt/ripe —— 结果是扫一个不存在的目录、
+      # 不报错、不干活，日志上完全看不出原因。这里逐条覆盖就是堵死这条路。
+      - INPUT_PDF_DIR=./input_pdfs
+      - PROCESSED_PDF_DIR=./processed_pdfs
+      - FAILED_PDF_DIR=./failed_pdfs
+      - MINERU_OUTPUT_DIR=./mineru_output
+      - OBSIDIAN_VAULT_DIR=./obsidian_vault
+      - REVIEW_OUTPUT_DIR=./obsidian_vault/reviews
+      - BOOK_INPUT_DIR=./input_books
+      - BOOK_OUTPUT_DIR=./book_output
+      # 已入库/损坏的教材原件必须移出 input_books：留在输入目录的旧书每晚会被重新计一遍
+      # 页数预算，几本大部头就吃光当晚额度、新书永远排不上（2026-07-30 修复的死锁）。
       - BOOK_PROCESSED_DIR=./processed_books
       - BOOK_FAILED_DIR=./failed_books
-      # 文档嵌入交给宿主机的夜间任务（crontab 里的 nightly_index.py，0-7 点，08:00 收工）。
-      # 容器内 build_index 只报待办不干活：本地 8B 嵌一篇论文约 24 分钟、占 15G 内存，
-      # 白天被 batch_fetch（每 120 分钟）触发一次就能把机器占死。
-      # 注意 .dockerignore 排除了 .env，容器配置只认这里，改 .env 对容器无效。
-      # 重排不受影响，仍走硅基流动在线 API。
-      - REVIEW_EMBED_BACKEND=local
-      # host 网络下代理直接用宿主机回环地址（覆盖 env_file 里 172.17.0.1 的旧值）。
-      # ALL_PROXY 置空：socks5 代理需要 httpx[socks]，镜像里没装，留着会让 openai 客户端初始化崩溃。
-      - HTTP_PROXY=http://127.0.0.1:20171
-      - HTTPS_PROXY=http://127.0.0.1:20171
-      - ALL_PROXY=
-      - WEBHOOK_URL=
-      # 数据文件路径
       - DB_PATH=./data/batch_tracking.db
       - EXCEL_OUTPUT_PATH=./data/knowledge_base.xlsx
       # 运行日志按天落 data/app-YYYY-MM-DD.log，超期自动删；0 = 永久保留
-      - LOG_RETENTION_DAYS=30
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
     volumes:
-      # 所有数据目录统一挂载自 /mnt/ripe/literature_analyzer_data/
-      - /mnt/ripe/literature_analyzer_data/input_pdfs:/app/input_pdfs
-      - /mnt/ripe/literature_analyzer_data/processed_pdfs:/app/processed_pdfs
-      - /mnt/ripe/literature_analyzer_data/failed_pdfs:/app/failed_pdfs
-      - /mnt/ripe/literature_analyzer_data/mineru_output:/app/mineru_output
-      - /mnt/ripe/literature_analyzer_data/obsidian_磷化工文献:/app/obsidian_vault
-      - /mnt/ripe/literature_analyzer_data/input_books:/app/input_books
-      - /mnt/ripe/literature_analyzer_data/book_output:/app/book_output
-      - /mnt/ripe/literature_analyzer_data/processed_books:/app/processed_books
-      - /mnt/ripe/literature_analyzer_data/failed_books:/app/failed_books
-      - /mnt/ripe/literature_analyzer_data:/app/data
+      # 所有数据目录都是 DATA_ROOT 的子目录，换机器只需改 DATA_ROOT 一个变量。
+      # 默认 ./data = 仓库内，别人 clone 下来即可运行；作者机器指向 /mnt/ripe 的数据盘。
+      # 每处都带 :-./data 默认值 —— 万一 DATA_ROOT 拼错成空串，路径会变成 /input_pdfs
+      # 直接挂宿主机根目录下的路径，这个后果比启动失败严重得多。
+      - ${DATA_ROOT:-./data}/input_pdfs:/app/input_pdfs
+      - ${DATA_ROOT:-./data}/processed_pdfs:/app/processed_pdfs
+      - ${DATA_ROOT:-./data}/failed_pdfs:/app/failed_pdfs
+      - ${DATA_ROOT:-./data}/mineru_output:/app/mineru_output
+      - ${DATA_ROOT:-./data}/${OBSIDIAN_VAULT_DIRNAME:-obsidian_vault}:/app/obsidian_vault
+      - ${DATA_ROOT:-./data}/input_books:/app/input_books
+      - ${DATA_ROOT:-./data}/book_output:/app/book_output
+      - ${DATA_ROOT:-./data}/processed_books:/app/processed_books
+      - ${DATA_ROOT:-./data}/failed_books:/app/failed_books
+      - ${DATA_ROOT:-./data}:/app/data
     # 默认启动常驻守护进程
     command: ["python", "daemon.py"]

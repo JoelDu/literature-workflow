@@ -32,7 +32,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
-from utils import init_dirs, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event
+from utils import init_dirs, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 配置获取 ──────────────────────────────────────────────────────────────────
 settings = get_settings()
@@ -209,7 +209,20 @@ def prepare_batch() -> dict:
                     output_folder = os.path.join(settings.MINERU_OUTPUT_DIR, f"{title}_{doc_id[:8]}")
                     mineru_res = mineru_client.process_pdf(pdf_path, output_folder)
                     md_text = mineru_res["markdown"]
-                    
+
+                    # 空正文直接判永久失败：MinerU 返回 success 不代表抽出了字。
+                    # 必须赶在下面 shutil.move 到 processed_pdfs 之前拦，否则这份 PDF 会被
+                    # 当成"已处理"归档，人再也不会去看它，而库里多了一条纯属编造的分析。
+                    if len(md_text.strip()) < MIN_MARKDOWN_CHARS:
+                        err_msg = f"MinerU 解析出的正文只有 {len(md_text.strip())} 字符（阈值 {MIN_MARKDOWN_CHARS}），大概率是扫描件或纯图版 PDF"
+                        console.print(f"[red]正文为空，跳过 {filename}: {err_msg}")
+                        shutil.move(pdf_path, os.path.join(settings.FAILED_PDF_DIR, filename))
+                        report["pdf_parsed_failed"] += 1
+                        log_run_event(mode="batch", event="paper_parsed", title=title, doc_id=doc_id,
+                                      status="failed", error=err_msg, extra={"type": "empty_markdown"})
+                        progress.advance(task)
+                        continue
+
                     docx_path = mineru_res.get("docx_path")
                     if docx_path and os.path.exists(docx_path):
                         docx_dir = os.path.join(os.path.dirname(settings.INPUT_PDF_DIR), "word_exports")
@@ -492,9 +505,39 @@ def fetch_batch() -> dict:
     return report
 
 
+def _mark_batch_failed(job_id: str, err_msg: str, c, conn) -> int:
+    """把整个 Batch 涉及的论文标成 BATCH_FAILED 并闭环，返回受影响篇数。
+
+    BATCH_FAILED 在下一轮阶段 1 的「自动拾起」名单里，所以标记之后这些论文会被
+    重新提交 —— 这正是它跟「卡在 BATCH_SUBMITTED」的本质区别：前者能自愈，后者是死局。
+    """
+    c.execute("SELECT id FROM papers WHERE batch_job_id=?", (job_id,))
+    rows = c.fetchall()
+    for r in rows:
+        c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_BATCH_FAILED, err_msg, r[0]))
+    conn.commit()
+    log_run_event(mode="batch", event="batch_fetched", status="failed", error=err_msg,
+                  extra={"batch_id": job_id, "provider": "deepseek", "count": len(rows)})
+    return len(rows)
+
+
+def _read_batch_file(file_ref: str, client) -> str:
+    """读取 Batch 的输出/错误文件。
+
+    硅基流动在 output_file_id / error_file_id 里放的是**完整 OSS URL**而不是 file id，
+    照着 OpenAI 的约定去调 /v1/files/{id}/content 只会拿到 404。两种形式都得认。
+    """
+    if file_ref.startswith("http://") or file_ref.startswith("https://"):
+        import httpx
+        resp = httpx.get(file_ref, timeout=120)
+        resp.raise_for_status()
+        return resp.text
+    return client.files.content(file_ref).content.decode("utf-8")
+
+
 def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
     ds_client = llm_router.deepseek_client
-    
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def do_fetch_status():
         return ds_client.batches.retrieve(job_id)
@@ -513,18 +556,37 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
             output_file_id = status.data.get("output_file_id")
             
         if not output_file_id:
-            raise ValueError(f"无法从 Batch 提取 output_file_id: {status}")
-            
+            # 云端说 completed 却没有输出文件，只有一种情形：这批里没有任何一条请求跑成功，
+            # 结果全在 error_file 里（典型触发条件是模型本身不可用，如 2026-07 的 DeepSeek-V3）。
+            #
+            # 此前这里直接 raise，异常被外层的「未知崩溃」兜底吞掉，论文就永远停在
+            # BATCH_SUBMITTED —— 而 BATCH_SUBMITTED 不在阶段 1 的自动拾起名单里，等于永久卡死，
+            # 且每一轮拉取都要再查一遍这个死批次。改成走 BATCH_FAILED 才能被重新提交。
+            rc = getattr(status, "request_counts", None)
+            done = getattr(rc, "completed", None)
+            if done is None and isinstance(rc, dict):
+                done = rc.get("completed")
+            if done:
+                # 有成功条目却拿不到输出文件，那是另一回事，照旧抛出交给上层记录
+                raise ValueError(f"无法从 Batch 提取 output_file_id: {status}")
+
+            error_file_id = getattr(status, "error_file_id", None)
+            if not error_file_id and hasattr(status, "data") and isinstance(status.data, dict):
+                error_file_id = status.data.get("error_file_id")
+            detail = ""
+            if error_file_id:
+                try:
+                    detail = _read_batch_file(error_file_id, ds_client).strip()[:500]
+                except Exception as e:
+                    detail = f"(错误文件拉取失败: {e})"
+            err_msg = f"DeepSeek Batch 全部请求失败，云端无输出文件。错误详情: {detail}"
+            console.print(f"[bold red]  {err_msg}")
+            return 0, _mark_batch_failed(job_id, err_msg, c, conn)
+
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
         def do_download():
-            if output_file_id.startswith("http://") or output_file_id.startswith("https://"):
-                import httpx
-                resp = httpx.get(output_file_id, timeout=120)
-                resp.raise_for_status()
-                return resp.text
-            else:
-                return ds_client.files.content(output_file_id).content.decode("utf-8")
-            
+            return _read_batch_file(output_file_id, ds_client)
+
         result_content = do_download()
         success_count = 0
         fail_count = 0
@@ -558,13 +620,7 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
     elif status_val in ("failed", "cancelled", "expired"):
         err_msg = f"DeepSeek 任务在云端夭折，返回状态: {status_val}"
         console.print(f"[bold red]  {err_msg}")
-        c.execute("SELECT id FROM papers WHERE batch_job_id=?", (job_id,))
-        rows = c.fetchall()
-        for r in rows:
-            c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_BATCH_FAILED, err_msg, r[0]))
-        conn.commit()
-        log_run_event(mode="batch", event="batch_fetched", status="failed", error=err_msg, extra={"batch_id": job_id, "provider": "deepseek", "count": len(rows)})
-        return 0, len(rows)
+        return 0, _mark_batch_failed(job_id, err_msg, c, conn)
         
     # 其余 pending/processing 状态保持不变
     return 0, 0

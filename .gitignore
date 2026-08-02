@@ -25,4 +25,5 @@ obsidian_vault/
 data/
 # 本地设置
 .claude/
+.vscode/
 .git_broken_backup/

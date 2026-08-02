@@ -1,16 +1,43 @@
-pandas
-openpyxl
-langdetect
-openai
-google-genai
-rich
-jinja2
-requests
-python-dotenv
-pydantic
-httpx
-schedule
-tenacity
-numpy
-pypdf
-docxcompose
+# 版本全部锁死到当前生产镜像里实测跑通的那一组。
+# 这是应用不是库，锁死换来的是可复现构建：别人半年后 build 出来的镜像和你现在这个一样。
+# 之前全部无版本约束，等于每次 docker build 都在赌上游没有破坏性更新。
+# 升级请单个改、重新构建、跑一遍 tests/，不要整体 pip install -U。
+#
+# 注意：宿主机的 ~/.venv_lit（Python 3.11，跑 MCP server 和 nightly_index.py）版本会
+# 比这里新，两边不强制一致 —— 镜像锁 Python 3.10 的组合，venv 那边随宿主机。
+
+# ── 数据处理与输出 ──
+pandas==2.3.3
+numpy==2.2.6
+openpyxl==3.1.5
+
+# ── LLM / HTTP 客户端 ──
+openai==2.50.0
+google-genai==2.14.0
+httpx==0.28.1
+requests==2.34.2
+tenacity==9.1.4
+
+# ── 配置与校验 ──
+pydantic==2.13.4
+python-dotenv==1.2.2
+
+# ── PDF / Word 处理 ──
+pypdf==6.14.2
+# litreview/bookintake.py 里 `from docx import Document`，直接使用。
+# 以前只靠 docxcompose 间接带进来，哪天 docxcompose 换掉依赖这里就会 ImportError。
+python-docx==1.2.0
+docxcompose==2.2.0
+# 项目代码不用，是构建期 clone 的 caj2pdf 需要（CAJ 转 PDF）。
+# 原先写在 Dockerfile 里单独一条 RUN，挪到这里统一管版本。
+PyPDF2==3.0.1
+
+# ── MCP server（mcp_server.py 的 FastMCP）──
+# 之前漏在依赖之外：镜像里根本没装，容器内跑 mcp_server.py 必然 ImportError。
+mcp==1.28.1
+
+# ── 其它 ──
+langdetect==1.0.9
+rich==15.0.0
+jinja2==3.1.6
+schedule==1.2.2
