@@ -5,7 +5,7 @@
 ## ✨ 核心特性
 
 - **高质量 PDF 解析**：集成 [MinerU](https://mineru.net/)，完美提取 PDF 中的复杂排版、公式和表格，输出高质量 Markdown。
-- **智能大模型分析**：集成 **硅基流动 (SiliconFlow) DeepSeek V3** 进行无损文献分析（当前已统一中英文路由至 DeepSeek V3 保证稳定性）。
+- **智能大模型分析**：集成 **硅基流动 (SiliconFlow) DeepSeek-V3.1-Terminus** 进行无损文献分析（中英文统一路由，不做语言分流）。
 - **双模运行机制**：
   - **实时模式** (`RUN_MODE=realtime`)：常驻守护进程，每隔固定时间（默认 10 分钟）自动扫描 `input_pdfs/` 目录并即刻处理，生成 Obsidian 笔记与 Excel 记录。
   - **批处理模式** (`RUN_MODE=batch`)：利用大模型的 Batch API，享受 **50% 的成本折扣**。常驻守护进程按固定间隔轮询：每 `BATCH_SCAN_INTERVAL_MINUTES`（默认 30）分钟扫描并提交任务，每 `BATCH_FETCH_INTERVAL_MINUTES`（默认 120）分钟拉取结果，同时支持容器启动瞬间的冷启动检测，确保完美错峰。
@@ -15,7 +15,8 @@
   - **可视化看板**：提供 `python cli.py history`（查看每日处理成功/失败统计与失败详情）以及 `python cli.py status`（查看当前任务分布）命令行看板，方便进行日常运维与统计。
 - **极致的生产级优化**：
   - **哈希去重**：自动计算 PDF 的 SHA-256 哈希值并记录，避免重复处理已解析文献，节省解析 Token 额度。
-  - **自动垃圾清理**：在将笔记和图片导出至 Obsidian Vault 后，自动清理 MinerU 生成的本地庞大临时中间产物文件夹，节省服务器磁盘空间。
+  - **中间产物策略**：实时模式导出后自动清理 MinerU 的临时文件夹省磁盘；批处理模式**故意保留** `mineru_output/`——综述生成器的 `enrich` 要从里面的 `content_list.json` 免费抽取图表和参考文献，删了就只能花钱调大模型重来。
+  - **空解析拦截**：MinerU 返回 success 不代表抽出了字（扫描件、纯图版 PDF 常常只给个空 `full.md`）。正文少于 200 字符的直接判永久失败移入 `failed_pdfs/`，不让大模型对着标题瞎编、把污染数据写进知识库。
   - **日志降噪**：守护进程在没有检测到新文件时保持静默（仅输出一行暗色扫描提示），避免无效日志刷屏。
   - **格式与错误感知**：自动感知 CAJ 等不支持的非 PDF 格式文件并进行警告；能够动态区分临时错误（网络波动、API 超时）与永久错误（页数超限、损坏文件），对临时错误进行自动重试。
 
@@ -31,7 +32,7 @@ input_pdfs/
         ├── 论文名_hash/
         │   ├── *.md (结构化 Markdown)
         │   └── images/
-        ↓ LLMRouter (统一路由至 SiliconFlow DeepSeek V3)
+        ↓ LLMRouter (统一路由至 SiliconFlow DeepSeek-V3.1-Terminus)
     obsidian_vault/
         └── *.md (带 Frontmatter、原始摘要与插图的 Obsidian 笔记)
     data/
@@ -65,7 +66,12 @@ cp .env.example .env
 
 需要配置的特色参数：
 - `MINERU_API_KEY`: 申请自 MinerU 平台。**支持配置多个 Key**（使用英文逗号 `,` 分隔，例如 `key1,key2,key3`）。程序在运行中如果遇到某个 Key 额度不足 (HTTP 402/429) 或失效，会自动平滑切换到下一个备用 Key 进行处理，防止因额度问题中断流水线。
-- `DEEPSEEK_MODEL`: 调用的 DeepSeek 模型名称，默认在硅基流动上为 `deepseek-ai/DeepSeek-V3`，官方为 `deepseek-chat`。您可以通过修改该变量来更换模型（例如 `deepseek-ai/DeepSeek-R1`）。
+- `DEEPSEEK_MODEL`: 文献分析模型，硅基流动上默认 `deepseek-ai/DeepSeek-V3.1-Terminus`，官方 DeepSeek 默认 `deepseek-chat`。
+
+  > ⚠️ **换模型前必须确认它支持 Batch 推理**，否则批处理模式在提交阶段就会 400 报 `20088 This model does not support batch inference`。实测（2026-08-02）硅基流动上支持 Batch 的只有 `DeepSeek-V3`、`DeepSeek-V3.1-Terminus`、`DeepSeek-R1` 三个；`V3.2` / `V4-Pro` / `V4-Flash` / `Qwen` 系列**同步调用正常但不能走 Batch**。而 `DeepSeek-V3` 自 2026-07-24 起在硅基流动上已彻底不可用（任何请求都返回 429 `System is too busy now`），`R1` 是推理模型不适合结构化抽取——所以默认值是 Terminus。
+  >
+  > 这个坑很隐蔽：走 Batch 时模型不可用只会在错误文件里留下一句 `Request failed: Unknown error.`，日志上完全看不出是模型的问题。怀疑模型时先用同步调用单独试一次。
+
 - `BATCH_SIZE_LIMIT`: 每次运行处理/导出的最大论文数量，默认为 `30`。如果您想增加每次运行处理的论文篇数，可以在环境变量中调大此数值。
 
 ---
@@ -74,30 +80,53 @@ cp .env.example .env
 
 本项目内置了完整的 Docker + docker-compose 支持，并以常驻守护进程（Daemon）方式运行。
 
+**你只需要填 `.env` 这一个文件，`docker-compose.yml` 不用改。** 里面所有可变项都写成了 `${VAR:-默认值}`，默认值取的是「换台机器就能跑」的那一套：桥接网络、无代理、密钥读本地 `.env`、嵌入走在线 API、数据放 `./data`。
+
 ### 1. 部署准备
-在服务器上创建外部共享 API 密钥文件：`/opt/docker_shared/api_keys.env`，内容格式如下：
-```env
-MINERU_API_KEY=key1,key2,key3       # 支持配置多个，以英文逗号分隔
-SILICONFLOW_API_KEY=your_siliconflow_key
-SILICONFLOW_API_BASE=https://api.siliconflow.cn/v1
-DEEPSEEK_MODEL=deepseek-ai/DeepSeek-V3 # 可选，更换 AI 模型
-BATCH_SIZE_LIMIT=50                 # 可选，增加单次处理上限数量（默认 30）
-```
-
-### 2. 配置 docker-compose.yml
-你可以通过编辑 `docker-compose.yml` 中的环境变量选择运行模式：
-```yaml
-environment:
-  - RUN_MODE=batch  # 可选 realtime (实时模式) 或 batch (批处理模式)
-```
-
-### 3. 启动服务
-在项目根目录下，执行以下命令构建并启动容器：
 ```bash
-# 由于部分环境网络限制，默认禁用 Buildkit 进行经典构建
+cp .env.example .env
+# 编辑 .env，填第 1 段的 MINERU_API_KEY 和 SILICONFLOW_API_KEY 即可，其余各段都有能用的默认值
+```
+
+### 2. 启动服务
+```bash
+# 部分环境网络受限，禁用 Buildkit 走经典构建
 DOCKER_BUILDKIT=0 docker compose build
 docker compose up -d
 ```
+
+### 3. 常用配置项
+
+| 变量 | 作用 | 什么时候需要改 |
+|---|---|---|
+| `RUN_MODE` | `batch`（省 50%）或 `realtime` | 想立等结果就用 realtime |
+| `DATA_ROOT` | 所有数据目录的根，默认 `./data` | 数据大了指向别的盘，如 `/mnt/data/lit` |
+| `CONTAINER_NAME` | 容器名，默认 `lit_analyzer` | 一台机器跑多套时必须区分 |
+| `OBSIDIAN_VAULT_DIRNAME` | vault 目录名 | 想用中文库名时 |
+| `DOCKER_NETWORK_MODE` | 默认 `bridge` | 仅当宿主机防火墙拦 docker 网桥、容器完全断网时改 `host` |
+| `LIT_HTTP_PROXY` / `LIT_HTTPS_PROXY` | 容器用的代理，默认空 | 国内访问 MinerU / 硅基流动都不需要 |
+
+> ⚠️ **一台机器跑多套时（比如「自己用」+「给别人用」各一份），`CONTAINER_NAME` 和 `DATA_ROOT` 必须同时改。** 只改容器名不改数据目录，两套会共用同一个数据库和 vault、互相覆盖处理记录——这比容器起不来严重得多。
+
+> ⚠️ **代理变量为什么带 `LIT_` 前缀**：compose 做变量替换时 shell 环境的优先级高于 `.env`，而 `HTTP_PROXY` 恰恰最容易被 export。不加前缀的话，你 shell 里挂的代理会被悄悄注进容器；bridge 模式下 `127.0.0.1` 指的是容器自己的回环，所有外部请求变成 connection refused，而配置文件上完全看不出来。
+
+### 4. 换机器 / 内存小的机器部署
+
+镜像固定 tag 为 `lit-analyzer:1.0`（可用 `IMAGE_NAME` 覆盖），所以「本机构建 → 传镜像 → 目标机直接起」这条路是通的：
+
+```bash
+# 本机
+docker save lit-analyzer:1.0 | gzip > lit.tar.gz
+# 目标机
+gunzip -c lit.tar.gz | docker load
+docker compose up -d          # 镜像名对得上，不会触发构建
+```
+
+小内存云服务器（1~2G）建议走这条路：本地构建时 pip 装 pandas/numpy 很吃内存，直接在服务器上 build 容易 OOM。
+
+> ⚠️ **容器代码是 `COPY . .` 打进镜像的，不是挂载的。** 改了宿主机上的 `.py` 对运行中的容器**无效且不报错**，必须 `docker compose build && docker compose up -d`。
+>
+> ⚠️ **改了 `.env` 之后 `docker restart` 不生效**——环境变量是容器创建时烤进去的。必须 `docker compose up -d --force-recreate`，核对用 `docker exec <容器名> printenv <变量名>`。
 
 ### 4. 运行日志监控与日常运维
 ```bash
@@ -129,7 +158,7 @@ docker compose exec literature-analyzer python cli.py reset --failed
 - `batch_pipeline.py`: 批处理处理逻辑实现（包含基于 SQLite 的提交与结果拉取状态流转）。
 - `cli.py`: 运维及状态/运行历史统计管理 CLI 终端。
 - `mineru_client.py`: 封装了 MinerU 的两步上传、解析轮询及结果下载，轮询间隔已优化为 10 秒。
-- `llm_router.py`: 大模型调用路由，内置 SiliconFlow DeepSeek V3 接口及原始摘要无损提取逻辑。
+- `llm_router.py`: 大模型调用路由，内置 SiliconFlow / 官方 DeepSeek 双通道及原始摘要无损提取逻辑。
 - `utils.py`: 共享的工具函数，提供 Excel 导出、Obsidian 模板渲染、SHA-256 去重哈希计算、运行日志追加等。
 - `obsidian_template.md`: Jinja2 模板，定义了生成的 Obsidian 笔记排版样式。
 - `review.py` + `litreview/`: 综述生成器（分块 → Qwen3-Embedding 向量检索 → Qwen3-Reranker 重排 → 证据打分 → 带引用归纳）。
@@ -220,7 +249,34 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 }
 ```
 
-`mcp_server.sh` 负责加载密钥（`/opt/docker_shared/api_keys.env`）、清理代理变量、指向生产数据库后启动 server；换机器部署时只需改脚本里的三个路径。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
+`mcp_server.sh` 负责加载密钥、清理代理变量、指向生产数据库后启动 server；换机器部署时需改脚本里的三个路径。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
+
+> [!WARNING]
+> `mcp_server.sh` 目前仍**硬编码** `. /opt/docker_shared/api_keys.env`，没跟着去宿主机化一起改成 `${SHARED_ENV_FILE}`。
+> 别人的机器上没有这个文件，脚本开头是 `set -a` 加 source，失败会直接退出、MCP 起不来。
+> 自己部署时请先把这一行改成你的密钥文件路径（或直接删掉，改用 `.env`）。
+
+**远程接入（别的设备连回跑着文献库的那台机器）**：MCP 走 stdio，所以直接用 SSH 把命令跑在对端即可。以 Windows 上 Git 自带的 `ssh.exe` 为例：
+
+```json
+{
+  "mcpServers": {
+    "literature-review": {
+      "command": "C:\\Program Files\\Git\\usr\\bin\\ssh.exe",
+      "args": [
+        "-T",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "BatchMode=yes",
+        "-o", "ServerAliveInterval=30",
+        "-p", "<端口>", "<用户>@<主机>",
+        "/path/to/literature_analyzer/mcp_server.sh"
+      ]
+    }
+  }
+}
+```
+
+这四个选项**都不是可有可无的**，缺任何一个的表现都是"客户端显示已连接后立刻断开"，见下方经验教训。改配置前先手动跑一次 `ssh -T -p <端口> <用户>@<主机> "whoami"` 确认链路本身通。
 
 **日志**：server 启动/就绪/退出以及每次工具调用（入参、耗时、异常堆栈）都会写入 `data/mcp_server.log`（不经过 stdout/stderr，不会污染 stdio 协议流）。排查"客户端显示已连接却立刻断开"一类问题时先看这个文件：
 
@@ -228,4 +284,13 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 tail -f /home/dudu/GoogleDrive/Antigravity/literature_analyzer/data/mcp_server.log
 ```
 
-如果连"MCP server 启动中"这条都没出现，说明进程根本没跑起来（传输层/SSH 问题，而非 server 代码本身）；如果启动日志有但没有任何工具调用记录，说明客户端连上后没有发起过请求。**经验教训**：MCP stdio 要求 stdin/stdout 是未经改动的原始字节流，用 SSH 转发时如果分配了伪终端（pty，默认或 `-t`/`-tt`）会插入回显、换行转换等终端层处理，破坏协议帧——现象就是客户端显示"已连接"后几十~几百毫秒内立刻断开，且服务端日志干干净净（启动、就绪、退出都有，但没有任何工具调用记录）。用 `-T`（禁用 pty）即可解决。
+如果连"MCP server 启动中"这条都没出现，说明进程根本没跑起来（传输层/SSH 问题，而非 server 代码本身）；如果启动日志有但没有任何工具调用记录，说明客户端连上后没有发起过请求。
+
+**经验教训**：以下三个坑现象**完全一样**——客户端显示"已连接"后几十~几百毫秒内立刻断开，服务端日志干干净净——但成因不同。根因都是同一条：MCP stdio 要求 stdin/stdout 是**未经改动的原始字节流**，任何往这条流里掺东西的行为都会破坏协议帧。
+
+1. **伪终端（pty）**：SSH 转发时如果分配了 pty（`-t`/`-tt`，或某些客户端默认），会插入回显、换行转换等终端层处理。用 `-T` 显式禁用。
+2. **`known_hosts` 缺条目**：`known_hosts` 是按 `[主机]:端口` 存的，所以**换公网 IP 或换端口都等于全新条目**，ssh 会弹 `Are you sure you want to continue connecting?`。MCP 客户端没有终端可回答，这行提示直接窜进协议流。用 `-o StrictHostKeyChecking=accept-new` 首次自动接受。
+3. **找不到密钥时转去要密码**：ssh 会去读 stdin 等用户输入密码——而 stdin 正是 MCP 的协议输入流，等于把协议数据当密码吃掉。用 `-o BatchMode=yes` 让它直接失败而不是转去交互。
+   Windows 上还有个额外诱因：Git for Windows 的 `ssh.exe` 被 MCP 客户端以纯 Win32 进程拉起时 `HOME` 可能没设置，于是找不到 `~/.ssh/id_ed25519`。这种情况要在 `args` 里补 `"-i", "C:/Users/<你>/.ssh/id_ed25519"`。
+
+排查顺序：**先在终端里手动跑一遍同样的 ssh 命令**（`ssh -T -p <端口> <用户>@<主机> "whoami"`）。手动能通而 MCP 不通，基本就是上面第 2、3 条；手动就不通，那是链路或认证问题，跟 MCP 无关。

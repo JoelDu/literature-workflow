@@ -1,6 +1,20 @@
 # Docker 多项目基础设施统一配置指南
 
-适用于所有需要调用大模型 API 和外网代理的 Docker 项目。**一次配置，全机生效。**
+> [!WARNING]
+> **这份文档描述的是作者那台宿主机的跨项目基础设施，不是本项目的配置方式。**
+> 本项目自 2026-08 去宿主机化之后，**配置的唯一入口是仓库根目录的 `.env`**（照 `.env.example` 抄），
+> 不需要、也不应该按本文去建 `/opt/docker_shared/api_keys.env`。两处具体冲突：
+>
+> 1. 本文说"**不建项目级 `.env`**"——本项目相反，`.env` 是必需的，`compose` 的 `env_file` 直接读它；
+>    `/opt/docker_shared/api_keys.env` 降级成可选的 `${SHARED_ENV_FILE}`（`required: false`），
+>    只是作者机器上集中管 Key 的便利，不是前提。
+> 2. 本文第二节让把 `ALL_PROXY=socks5://...` 写进共享文件——**本项目的容器里绝不能有它**。
+>    镜像没装 `httpx[socks]`，继承到 socks 代理会让 openai 客户端初始化就崩，
+>    所以 `docker-compose.yml` 里 `ALL_PROXY` 被强制置空。代理请用 `LIT_HTTP_PROXY`/`LIT_HTTPS_PROXY`。
+>
+> 详见 `handoff.md` §5「环境配置」。以下内容仅对作者本机的其他项目有效。
+
+适用于作者宿主机上所有需要调用大模型 API 和外网代理的 Docker 项目。**一次配置，全机生效。**
 
 ---
 
