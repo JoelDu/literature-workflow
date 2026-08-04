@@ -119,29 +119,38 @@ def library_status() -> str:
     n_details = conn.execute("SELECT COUNT(*) FROM paper_details").fetchone()[0]
     latest = conn.execute("SELECT MAX(processed_at) FROM papers").fetchone()[0]
     conn.close()
+    counts = _store().doc_type_counts()
+    label = {"paper": "论文", "book": "教材/书籍", "patent": "专利"}
+    breakdown = "、".join(f"{label.get(k, k)} {v}" for k, v in
+                          sorted(counts.items(), key=lambda kv: -kv[1]))
     return (f"文献库概况：\n"
-            f"- 已入库文献：{s['exported_docs']} 篇（最近入库时间 {latest}）\n"
+            f"- 已入库文献：{s['exported_docs']} 篇（{breakdown}；最近入库时间 {latest}）\n"
             f"- 向量索引：{s['indexed_docs']} 篇 / {s['embedded_chunks']} 块"
             f"（模型 {settings.EMBEDDING_MODEL}，待索引 {s['pending_docs']} 篇）\n"
             f"- 结构化元数据：{n_details} 篇（DOI/中英标题/参考文献/图表）")
 
 
 @_logged_tool()
-def search_literature(query: str, top_k: int = 8) -> str:
+def search_literature(query: str, top_k: int = 8, corpus: str = "all") -> str:
     """在本地文献库中检索与问题最相关的原文片段（向量召回+重排序，支持中英跨语言）。
     返回片段原文与来源论文信息，可据此归纳回答并注明出处。
 
     Args:
         query: 检索问题或关键词（中文即可，能命中英文文献）
         top_k: 返回片段数量，默认 8
+        corpus: 限定来源，all(默认，混检) / paper(论文) / book(教材) / patent(专利)
     """
     store = _store()
+    if corpus not in ("all", "paper", "book", "patent"):
+        return f"corpus 只能是 all / paper / book / patent，收到的是「{corpus}」。"
     qvec = _embedder().embed_query(query)
     rr = _reranker()
     recall_k = settings.RERANK_CANDIDATES if rr else top_k
-    results = store.search(qvec, top_k=recall_k, max_per_doc=settings.REVIEW_MAX_CHUNKS_PER_DOC)
+    results = store.search(qvec, top_k=recall_k, max_per_doc=settings.REVIEW_MAX_CHUNKS_PER_DOC,
+                           doc_types=None if corpus == "all" else [corpus])
     if not results:
-        return "未检索到结果（索引可能为空）。"
+        hint = "（索引可能为空）" if corpus == "all" else f"（已限定 corpus={corpus}，可换成 all 再试）"
+        return f"未检索到结果{hint}。"
     if rr:
         ranked = rr.rerank(query, [r.content for r in results], top_n=top_k)
         results = [results[i] for i, _score in ranked]
@@ -153,7 +162,10 @@ def search_literature(query: str, top_k: int = 8) -> str:
     for i, (r, sc) in enumerate(zip(results, scores), 1):
         m = meta.get(r.doc_id, {})
         title = m.get("title_zh") or m.get("title_en") or m.get("title", r.doc_id[:8])
-        out.append(f"[{i}] 《{title}》({m.get('year') or '年份不详'}) "
+        kind = {"book": "[教材]", "patent": "[专利]"}.get(m.get("doc_type"), "")
+        if m.get("doc_type") == "patent" and m.get("patent_no"):
+            kind = f"[专利 {m['patent_no']}]"
+        out.append(f"[{i}] {kind}《{title}》({m.get('year') or '年份不详'}) "
                    f"小节:{r.section_title or '-'} 相关度:{sc:.3f} 文献ID:{r.doc_id[:8]}\n"
                    f"{r.content[:800]}\n")
     return "\n".join(out)
@@ -170,29 +182,75 @@ def get_paper_info(keyword: str, limit: int = 5) -> str:
     conn = _store()._conn()
     rows = conn.execute(
         """SELECT p.id, p.title, d.title_zh, d.title_en, d.doi, d.authors, d.journal,
-                  d.year, d.keywords, d.n_refs, d.n_figures, d.n_tables, p.result_json
+                  d.year, d.keywords, d.n_refs, d.n_figures, d.n_tables, p.result_json,
+                  COALESCE(d.doc_type,'paper'), d.patent_no, d.filing_date,
+                  d.legal_status, d.status_checked_at, d.publisher
            FROM papers p LEFT JOIN paper_details d ON d.doc_id = p.id
            WHERE p.status='EXPORTED' AND (p.title LIKE ? OR d.title_zh LIKE ?
-                 OR d.title_en LIKE ? OR d.keywords LIKE ?)
+                 OR d.title_en LIKE ? OR d.keywords LIKE ? OR d.patent_no LIKE ?)
            LIMIT ?""",
-        (f"%{keyword}%",) * 4 + (limit,)).fetchall()
+        (f"%{keyword}%",) * 5 + (limit,)).fetchall()
     conn.close()
     if not rows:
         return f"未找到与「{keyword}」匹配的文献。"
     out = [f"找到 {len(rows)} 篇：\n"]
     for (doc_id, title, t_zh, t_en, doi, authors, journal, year,
-         kw, n_refs, n_figs, n_tabs, result_json) in rows:
+         kw, n_refs, n_figs, n_tabs, result_json,
+         doc_type, patent_no, filing_date, legal_status, checked_at, publisher) in rows:
         tldr = ""
         try:
             tldr = json.loads(result_json).get("tldr", "") if result_json else ""
         except Exception:
             pass
+        if doc_type == "patent":
+            from litreview.patent import describe
+            out.append(f"● [专利] {t_zh or title}（文献ID {doc_id[:8]}）\n"
+                       f"  专利号: {patent_no or '-'} | 申请日: {filing_date or '-'}\n"
+                       f"  发明人: {authors or '-'} | 申请人/专利权人: {publisher or '-'}\n"
+                       f"  {describe(patent_no, filing_date, legal_status, checked_at)}\n"
+                       f"  图 {n_figs or 0} / 表 {n_tabs or 0}\n")
+            continue
         out.append(f"● {t_zh or title}（文献ID {doc_id[:8]}）\n"
                    f"  英文题名: {t_en or '-'}\n"
                    f"  作者: {authors or '-'} | 期刊: {journal or '-'} | 年份: {year or '-'}\n"
                    f"  DOI: {doi or '-'} | 关键词: {kw or '-'}\n"
                    f"  参考文献 {n_refs or 0} 条 / 图 {n_figs or 0} / 表 {n_tabs or 0}\n"
                    f"  TLDR: {tldr[:200] or '-'}\n")
+    return "\n".join(out)
+
+
+@_logged_tool()
+def patent_status(keyword: str = "") -> str:
+    """查看专利台账：专利号、申请日、出版阶段、保护期届满日、人工核实过的法律状态。
+
+    「出版阶段」和「保护期至」是由专利号种别码与申请日现算的事实，印在 PDF 上、不会变。
+    「法律状态」（驳回/撤回/欠费失效/无效）不在 PDF 里且随时间变化，只有人工核实过才有值，
+    显示「未核实」时**不要**拿出版阶段替代它回答，也不要自行推断。
+    本工具只读；更新状态需在服务器上执行 `python review.py patents --set <专利号> --status <状态>`。
+
+    Args:
+        keyword: 按专利号或名称过滤，留空则列出全部
+    """
+    from litreview.patent import patent_stage, patent_expiry, is_term_expired
+    rows = _store().list_patents()
+    if keyword:
+        k = keyword.lower()
+        rows = [r for r in rows
+                if k in (r["patent_no"] or "").lower() or k in (r["title"] or "").lower()]
+    if not rows:
+        return f"未找到匹配「{keyword}」的专利。" if keyword else "库中暂无专利记录。"
+    out = [f"专利 {len(rows)} 篇：\n"]
+    for r in rows:
+        exp = patent_expiry(r["patent_no"], r["filing_date"])
+        legal = (f"{r['legal_status']}（{r['status_checked_at']} 核实）"
+                 if r["legal_status"] else "未核实（PDF 中无此信息，需人工查证）")
+        out.append(f"● {r['patent_no'] or '号码未识别'} 《{r['title'] or '-'}》"
+                   f"（文献ID {r['doc_id'][:8]}）\n"
+                   f"  申请日: {r['filing_date'] or '-'} | 出版阶段: {patent_stage(r['patent_no'])}\n"
+                   f"  保护期至: {exp or '-'}"
+                   f"{'（已超期）' if is_term_expired(r['patent_no'], r['filing_date']) else ''}"
+                   f" | 法律状态: {legal}\n"
+                   f"  发明人: {r['inventors'] or '-'} | 专利权人: {r['assignee'] or '-'}\n")
     return "\n".join(out)
 
 

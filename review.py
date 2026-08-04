@@ -193,6 +193,72 @@ def cmd_add_book(args):
                   + ("" if failed else " 运行 `python review.py index` 建索引。"))
 
 
+def cmd_patents(args):
+    """专利台账：列表 / 重扫存量 / 人工核实法律状态。
+
+    列表里「出版阶段」和「保护期至」是从专利号和申请日现算出来的事实，不落库；
+    「法律状态」只有人工核实过才有值——驳回、撤回、欠年费失效这些事件 PDF 里没有，
+    也没法从本地推出来，所以宁可显示"未核实"，也不拿出版阶段冒充法律状态。
+    """
+    from datetime import date
+    from litreview.store import VectorStore
+    from litreview.patent import (patent_stage, patent_expiry, is_term_expired,
+                                  LEGAL_STATUSES)
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+
+    if args.rescan:
+        from litreview.enrich import rescan_patents
+        rescan_patents(settings, console, apply=args.apply)
+        return
+
+    if args.set:
+        if not args.status:
+            console.print("[red]--set 必须同时给 --status，"
+                          f"可选：{'/'.join(LEGAL_STATUSES)}")
+            sys.exit(1)
+        today = date.today().isoformat()
+        hit = store.set_patent_status(args.set, args.status, today)
+        if not hit:
+            console.print(f"[yellow]未匹配到专利「{args.set}」（可用专利号或文献ID前缀）。"
+                          "先跑 `python review.py patents` 看看台账。")
+            sys.exit(1)
+        console.print(f"[green]✔ 已将 {len(hit)} 篇标记为「{args.status}」，核实日期 {today}。")
+        log_run_event(mode="review", event="patent_status", status="success",
+                      extra={"ident": args.set, "status": args.status, "docs": len(hit)})
+        return
+
+    rows = store.list_patents()
+    if not rows:
+        console.print("[yellow]库里还没有 doc_type='patent' 的记录。"
+                      "若确信已入库过专利，先跑 `python review.py patents --rescan` 预演一下。")
+        return
+    # 列数压到 6 且名称允许折行——7 列挤在 80 字符终端里会被全部截成省略号，等于没显示。
+    table = Table(title=f"📄 专利台账（{len(rows)} 篇）", show_lines=True)
+    table.add_column("专利号", style="cyan", no_wrap=True)
+    table.add_column("名称", overflow="fold")
+    table.add_column("申请日", justify="center", no_wrap=True)
+    table.add_column("阶段", justify="center", no_wrap=True)
+    table.add_column("保护期至", justify="center", no_wrap=True)
+    table.add_column("法律状态", justify="center", overflow="fold")
+    short = {"申请公布（审查中）": "公布\n审查中", "发明专利已授权": "发明\n已授权",
+             "发明专利已授权（更正）": "发明\n已授权", "实用新型已授权": "实用新型\n已授权",
+             "外观设计已授权": "外观\n已授权", "申请公开（审查中）": "公开\n审查中",
+             "已授权": "已授权", "未知": "未知"}
+    for r in rows:
+        exp = patent_expiry(r["patent_no"], r["filing_date"])
+        expired = is_term_expired(r["patent_no"], r["filing_date"])
+        stage = patent_stage(r["patent_no"])
+        legal = (f"{r['legal_status']}\n[dim]{r['status_checked_at']}[/dim]"
+                 if r["legal_status"] else "[dim]未核实[/dim]")
+        table.add_row(r["patent_no"] or f"[dim]{r['doc_id'][:8]}[/dim]", r["title"] or "-",
+                      r["filing_date"] or "-", short.get(stage, stage),
+                      f"[red]{exp}[/red]" if expired else (exp or "-"), legal)
+    console.print(table)
+    console.print("[dim]「阶段」「保护期至」由专利号种别码与申请日现算，是 PDF 上的事实，不会变；\n"
+                  "「法律状态」PDF 里没有且会随时间变化，需人工核实后录入：\n"
+                  "  python review.py patents --set <专利号|文献ID> --status 驳回")
+
+
 def cmd_outline(args):
     _require_siliconflow()
     from litreview.store import VectorStore
@@ -357,8 +423,8 @@ def main():
     p.add_argument("query")
     p.add_argument("-k", "--top-k", type=int, default=10)
     p.add_argument("--no-rerank", action="store_true", help="只用向量分数，不做重排序")
-    p.add_argument("--corpus", choices=["all", "paper", "book"], default="all",
-                   help="限定检索来源（默认 all=论文+教材混检）")
+    p.add_argument("--corpus", choices=["all", "paper", "book", "patent"], default="all",
+                   help="限定检索来源（默认 all=论文+教材+专利混检）")
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("enrich", help="提取结构化元数据（标题中英/DOI/图表/参考文献）")
@@ -372,6 +438,16 @@ def main():
     p.add_argument("--pages", type=int, default=None, help="PDF 每份最大页数（默认取 BOOK_SPLIT_PAGES=180；EPUB 忽略）")
     p.add_argument("--no-llm", action="store_true", help="元数据只做本地解析，出版社/版次等留空待手填")
     p.set_defaults(func=cmd_add_book)
+
+    p = sub.add_parser("patents", help="专利台账：查看出版阶段/保护期，人工核实法律状态")
+    p.add_argument("--rescan", action="store_true",
+                   help="重扫存量文献，找出被误判成论文的专利（默认只预演，不写库、不调 LLM）")
+    p.add_argument("--apply", action="store_true", help="配合 --rescan：真正写库")
+    p.add_argument("--set", metavar="专利号或文献ID", help="指定要更新法律状态的专利")
+    p.add_argument("--status", choices=["审查中", "已授权", "驳回", "撤回", "视为撤回",
+                                        "失效", "已过期", "无效", "未知"],
+                   help="配合 --set：人工核实到的法律状态，自动记录核实日期")
+    p.set_defaults(func=cmd_patents)
 
     p = sub.add_parser("outline", help="生成综述大纲")
     p.add_argument("topic")

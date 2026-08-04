@@ -173,6 +173,7 @@ python review.py status               # 索引状态
 python review.py index [--force]     # 手动建/重建向量索引（换嵌入模型后需 --force）
 python review.py enrich [--no-llm]   # 提取结构化元数据：中英标题/DOI/图表/参考文献 → paper_details 等新表
 python review.py search "关键词"      # 检索调试（默认走重排序，--no-rerank 看纯向量结果）
+python review.py patents              # 专利台账：出版阶段/保护期/法律状态（详见下文）
 python review.py outline "主题" -o outline.json   # 只生成大纲（可手工编辑后再传入 generate）
 python review.py generate "主题" [--outline outline.json] [--dry-run] \
     [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数]
@@ -214,20 +215,50 @@ python review.py search "某概念" --corpus book   # 只在教材中检索（�
   python -c "import daemon; daemon.book_intake_job()"
   ```
 
+### 📄 专利（自动识别，法律状态人工核实）
+
+专利 PDF **不需要单独的入口**——跟论文走同一条流水线，`enrich` 阶段按扉页的 **INID 码**（WIPO ST.9 标准著录项目代码，`(21)申请号` `(22)申请日` `(72)发明人` `(54)发明名称` 等，全球专利文献通用）自动判定，命中 **≥2 个**标记才算数（只出现一次 "United States Patent" 的论文不会被误判）。识别为专利后 `doc_type='patent'`，发明人/申请人/申请日直接从 INID 码取，**跳过 LLM 补缺**（同教材的做法，省一次 API 调用）。
+
+```bash
+python review.py patents                          # 专利台账
+python review.py patents --rescan                 # 重扫存量文献，找出被误判成论文的专利（仅预演）
+python review.py patents --rescan --apply         # 确认后写库（不调 LLM、不重解析，可重复执行）
+python review.py patents --set CN110346043A --status 驳回   # 人工录入法律状态，自动记核实日期
+python review.py search "余热回收" --corpus patent          # 只在专利中检索
+```
+
+**⚠️ 状态分两类，这是本功能的设计前提，改代码前务必看清 `litreview/patent.py` 模块头部说明：**
+
+| | 出版阶段 / 保护期至 | 法律状态 |
+|---|---|---|
+| 来源 | 专利号种别码 + 申请日，**印在 PDF 上** | 驳回/撤回/欠年费失效/无效宣告，**PDF 里没有** |
+| 会变吗 | 不会 | **会**，随时间变化 |
+| 怎么得到 | 本地现算，零成本零网络 | 只能人工核实或接外部数据源 |
+| 存哪 | 不落库，读取时现算 | `legal_status` + `status_checked_at` 两列 |
+
+- 种别码：CN `A`=发明申请公布（审查中）/ `B`=发明授权 / `U`=实用新型授权 / `S`=外观设计；US `A1`=申请公开、`B1`/`B2`=授权；EP `A*`=申请、`B*`=授权。扉页同时印着授权公告号和申请公布号时**取授权号**，它才代表当前阶段。
+- 保护期：申请日 + 20 年（发明）/ 10 年（实用新型）/ 15 年（外观设计），是纯算术。但这只是**期限上限**——欠缴年费、主动放弃、被宣告无效都会让专利早于此日失效，那些事件本地看不到。
+- 没人工核实过就显示「未核实」，**不会拿出版阶段冒充法律状态**（种别码 `B` 只说明它当年被授权过，不代表今天仍然有效）。
+- `legal_status` / `status_checked_at` 两列**不会被 `enrich --force` 冲掉**（`save_enrichment` 是 `INSERT OR REPLACE`，写入前会先取回旧值沿用），人工成果安全。
+- 新增的 4 列（`patent_no` / `filing_date` / `legal_status` / `status_checked_at`）全部可空、默认 NULL，随 `paper_details` 既有的热升级机制自动补列，对已有论文/教材行零影响。
+
 ## 🔌 MCP Server（在大模型对话中直接调用）
 
 `mcp_server.py` 把文献库检索与综述撰写打包成标准 MCP server（stdio），可被 Claude Code / Claude Desktop / Cherry Studio 等任意 MCP 客户端调用。
 
-**提供 6 个工具**：
+**提供 7 个工具**：
 
 | 工具 | 说明 |
 |---|---|
-| `library_status` | 文献库概况（篇数/索引/元数据覆盖） |
-| `search_literature(query, top_k)` | 语义检索文献片段（向量召回 + 重排序，跨中英） |
-| `get_paper_info(keyword, limit)` | 按标题/关键词查论文的结构化元数据（DOI/作者/期刊/TLDR） |
+| `library_status` | 文献库概况（篇数/索引/元数据覆盖，按论文/教材/专利分列） |
+| `search_literature(query, top_k, corpus)` | 语义检索文献片段（向量召回 + 重排序，跨中英）；`corpus` 可限定 `paper`/`book`/`patent` |
+| `get_paper_info(keyword, limit)` | 按标题/关键词/专利号查结构化元数据（DOI/作者/期刊/TLDR，专利则给出阶段与保护期） |
+| `patent_status(keyword)` | 专利台账：出版阶段、保护期至、法律状态（**只读**，法律状态只能用 CLI 人工录入） |
 | `generate_outline(topic, focus, sections)` | 生成综述大纲 JSON（同步，约 1 分钟） |
 | `start_review(topic, focus, words, sections, outline_json)` | 后台启动完整综述生成，立即返回 job_id |
 | `review_status(job_id)` | 查询生成进度/日志尾部/产出文件路径（markdown + Word 各一份） |
+
+> `patent_status` 刻意**不提供写入能力**——法律状态是要对外负责的结论，不能由模型自行判断后写进生产库；工具返回「未核实」时也明确要求调用方不要拿出版阶段替代作答。
 
 综述生成耗时 7-30 分钟（取决于模型），远超 MCP 工具调用超时，所以采用**后台任务模式**：`start_review` 秒回 job_id，之后随时用 `review_status` 轮询，完成后返回 Obsidian 笔记路径。
 

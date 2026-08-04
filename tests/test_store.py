@@ -141,3 +141,74 @@ def test_dim_mismatch_skipped():
         conn.close()
         matrix, meta = store.load_matrix(force_reload=True)
         assert matrix.shape[0] == 0
+
+
+def test_manual_patent_status_survives_reenrich():
+    """save_enrichment 用的是 INSERT OR REPLACE，会整行重写。
+    人工核实过的 legal_status/status_checked_at 必须活过后续的 enrich --force，
+    否则重跑一次元数据提取就把人工成果全冲没了。"""
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        doc_id = "c" * 64
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                     (doc_id, "热法磷酸全热能回收系统", "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+
+        store.save_enrichment(doc_id, {"title": "热法磷酸全热能回收系统", "doc_type": "patent",
+                                       "patent_no": "CN112856361B", "filing_date": "2021-03-08"},
+                              [], [])
+        assert store.set_patent_status("CN112856361B", "驳回", "2026-08-04") == [doc_id]
+
+        # 模拟 enrich --force 重跑：同一篇再存一次，且这次不带任何状态字段
+        store.save_enrichment(doc_id, {"title": "热法磷酸全热能回收系统", "doc_type": "patent",
+                                       "patent_no": "CN112856361B", "filing_date": "2021-03-08"},
+                              [], [])
+        rows = store.list_patents()
+        assert len(rows) == 1
+        assert rows[0]["legal_status"] == "驳回"
+        assert rows[0]["status_checked_at"] == "2026-08-04"
+
+        # 显式传新状态时应当覆盖
+        store.save_enrichment(doc_id, {"title": "x", "doc_type": "patent",
+                                       "patent_no": "CN112856361B", "filing_date": "2021-03-08",
+                                       "legal_status": "已授权", "status_checked_at": "2026-09-01"},
+                              [], [])
+        assert store.list_patents()[0]["legal_status"] == "已授权"
+
+
+def test_set_patent_status_by_doc_id_prefix_and_miss():
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        doc_id = "d" * 64
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                     (doc_id, "某专利", "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+        store.save_enrichment(doc_id, {"title": "某专利", "doc_type": "patent",
+                                       "patent_no": "CN110346043A", "filing_date": "2019-06-03"},
+                              [], [])
+        assert store.set_patent_status("dddddddd", "撤回", "2026-08-04") == [doc_id]
+        assert store.set_patent_status("CN999999999A", "驳回", "2026-08-04") == []
+
+
+def test_doc_type_counts_and_patent_isolation():
+    """论文不该被 list_patents 捞出来，统计口径也要分得开。"""
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        conn = sqlite3.connect(db_path)
+        for i, (did, t) in enumerate([("a" * 64, "论文"), ("b" * 64, "教材"), ("c" * 64, "专利")]):
+            conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                         (did, t, "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+        store.save_enrichment("a" * 64, {"title": "论文"}, [], [])
+        store.save_enrichment("b" * 64, {"title": "教材", "doc_type": "book"}, [], [])
+        store.save_enrichment("c" * 64, {"title": "专利", "doc_type": "patent",
+                                         "patent_no": "CN110346043A"}, [], [])
+        assert store.doc_type_counts() == {"paper": 1, "book": 1, "patent": 1}
+        assert [r["doc_id"] for r in store.list_patents()] == ["c" * 64]
+        meta = store.get_paper_meta(["c" * 64])["c" * 64]
+        assert meta["doc_type"] == "patent" and meta["patent_no"] == "CN110346043A"

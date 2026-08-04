@@ -62,15 +62,21 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
 
 **综述生成器（`review.py` + `litreview/`）**
 1.  `index`：对已入库论文/教材分块并向量化（`chunker.py` + `embedder.py`），写入检索表。
-2.  `enrich`：优先从 MinerU 的 `content_list.json` 本地解析（正则抓 DOI，按 block 类型取图表/参考文献），解析不出来的字段才调用 LLM 补全，写入 `paper_details`/`paper_assets`/`paper_references`。
+2.  `enrich`：优先从 MinerU 的 `content_list.json` 本地解析（正则抓 DOI，按 block 类型取图表/参考文献），解析不出来的字段才调用 LLM 补全，写入 `paper_details`/`paper_assets`/`paper_references`；扉页命中 ≥2 个 INID 码的判为专利（`litreview/patent.py`），元数据直接从著录项目取、跳过 LLM。
 3.  `outline` → `generate`：向量召回 → `reranker.py` 精排 → 大模型逐条给证据打分（≥ `REVIEW_MIN_SCORE` 保留）→ 只依据证据写作、强制引用标记，自动插图（`figures.py`）→ 渲染 Markdown + pandoc 导出 Word。
 
 **教材入库（`litreview/bookintake.py`）**
 - 手动：`review.py add-book [路径]`，PDF 走 pypdf 按 `BOOK_SPLIT_PAGES` 拆分再拼回同一 `doc_id`；EPUB 走 pandoc 直转。
 - 定时：`daemon.book_intake_job()`，每天 `BOOK_INTAKE_TIME` 扫描 `BOOK_INPUT_DIR`，按文件名排序、PDF 累计页数不超 `BOOK_DAILY_PAGE_BUDGET` 逐本处理（排最前的单本超预算大部头例外，会处理完，避免永远排不上），成功后按 `REVIEW_AUTO_INDEX` 自动增量建索引（`REVIEW_EMBED_BACKEND=local` 时只登记待办，实际嵌入留给夜间任务，见下）。
 
+**专利（`litreview/patent.py`）**
+- 无独立入口，与论文同一条流水线；`enrich` 按扉页 INID 码（`(21)申请号`/`(22)申请日`/`(72)发明人`…）判定，**必须 ≥2 个标记**（库里真有一篇 ResearchGate 章节正文提到 "United States Patent"，单关键词必误判，已固化为回归用例）。扉页同时印授权公告号与申请公布号时取授权号。
+- ⚠️ **"状态"是两件不同的事，别合并成一列**：出版阶段（种别码 `A`/`B`/`U`/`S`）与保护期（申请日 + 20/10/15 年）印在 PDF 上、不会变，**读取时现算、不落库**（存成"已过期"会随时间变错且无人察觉）；驳回/撤回/欠年费失效/无效宣告这类法律状态**不在 PDF 上且会变**，只能人工核实，落 `legal_status` + `status_checked_at`（**必须带核实日期**）。没核实过一律显示"未核实"，不拿种别码冒充。
+- `review.py patents [--rescan [--apply]] [--set <专利号|文献ID> --status <状态>]`；`--rescan` 只跑正则、不调 LLM、默认 dry-run（`enrich --force` 会对全库重跑 LLM，为了重分类两篇专利不值得）。
+- ⚠️ `save_enrichment` 用的是 `INSERT OR REPLACE`（整行重写），所以写入前会先 SELECT 回 `legal_status`/`status_checked_at` 沿用——否则一次 `enrich --force` 就把人工核实结果冲成空。改那段代码务必保住这个行为，`tests/test_store.py` 有专门用例盯着。
+
 **MCP Server（`mcp_server.py`）**
-- stdio 协议，6 个工具：`library_status`、`search_literature`、`get_paper_info`、`generate_outline`、`start_review`（异步，秒回 job_id）、`review_status`（轮询）。
+- stdio 协议，7 个工具：`library_status`、`search_literature`（可 `corpus` 限定 paper/book/patent）、`get_paper_info`、`patent_status`（**只读**，法律状态不允许模型写库）、`generate_outline`、`start_review`（异步，秒回 job_id）、`review_status`（轮询）。
 - 由 `mcp_server.sh` 负责加载密钥、清理代理变量、指向生产库后启动。
 
 **夜间本地嵌入（`nightly_index.py`，2026-07-29 上线）**
@@ -90,8 +96,8 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
 
 *   `batch_pipeline.py` / `pipeline.py`：论文批处理/实时处理主逻辑（扫描、MinerU 分发、LLM Batch 提交、拉取与导出）。
 *   `daemon.py`：守护进程调度器——论文的 `RUN_MODE`（实时/批处理间隔轮询）与教材每日定时入库两条调度线并行、互不干扰。
-*   `review.py`：综述生成器 CLI 入口（`index`/`enrich`/`search`/`outline`/`generate`/`add-book`）。
-*   `litreview/`：综述生成器核心包——`chunker.py`（分块）、`embedder.py`（Qwen3 向量化）、`reranker.py`（重排序）、`stages.py`（检索→打分→写作流程编排）、`enrich.py`（结构化元数据提取）、`figures.py`（自动插图）、`bookintake.py`（教材入库，PDF 拆分/EPUB 转换/定时调度）、`models.py`/`store.py`（SQLite 数据模型与读写）、`prompts.py`（各阶段提示词）。
+*   `review.py`：综述生成器 CLI 入口（`index`/`enrich`/`search`/`patents`/`outline`/`generate`/`add-book`）。
+*   `litreview/`：综述生成器核心包——`chunker.py`（分块）、`embedder.py`（Qwen3 向量化）、`reranker.py`（重排序）、`stages.py`（检索→打分→写作流程编排）、`enrich.py`（结构化元数据提取）、`patent.py`（专利识别，只产出事实、不猜法律状态）、`figures.py`（自动插图）、`bookintake.py`（教材入库，PDF 拆分/EPUB 转换/定时调度）、`models.py`/`store.py`（SQLite 数据模型与读写）、`prompts.py`（各阶段提示词）。
 *   `mcp_server.py` + `mcp_server.sh`：MCP 协议 server，把检索/综述能力暴露给 Claude Code 等客户端。
 *   `mineru_client.py`：MinerU V4 API 客户端。已配置轮询重试、自动 Key 轮换及 ZIP 附件解压提取（Markdown、Images、DOCX、HTML、LaTeX 全格式取回）。
 *   `llm_router.py`：大模型客户端封装。处理 DeepSeek（主力）与 Gemini 的 Batch 任务构建及系统提示词管理。
@@ -125,6 +131,7 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
     - **默认模型 `deepseek-ai/DeepSeek-V3` 已废**：2026-07-24 后它在硅基流动上任何请求都返回 `429 System is too busy now`。改默认为 `DeepSeek-V3.1-Terminus`——实测整个账户里只有 V3 / V3.1-Terminus / R1 支持 batch 推理，其余（V3.2、V4-Pro、V4-Flash、Qwen 系）提交时就报 `20088 not support batch inference`，而 V3 已废、R1 是推理模型不适合结构化抽取，Terminus 是唯一跑得通的。
     - **全失败的 Batch 会永久卡死**：云端返回 `completed` 但 `request_counts.completed == 0` 时没有 `output_file_id`，旧代码直接 raise 被外层"未知崩溃"吞掉，论文永远停在 `BATCH_SUBMITTED`——而这个状态不在阶段 1 的自动拾起名单里，等于死局。现在识别并落到 `BATCH_FAILED`（可自愈、会被重新提交），同时读 `error_file` 把真实原因写进 `error_message`。
     - **空解析结果会被当正常论文入库**：MinerU 返回 success 不代表抽出了字，扫描件和纯图版 PDF 常常只给个空 `full.md`，放行的话 LLM 只能靠标题编，编出来的还会写进 Obsidian 和 Excel。现在按 `MIN_MARKDOWN_CHARS=200` 在解析出口拦截并移进 `failed_pdfs`。**拦截点必须在归档 move 之前**，否则这份 PDF 会被当成"已处理"，人再也不会去看它。
+17. **专利成为第三类文献**（`litreview/patent.py`，2026-08-04）：库里一直混着专利却被当论文处理。识别复用既有的 `doc_type` seam（该字段本就从 `docs_needing_index` → `chunk_params_for` → `search(doc_types=)` 全程打通，所以 `chunker.py` 一行没改），`paper_details` 加 4 个可空列。三个关键决定：① **判定要 ≥2 个 INID 码**——单关键词会把正文提到 "United States Patent" 的论文误判（真实案例已固化为回归用例）；② **派生值不落库**——出版阶段和保护期到期日读取时现算，存下来会随时间变错；③ **法律状态与出版阶段严格分离**，前者只能人工录入且强制记核实日期。另外专利跳过 LLM 补缺（INID 码已结构化），`--rescan` 走纯正则、默认 dry-run，避免为重分类两篇专利而 `enrich --force` 重跑全库 LLM。
 
 ---
 
@@ -170,10 +177,13 @@ docker compose exec literature-analyzer python cli.py doctor             # 网�
 docker compose exec literature-analyzer python cli.py reset --failed     # 一键重置失败任务重试
 ```
 
-### 手动干预指令（教材/综述）
+### 手动干预指令（教材/专利/综述）
 ```bash
 python review.py add-book [路径]                      # 手动入库单本/目录/默认 BOOK_INPUT_DIR
 python -c "import daemon; daemon.book_intake_job()"    # 立即触发一次每日定时入库（不等凌晨）
+python review.py patents                              # 专利台账（出版阶段/保护期/法律状态）
+python review.py patents --rescan [--apply]           # 重扫存量文献认专利，默认只预演
+python review.py patents --set CN110346043A --status 驳回   # 人工录入法律状态并记核实日期
 python review.py index / enrich / search / outline / generate  # 综述生成器全流程见 README
 ```
 
@@ -231,18 +241,19 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 
 ## 6. 现状与欠缺项
 
-**数据截至 2026-08-03（作者生产库）**：
+**数据截至 2026-08-04（作者生产库）**：
 
 | 指标 | 实际值 |
 |---|---|
-| 文献总数 | 176 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
-| 结构化元数据 | `paper_details` 176 · `paper_assets` 10388 · `paper_references` 5301 |
+| 文献总数 | 179 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
+| 分类 | `doc_type`：论文 158 · 教材 21（其中 2 篇实为专利，`patents --rescan --apply` 尚未对生产库执行） |
+| 结构化元数据 | `paper_details` 179 · `paper_assets` 13928 · `paper_references` 5301 |
 | DOI 覆盖 | 77 / 176（44%），其余多为中文期刊与教材 |
-| 向量索引 | 169 个文档 / 12375 块（Qwen3-Embedding-8B，4096 维），1 个待嵌 |
+| 向量索引 | 167 个文档 / 12375 块（Qwen3-Embedding-8B，4096 维） |
 | Excel 汇总 | 218 行 |
-| 测试套件 | 62 用例全绿（`pytest`，`pytest.ini` 已限定 `testpaths=tests`） |
+| 测试套件 | 73 用例全绿（`pytest`，`pytest.ini` 已限定 `testpaths=tests`） |
 
-入库流水线、综述生成器、MCP 集成、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库均已完成；部署已去宿主机化，同一份 compose 可在作者机器/云服务器/别人的电脑上跑，并已在阿里云实机部署过一轮。
+入库流水线、综述生成器、MCP 集成、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库、专利识别与状态台账均已完成；部署已去宿主机化，同一份 compose 可在作者机器/云服务器/别人的电脑上跑，并已在阿里云实机部署过一轮。
 
 **欠缺项，按优先级**：
 
@@ -253,4 +264,5 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 5. **元数据补缺可以少烧一半 token**：现在 173/176 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
 6. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
 7. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
-8. **Excel 218 行 > DB 176 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
+8. **Excel 218 行 > DB 179 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
+9. **专利法律状态目前全靠人工**：`patent.py` 只产出 PDF 上的事实，驳回/失效/无效这些得自己去国家知识产权局或 Google Patents 查了再 `--set` 录进来。将来若要自动同步，得接 CNIPA 或 Google Patents 的数据源，并保留 `status_checked_at` 语义（自动同步同样会过期）。

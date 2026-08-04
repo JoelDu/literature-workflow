@@ -11,6 +11,7 @@ import glob
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from .store import VectorStore
+from .patent import detect_patent
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 _ASSET_TYPES = ("image", "chart", "table")
@@ -98,7 +99,7 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
     todo = store.docs_needing_enrich(force=force)
     report = {"total": len(todo), "enriched": 0, "failed": 0,
-              "with_doi": 0, "with_refs": 0, "assets": 0}
+              "with_doi": 0, "with_refs": 0, "assets": 0, "patents": 0}
     if not todo:
         console.print("[green]✔ 元数据已是最新，0 篇待提取。")
         return report
@@ -135,8 +136,26 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
                     "source": "local",
                 }
 
-                # 2) LLM 补缺（不覆盖已有非空字段）
-                if use_llm and client is not None:
+                # 2) 专利判定：扉页 INID 码已把发明人/申请人/申请日全结构化了，
+                #    识别中就直接跳过 LLM 补缺（同书籍的做法），省一次 API 调用。
+                pat = detect_patent(md_head or "")
+                if pat:
+                    details.update({
+                        "doc_type": "patent",
+                        "patent_no": pat["patent_no"],
+                        "filing_date": pat["filing_date"],
+                        "title": pat["title"] or details["title"],
+                        "title_zh": pat["title"] or "",
+                        "authors": pat["inventors"] or details["authors"],
+                        "publisher": pat["assignee"],
+                        "keywords": pat["ipc"],
+                        "year": (pat["filing_date"] or "")[:4] or details["year"],
+                        "source": "patent-inid",
+                    })
+                    report["patents"] += 1
+
+                # 3) LLM 补缺（不覆盖已有非空字段）
+                if use_llm and client is not None and not pat:
                     try:
                         filled = _llm_fill(client, settings.REVIEW_MODEL, title or "",
                                            md_head or "", local, existing)
@@ -160,5 +179,43 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
             progress.advance(task)
 
     console.print(f"[bold green]✔ 元数据提取完成：成功 {report['enriched']} 篇（含 DOI {report['with_doi']} 篇、"
-                  f"含参考文献 {report['with_refs']} 篇、图表 {report['assets']} 项），失败 {report['failed']} 篇。")
+                  f"含参考文献 {report['with_refs']} 篇、图表 {report['assets']} 项、"
+                  f"识别为专利 {report['patents']} 篇），失败 {report['failed']} 篇。")
     return report
+
+
+def rescan_patents(settings, console, apply: bool = False) -> dict:
+    """重扫存量文献，把漏判成论文的专利改回 doc_type='patent'。
+
+    只做本地正则 + 只改专利相关列，**不调用任何 LLM、不重解析 content_list**，
+    所以既不花钱也不会动到已有的标题/图表/参考文献。默认 dry-run，加 apply=True 才写库。
+    """
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    rows = store.docs_needing_enrich(force=True)      # 全量 EXPORTED：(id, title, images_dir, md头)
+    # 先记下扫描前的分类，报告里才能如实说出它原来被当成了什么（论文还是教材）
+    was = store._doc_type_map()
+    found, changed = [], 0
+    for doc_id, title, _images_dir, md_head in rows:
+        pat = detect_patent(md_head or "")
+        if not pat:
+            continue
+        found.append((doc_id, title, pat))
+        if apply:
+            store.mark_as_patent(doc_id, pat)
+            changed += 1
+
+    _labels = {"paper": "论文", "book": "教材"}
+    n_new = sum(1 for d, _t, _p in found if was.get(d, "paper") != "patent")
+    console.print(f"[cyan]扫描 {len(rows)} 篇，判定为专利 {len(found)} 篇"
+                  f"（其中 {n_new} 篇是新识别出来的）。")
+    for doc_id, title, pat in found:
+        old = was.get(doc_id, "paper")
+        flag = "" if old == "patent" else \
+            f"  [yellow]← 原先被当成{_labels.get(old, old)}[/yellow]"
+        console.print(f"  {doc_id[:8]}  {pat['patent_no'] or '号码未识别':<16} "
+                      f"{(pat['title'] or title or '')[:34]}{flag}")
+    if not apply:
+        console.print("[yellow]以上为预演结果，未写库。确认无误后加 --apply 执行。")
+    else:
+        console.print(f"[bold green]✔ 已更新 {changed} 篇为 doc_type='patent'。")
+    return {"scanned": len(rows), "found": len(found), "changed": changed}
