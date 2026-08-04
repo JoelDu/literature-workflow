@@ -131,7 +131,7 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
     - **默认模型 `deepseek-ai/DeepSeek-V3` 已废**：2026-07-24 后它在硅基流动上任何请求都返回 `429 System is too busy now`。改默认为 `DeepSeek-V3.1-Terminus`——实测整个账户里只有 V3 / V3.1-Terminus / R1 支持 batch 推理，其余（V3.2、V4-Pro、V4-Flash、Qwen 系）提交时就报 `20088 not support batch inference`，而 V3 已废、R1 是推理模型不适合结构化抽取，Terminus 是唯一跑得通的。
     - **全失败的 Batch 会永久卡死**：云端返回 `completed` 但 `request_counts.completed == 0` 时没有 `output_file_id`，旧代码直接 raise 被外层"未知崩溃"吞掉，论文永远停在 `BATCH_SUBMITTED`——而这个状态不在阶段 1 的自动拾起名单里，等于死局。现在识别并落到 `BATCH_FAILED`（可自愈、会被重新提交），同时读 `error_file` 把真实原因写进 `error_message`。
     - **空解析结果会被当正常论文入库**：MinerU 返回 success 不代表抽出了字，扫描件和纯图版 PDF 常常只给个空 `full.md`，放行的话 LLM 只能靠标题编，编出来的还会写进 Obsidian 和 Excel。现在按 `MIN_MARKDOWN_CHARS=200` 在解析出口拦截并移进 `failed_pdfs`。**拦截点必须在归档 move 之前**，否则这份 PDF 会被当成"已处理"，人再也不会去看它。
-17. **专利成为第三类文献**（`litreview/patent.py`，2026-08-04）：库里一直混着专利却被当论文处理。识别复用既有的 `doc_type` seam（该字段本就从 `docs_needing_index` → `chunk_params_for` → `search(doc_types=)` 全程打通，所以 `chunker.py` 一行没改），`paper_details` 加 4 个可空列。三个关键决定：① **判定要 ≥2 个 INID 码**——单关键词会把正文提到 "United States Patent" 的论文误判（真实案例已固化为回归用例）；② **派生值不落库**——出版阶段和保护期到期日读取时现算，存下来会随时间变错；③ **法律状态与出版阶段严格分离**，前者只能人工录入且强制记核实日期。另外专利跳过 LLM 补缺（INID 码已结构化），`--rescan` 走纯正则、默认 dry-run，避免为重分类两篇专利而 `enrich --force` 重跑全库 LLM。
+17. **专利成为第三类文献**（`litreview/patent.py`，2026-08-04）：库里一直混着专利却被当论文处理。识别复用既有的 `doc_type` seam（该字段本就从 `docs_needing_index` → `chunk_params_for` → `search(doc_types=)` 全程打通，所以 `chunker.py` 一行没改），`paper_details` 加 4 个可空列。三个关键决定：① **判定要 ≥2 个 INID 码**——单关键词会把正文提到 "United States Patent" 的论文误判（真实案例已固化为回归用例）；② **派生值不落库**——出版阶段和保护期到期日读取时现算，存下来会随时间变错；③ **法律状态与出版阶段严格分离**，前者只能人工录入且强制记核实日期。另外专利跳过 LLM 补缺（INID 码已结构化），`--rescan` 走纯正则、默认 dry-run、可重复执行，避免为重分类两篇专利而 `enrich --force` 重跑全库 LLM。生产库已于当日执行 `--apply`（迁移前热备份 `batch_tracking.db.bak.20260804_101706`），扫出的 2 篇里一篇原属论文、一篇原属教材，图表/参考文献计数未受影响。
 
 ---
 
@@ -246,7 +246,7 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 | 指标 | 实际值 |
 |---|---|
 | 文献总数 | 179 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
-| 分类 | `doc_type`：论文 158 · 教材 21（其中 2 篇实为专利，`patents --rescan --apply` 尚未对生产库执行） |
+| 分类 | `doc_type`：论文 157 · 教材 20 · 专利 2（专利法律状态均为"未核实"，待人工查证录入） |
 | 结构化元数据 | `paper_details` 179 · `paper_assets` 13928 · `paper_references` 5301 |
 | DOI 覆盖 | 77 / 176（44%），其余多为中文期刊与教材 |
 | 向量索引 | 167 个文档 / 12375 块（Qwen3-Embedding-8B，4096 维） |
@@ -261,7 +261,7 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 2. **Web UI（Phase 2）**——目前所有操作都是 CLI + MCP，"别人上传文件夹就能用"这个产品目标卡在这里。
 3. **打包分发（Phase 3）**，以及**尚未选定 LICENSE**（分发前必须定）。
 4. **`mcp_server.sh` 没跟着去宿主机化**：仍硬编码 `/opt/docker_shared/api_keys.env` 和三条绝对路径，别人的机器上直接跑不起来。
-5. **元数据补缺可以少烧一半 token**：现在 173/176 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
+5. **元数据补缺可以少烧一半 token**：现在 176/179 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
 6. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
 7. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
 8. **Excel 218 行 > DB 179 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
