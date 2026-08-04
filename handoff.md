@@ -267,17 +267,23 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 
 | 指标 | 实际值 |
 |---|---|
-| 文献总数 | 179 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
-| 分类 | `doc_type`：论文 142 · 教材 20 · 标准 15 · 专利 2（标准与专利的状态均为"未核实"，待人工查证录入；报告/学位论文/会议/网页 各 0） |
-| 结构化元数据 | `paper_details` 179 · `paper_assets` 13928 · `paper_references` 5301 |
+| 文献总数 | 178 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
+| 分类 | `doc_type`：论文 142 · 教材 20 · 标准 14 · 专利 2（标准与专利的状态均为"未核实"，待人工查证录入；报告/学位论文/会议/网页 各 0） |
+| 结构化元数据 | `paper_details` 178 · `paper_assets` 13923 · `paper_references` 5301 |
 | DOI 覆盖 | 77 / 176（44%），其余多为中文期刊与教材 |
-| 向量索引 | 167 个文档 / 12375 块（Qwen3-Embedding-8B，4096 维） |
-| Excel 汇总 | 218 行 |
+| 向量索引 | 166 个文档 / 12320 块（Qwen3-Embedding-8B，4096 维） |
+| Excel 汇总 | 220 行 |
 | 测试套件 | 126 用例全绿（`pytest`，`pytest.ini` 已限定 `testpaths=tests`） |
 
 入库流水线、综述生成器、MCP 集成、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库、专利与标准识别及状态台账、8 类文献类型词表均已完成；部署已去宿主机化，同一份 compose 可在作者机器/云服务器/别人的电脑上跑，并已在阿里云实机部署过一轮。
 
-**2026-08-04 类型重扫已对生产库执行完毕**（迁移前热备份 `batch_tracking.db.bak.20260804-145343`，257 MB）：`types --rescan --apply` 把 15 篇此前被当成论文的国标/行标归位（原论文数 157 → 142）。⚠️ 当初立项时按初版正则估的是 8 篇，实际 15 篇——差的 7 篇全被 MinerU 的 `<sup>` 标签和造字乱码挡住了，正则校准后才现形。另注：`cffb6ff4` 与 `aa1548c8` 是同一份 GB 38400-2019（一份 OCR 版，文件哈希不同所以查重没拦住），是否合并待定。因标准 `long=False`，本次重分类**不需要重建索引**。
+**2026-08-04 类型重扫已对生产库执行完毕**（迁移前热备份 `batch_tracking.db.bak.20260804-145343`，257 MB）：`types --rescan --apply` 把 15 篇此前被当成论文的国标/行标归位（原论文数 157 → 142）。⚠️ 当初立项时按初版正则估的是 8 篇，实际 15 篇——差的 7 篇全被 MinerU 的 `<sup>` 标签和造字乱码挡住了，正则校准后才现形。因标准 `long=False`，本次重分类**不需要重建索引**。
+
+**同日删除了一份重复文献**（热备份 `batch_tracking.db.bak.20260804-151901-删重复前`，Excel 备份 `knowledge_base.xlsx.bak.20260804-152119`）：`cffb6ff4`（原生解析）与 `aa1548c8`（OCR 版）是同一份 GB 38400-2019，源文件哈希不同所以入库查重没拦住。**删的是 OCR 版**——两版限量值完全一致，但 OCR 版把限值渲染成 `$\leqslant 10$ mg/kg`（LaTeX 包裹会实打实拉低"≤10 mg/kg"这类查询的命中率），且丢了 1 张图；它唯一的优势是规范性引用文件清单更全，那只是被引标准列表，不是实质内容。删除范围：`papers`/`paper_details`/`paper_assets`/`review_chunks`/`review_index_meta` 五张表 + Obsidian 笔记与 attachments + `mineru_output` 目录 + Excel 行；`review_evidence_cache` 挂在 `chunk_id` 上（不是 `doc_id`），也一并按块清了，否则会留孤儿。删后复核无孤儿行，各项计数正好各减 1。**源 PDF 仍留在 `processed_pdfs/`**（13.5 MB），删库不删原件，它不在扫描目录里、不会被重新入库。
+
+> ⚠️ **仓库里没有删除文献的功能**，上面这次是手写脚本一次性做的。要再删务必按同一顺序清干净五张表 + 证据缓存 + 三处文件 + Excel，漏一处就留孤儿。值得做成 `review.py rm` 命令。
+
+⚠️ 另有一处**与本次删除无关的既有不一致**：`a562003908bf`、`a93f17408bbb` 两篇有 `review_index_meta` 行却一个块都没有（删除前的备份里同样如此），原因未查。
 
 **欠缺项，按优先级**：
 
@@ -285,8 +291,8 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 2. **Web UI（Phase 2）**——目前所有操作都是 CLI + MCP，"别人上传文件夹就能用"这个产品目标卡在这里。
 3. **打包分发（Phase 3）**，以及**尚未选定 LICENSE**（分发前必须定）。
 4. **`mcp_server.sh` 没跟着去宿主机化**：仍硬编码 `/opt/docker_shared/api_keys.env` 和三条绝对路径，别人的机器上直接跑不起来。
-5. **元数据补缺可以少烧一半 token**：现在 176/179 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
+5. **元数据补缺可以少烧一半 token**：现在 176/178 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
 6. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
 7. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
-8. **Excel 218 行 > DB 179 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
+8. **Excel 220 行 > DB 178 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
 9. **专利法律状态目前全靠人工**：`patent.py` 只产出 PDF 上的事实，驳回/失效/无效这些得自己去国家知识产权局或 Google Patents 查了再 `--set` 录进来。将来若要自动同步，得接 CNIPA 或 Google Patents 的数据源，并保留 `status_checked_at` 语义（自动同步同样会过期）。
