@@ -7,7 +7,7 @@
 ### 核心能力
 1.  **全自动多格式支持**：论文支持 PDF 和 CAJ（底层通过 `caj2pdf` 和 `reportlab` 实现无损转码解析）；教材/书籍额外支持 EPUB（走 pandoc，无需 MinerU）。
 2.  **多模态 VLM 解析**：集成 MinerU v4 API，强制使用 `vlm` 视觉大模型引擎，实现对双栏排版、复杂图表的高精度提取，支持公式（LaTeX）与表格；同时取回 docx/html/latex 全部输出格式。
-3.  **大模型 Batch 并发分析**：通过 SiliconFlow 上的 DeepSeek V3 Batch API 实现极低成本、高并发的文献内容结构化提取（TLDR、摘要、结论等）。
+3.  **大模型 Batch 并发分析**：通过 SiliconFlow 上的 DeepSeek-V3.1-Terminus Batch API 实现极低成本（5 折）、高并发的文献内容结构化提取（TLDR、摘要、结论等）。⚠️ 早期用的 `DeepSeek-V3` 已于 2026-07-24 后全量返回 429，别照着老文档改回去，详见 §4.16。
 4.  **综述生成器（litreview）**：文献分块 → Qwen3-Embedding-8B 向量化 → 向量召回 + Qwen3-Reranker-8B 精排 → 大模型逐条证据打分 → 只依据筛选证据写作、强制标注引用，输出标准论文式排版（章节编号、GB/T 7714 参考文献）。
 5.  **教材/书籍入库**：`review.py add-book` 把教材当检索语料轻量入库（不做 LLM 全文分析、不进 Obsidian，省钱），PDF 走 pypdf 拆分 + MinerU，EPUB 走 pandoc；`daemon.py` 每天固定时间自动扫描入库，按页数预算控制成本。
 6.  **MCP Server**：`mcp_server.py` 把检索与综述撰写包装成标准 MCP 协议 server，Claude Code/Desktop 等客户端可直接调用。
@@ -114,8 +114,8 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
 
 *   `batch_pipeline.py` / `pipeline.py`：论文批处理/实时处理主逻辑（扫描、MinerU 分发、LLM Batch 提交、拉取与导出）。
 *   `daemon.py`：守护进程调度器——论文的 `RUN_MODE`（实时/批处理间隔轮询）与教材每日定时入库两条调度线并行、互不干扰。
-*   `review.py`：综述生成器 CLI 入口（`index`/`enrich`/`search`/`patents`/`outline`/`generate`/`add-book`）。
-*   `litreview/`：综述生成器核心包——`chunker.py`（分块）、`embedder.py`（Qwen3 向量化）、`reranker.py`（重排序）、`stages.py`（检索→打分→写作流程编排）、`enrich.py`（结构化元数据提取）、`patent.py`（专利识别，只产出事实、不猜法律状态）、`figures.py`（自动插图）、`bookintake.py`（教材入库，PDF 拆分/EPUB 转换/定时调度）、`models.py`/`store.py`（SQLite 数据模型与读写）、`prompts.py`（各阶段提示词）。
+*   `review.py`：综述生成器 CLI 入口，11 个子命令——`index`/`status`/`search`/`enrich`/`add-book`/`patents`/`standards`/`types`/`set-type`/`outline`/`generate`。
+*   `litreview/`：综述生成器核心包——**`doctype.py`（8 类文献类型词表，唯一真相源，加类型只改它）**、`chunker.py`（分块）、`embedder.py`（Qwen3 向量化）、`reranker.py`（重排序）、`stages.py`（检索→打分→写作流程编排，含 `format_reference` 按类型分支著录）、`enrich.py`（结构化元数据提取）、`patent.py`（专利识别，只产出事实、不猜法律状态）、`figures.py`（自动插图）、`bookintake.py`（教材入库，PDF 拆分/EPUB 转换/定时调度）、`models.py`/`store.py`（SQLite 数据模型与读写）、`prompts.py`（各阶段提示词）。
 *   `mcp_server.py` + `mcp_server.sh`：MCP 协议 server，把检索/综述能力暴露给 Claude Code 等客户端。
 *   `mineru_client.py`：MinerU V4 API 客户端。已配置轮询重试、自动 Key 轮换及 ZIP 附件解压提取（Markdown、Images、DOCX、HTML、LaTeX 全格式取回）。
 *   `llm_router.py`：大模型客户端封装。处理 DeepSeek（主力）与 Gemini 的 Batch 任务构建及系统提示词管理。
@@ -150,6 +150,7 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
     - **全失败的 Batch 会永久卡死**：云端返回 `completed` 但 `request_counts.completed == 0` 时没有 `output_file_id`，旧代码直接 raise 被外层"未知崩溃"吞掉，论文永远停在 `BATCH_SUBMITTED`——而这个状态不在阶段 1 的自动拾起名单里，等于死局。现在识别并落到 `BATCH_FAILED`（可自愈、会被重新提交），同时读 `error_file` 把真实原因写进 `error_message`。
     - **空解析结果会被当正常论文入库**：MinerU 返回 success 不代表抽出了字，扫描件和纯图版 PDF 常常只给个空 `full.md`，放行的话 LLM 只能靠标题编，编出来的还会写进 Obsidian 和 Excel。现在按 `MIN_MARKDOWN_CHARS=200` 在解析出口拦截并移进 `failed_pdfs`。**拦截点必须在归档 move 之前**，否则这份 PDF 会被当成"已处理"，人再也不会去看它。
 17. **专利成为第三类文献**（`litreview/patent.py`，2026-08-04）：库里一直混着专利却被当论文处理。识别复用既有的 `doc_type` seam（该字段本就从 `docs_needing_index` → `chunk_params_for` → `search(doc_types=)` 全程打通，所以 `chunker.py` 一行没改），`paper_details` 加 4 个可空列。三个关键决定：① **判定要 ≥2 个 INID 码**——单关键词会把正文提到 "United States Patent" 的论文误判（真实案例已固化为回归用例）；② **派生值不落库**——出版阶段和保护期到期日读取时现算，存下来会随时间变错；③ **法律状态与出版阶段严格分离**，前者只能人工录入且强制记核实日期。另外专利跳过 LLM 补缺（INID 码已结构化），`--rescan` 走纯正则、默认 dry-run、可重复执行，避免为重分类两篇专利而 `enrich --force` 重跑全库 LLM。生产库已于当日执行 `--apply`（迁移前热备份 `batch_tracking.db.bak.20260804_101706`），扫出的 2 篇里一篇原属论文、一篇原属教材，图表/参考文献计数未受影响。
+18. **文献类型扩到 8 类**（`litreview/doctype.py`，2026-08-04，紧接第 17 条）：专利刚补完就发现库里还混着国标、协会年报、企业财报、机构研究报告、网页资料，而这些的参考文献著录格式各不相同。做法是**把散在各处的类型判断收进一张 GB/T 7714-2015 码表**——`DOC_TYPES` 一处定义，CLI 的 `--corpus`/`--type`/`--status` 选项、MCP 参数校验、`chunker` 分块参数全部由它派生。三个关键决定：① **只给专利和标准写自动识别**（`detect: True`），报告/财报/网页跟长论文在版式上没有可靠差别，硬猜会污染整个库，用 `test_only_patent_and_standard_claim_auto_detection` 把这条钉死；② **`statuses_for()` 对没有"会失效"概念的类型返回空列表**——修的是一个真实 bug：它原本兜底返回专利那套选项，于是命令行允许把一篇期刊论文标成"已授权"；③ **标准 `long=False`**，正文是逐条条款、大块反而检得糊，顺带好处是论文→标准的重新归类不需要重建索引。同时修了 `stages.format_reference` 此前"非书籍一律按 `[J]` 印"的错误——专利和标准都被印成期刊论文、`[J].` 后跟一个空期刊名。`patents --rescan` 一并移除，重扫统一走 `types --rescan`。测试从 73 涨到 126 用例。当日对生产库执行了类型重扫与一次重复文献删除，见 §6。
 
 ---
 
@@ -267,7 +268,7 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 
 | 指标 | 实际值 |
 |---|---|
-| 文献总数 | 178 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
+| 文献总数 | **178 篇/本已 `EXPORTED`**（论文与教材同在 `papers` 表）。⚠️ `SELECT COUNT(*) FROM papers` 当时是 **214**——多出的 36 行状态是 `BATCH_SUBMITTED`，即当天正在 Batch 里跑的新专利，不是脏数据。**下面所有统计口径都是 `status='EXPORTED'`**，直接数 `papers` 表会对不上。 |
 | 分类 | `doc_type`：论文 142 · 教材 20 · 标准 14 · 专利 2（标准与专利的状态均为"未核实"，待人工查证录入；报告/学位论文/会议/网页 各 0） |
 | 结构化元数据 | `paper_details` 178 · `paper_assets` 13923 · `paper_references` 5301 |
 | DOI 覆盖 | 77 / 176（44%），其余多为中文期刊与教材 |
@@ -279,11 +280,16 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 
 **2026-08-04 类型重扫已对生产库执行完毕**（迁移前热备份 `batch_tracking.db.bak.20260804-145343`，257 MB）：`types --rescan --apply` 把 15 篇此前被当成论文的国标/行标归位（原论文数 157 → 142）。⚠️ 当初立项时按初版正则估的是 8 篇，实际 15 篇——差的 7 篇全被 MinerU 的 `<sup>` 标签和造字乱码挡住了，正则校准后才现形。因标准 `long=False`，本次重分类**不需要重建索引**。
 
-**同日删除了一份重复文献**（热备份 `batch_tracking.db.bak.20260804-151901-删重复前`，Excel 备份 `knowledge_base.xlsx.bak.20260804-152119`）：`cffb6ff4`（原生解析）与 `aa1548c8`（OCR 版）是同一份 GB 38400-2019，源文件哈希不同所以入库查重没拦住。**删的是 OCR 版**——两版限量值完全一致，但 OCR 版把限值渲染成 `$\leqslant 10$ mg/kg`（LaTeX 包裹会实打实拉低"≤10 mg/kg"这类查询的命中率），且丢了 1 张图；它唯一的优势是规范性引用文件清单更全，那只是被引标准列表，不是实质内容。删除范围：`papers`/`paper_details`/`paper_assets`/`review_chunks`/`review_index_meta` 五张表 + Obsidian 笔记与 attachments + `mineru_output` 目录 + Excel 行；`review_evidence_cache` 挂在 `chunk_id` 上（不是 `doc_id`），也一并按块清了，否则会留孤儿。删后复核无孤儿行，各项计数正好各减 1。**源 PDF 仍留在 `processed_pdfs/`**（13.5 MB），删库不删原件，它不在扫描目录里、不会被重新入库。
+**同日删除了一份重复文献**（热备份 `batch_tracking.db.bak.20260804-151901-删重复前`，Excel 备份 `knowledge_base.xlsx.bak.20260804-152119`）：`cffb6ff4`（原生解析）与 `aa1548c8`（OCR 版）是同一份 GB 38400-2019，源文件哈希不同所以入库查重没拦住。**删的是 OCR 版**——两版限量值完全一致，但 OCR 版把限值渲染成 `$\leqslant 10$ mg/kg`（LaTeX 包裹会实打实拉低"≤10 mg/kg"这类查询的命中率），且丢了 1 张图；它唯一的优势是规范性引用文件清单更全，那只是被引标准列表，不是实质内容。实删了 5 张表（`papers` 1 行 / `paper_details` 1 / `paper_assets` 5 / `review_chunks` 55 / `review_index_meta` 1）+ Obsidian 笔记与 attachments + `mineru_output` 目录 + Excel 行；`paper_references` 这篇本来就是 0 行（标准不著录参考文献），但**它同样挂 `doc_id`，删一篇论文时必须一起清**。`review_evidence_cache` 挂在 `chunk_id` 上（**不是 `doc_id`**），所以要先把该文献的 chunk_id 查出来再按块删，本次是 0 行。删后复核无孤儿行，各项计数正好各减 1。**源 PDF 仍留在 `processed_pdfs/`**（13.5 MB），删库不删原件，它不在扫描目录里、不会被重新入库。
 
-> ⚠️ **仓库里没有删除文献的功能**，上面这次是手写脚本一次性做的。要再删务必按同一顺序清干净五张表 + 证据缓存 + 三处文件 + Excel，漏一处就留孤儿。值得做成 `review.py rm` 命令。
+> ⚠️ **仓库里没有删除文献的功能**，上面这次是手写脚本一次性做的。要再删务必按这个顺序清干净：
+> **① 先** 用 `SELECT chunk_id FROM review_chunks WHERE doc_id=?` 解出块号删 `review_evidence_cache`（顺序反了就永远找不到它的缓存行）；
+> **② 六张挂 doc_id 的表**——`review_chunks`、`review_index_meta`、`paper_references`、`paper_assets`、`paper_details`，最后 `papers`（注意它的主键列名是 **`id` 不是 `doc_id`**）；
+> **③ 三处文件**——Obsidian 笔记 `*_<doc_id前8位>.md`、`attachments/<doc_id>/`、`mineru_output/` 或 `book_output/` 下的解析目录；
+> **④ Excel 行**。
+> 漏一处就留孤儿。值得做成 `review.py rm` 命令。
 
-⚠️ 另有一处**与本次删除无关的既有不一致**：`a562003908bf`、`a93f17408bbb` 两篇有 `review_index_meta` 行却一个块都没有（删除前的备份里同样如此），原因未查。
+（复核时另发现一处**与本次删除无关的既有不一致**，已记入下方欠缺项第 12 条。）
 
 **欠缺项，按优先级**：
 
@@ -291,8 +297,11 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 2. **Web UI（Phase 2）**——目前所有操作都是 CLI + MCP，"别人上传文件夹就能用"这个产品目标卡在这里。
 3. **打包分发（Phase 3）**，以及**尚未选定 LICENSE**（分发前必须定）。
 4. **`mcp_server.sh` 没跟着去宿主机化**：仍硬编码 `/opt/docker_shared/api_keys.env` 和三条绝对路径，别人的机器上直接跑不起来。
-5. **元数据补缺可以少烧一半 token**：现在 176/178 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
-6. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
-7. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
-8. **Excel 220 行 > DB 178 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
-9. **专利法律状态目前全靠人工**：`patent.py` 只产出 PDF 上的事实，驳回/失效/无效这些得自己去国家知识产权局或 Google Patents 查了再 `--set` 录进来。将来若要自动同步，得接 CNIPA 或 Google Patents 的数据源，并保留 `status_checked_at` 语义（自动同步同样会过期）。
+5. **`obsidian_template.md` 还是"论文形状"，没跟上 8 类类型**（类型扩展后暴露出来的，实测生产库里 **15 篇标准/专利的笔记都被打成 `#paper` 标签、"期刊/会议"一栏写着"未提取"**）。根因是 `utils.generate_obsidian_note` 压根没把 `doc_type` 传进模板——渲染发生在导出阶段，那时 `enrich` 还没跑、类型还没定，所以不是改模板就能了事：要么把类型判定提前，要么在 `enrich` 认出类型后回头改写笔记的 frontmatter。**注意教材不生成笔记**，所以这事只影响专利/标准/以后 `set-type` 指定的报告等。参考文献著录（`stages.format_reference`）不受影响，那条链路是对的。
+6. **元数据补缺可以少烧一半 token**：现在 176/178 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
+7. **没有删除文献的命令**：见上方 §6 的删除清单，目前只能手写脚本按顺序清 6 张表 + 证据缓存 + 三处文件 + Excel，漏一处留孤儿。应做成 `review.py rm <文献> [--keep-source]`，复用 `resolve_docs()` 的解析逻辑，默认 dry-run。
+8. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
+9. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
+10. **Excel 220 行 > DB 178 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
+11. **专利法律状态目前全靠人工**：`patent.py` 只产出 PDF 上的事实，驳回/失效/无效这些得自己去国家知识产权局或 Google Patents 查了再 `--set` 录进来。将来若要自动同步，得接 CNIPA 或 Google Patents 的数据源，并保留 `status_checked_at` 语义（自动同步同样会过期）。
+12. **`review_index_meta` 有 2 行对不上块**：`a562003908bf`、`a93f17408bbb` 有 meta 行却零个 `review_chunks`（与本次删除无关，删除前的备份里同样如此），原因未查。表现是 `library_status` 报的"已索引篇数"比实际能检索到的多 2。

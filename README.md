@@ -160,7 +160,7 @@ docker compose exec literature-analyzer python cli.py reset --failed
 - `mineru_client.py`: 封装了 MinerU 的两步上传、解析轮询及结果下载，轮询间隔已优化为 10 秒。
 - `llm_router.py`: 大模型调用路由，内置 SiliconFlow / 官方 DeepSeek 双通道及原始摘要无损提取逻辑。
 - `utils.py`: 共享的工具函数，提供 Excel 导出、Obsidian 模板渲染、SHA-256 去重哈希计算、运行日志追加等。
-- `obsidian_template.md`: Jinja2 模板，定义了生成的 Obsidian 笔记排版样式。
+- `obsidian_template.md`: Jinja2 模板，定义了生成的 Obsidian 笔记排版样式。⚠️ 目前**是按期刊论文写死的**——tag 恒为 `#paper`，抬头恒为「期刊/会议」，专利和标准的笔记也照这个印。原因是渲染发生在导出阶段，那时 `enrich` 还没跑、`doc_type` 尚未判定，模板拿不到类型。参考文献著录不受影响（走 `stages.format_reference`，按 8 种类型分支）。
 - `review.py` + `litreview/`: 综述生成器（分块 → Qwen3-Embedding 向量检索 → Qwen3-Reranker 重排 → 证据打分 → 带引用归纳）。
 - `review_template.md`: 综述笔记的 Jinja2 模板。
 
