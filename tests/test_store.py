@@ -143,7 +143,7 @@ def test_dim_mismatch_skipped():
         assert matrix.shape[0] == 0
 
 
-def test_manual_patent_status_survives_reenrich():
+def test_manual_status_survives_reenrich():
     """save_enrichment 用的是 INSERT OR REPLACE，会整行重写。
     人工核实过的 legal_status/status_checked_at 必须活过后续的 enrich --force，
     否则重跑一次元数据提取就把人工成果全冲没了。"""
@@ -159,13 +159,13 @@ def test_manual_patent_status_survives_reenrich():
         store.save_enrichment(doc_id, {"title": "热法磷酸全热能回收系统", "doc_type": "patent",
                                        "patent_no": "CN112856361B", "filing_date": "2021-03-08"},
                               [], [])
-        assert store.set_patent_status("CN112856361B", "驳回", "2026-08-04") == [doc_id]
+        assert store.set_doc_status("CN112856361B", "驳回", "2026-08-04") == [doc_id]
 
         # 模拟 enrich --force 重跑：同一篇再存一次，且这次不带任何状态字段
         store.save_enrichment(doc_id, {"title": "热法磷酸全热能回收系统", "doc_type": "patent",
                                        "patent_no": "CN112856361B", "filing_date": "2021-03-08"},
                               [], [])
-        rows = store.list_patents()
+        rows = store.list_docs("patent")
         assert len(rows) == 1
         assert rows[0]["legal_status"] == "驳回"
         assert rows[0]["status_checked_at"] == "2026-08-04"
@@ -175,10 +175,10 @@ def test_manual_patent_status_survives_reenrich():
                                        "patent_no": "CN112856361B", "filing_date": "2021-03-08",
                                        "legal_status": "已授权", "status_checked_at": "2026-09-01"},
                               [], [])
-        assert store.list_patents()[0]["legal_status"] == "已授权"
+        assert store.list_docs("patent")[0]["legal_status"] == "已授权"
 
 
-def test_set_patent_status_by_doc_id_prefix_and_miss():
+def test_set_doc_status_by_doc_id_prefix_and_miss():
     with tempfile.TemporaryDirectory() as td:
         store, db_path = _make_store(td)
         doc_id = "d" * 64
@@ -190,12 +190,12 @@ def test_set_patent_status_by_doc_id_prefix_and_miss():
         store.save_enrichment(doc_id, {"title": "某专利", "doc_type": "patent",
                                        "patent_no": "CN110346043A", "filing_date": "2019-06-03"},
                               [], [])
-        assert store.set_patent_status("dddddddd", "撤回", "2026-08-04") == [doc_id]
-        assert store.set_patent_status("CN999999999A", "驳回", "2026-08-04") == []
+        assert store.set_doc_status("dddddddd", "撤回", "2026-08-04") == [doc_id]
+        assert store.set_doc_status("CN999999999A", "驳回", "2026-08-04") == []
 
 
 def test_doc_type_counts_and_patent_isolation():
-    """论文不该被 list_patents 捞出来，统计口径也要分得开。"""
+    """论文不该被 list_docs("patent") 捞出来，统计口径也要分得开。"""
     with tempfile.TemporaryDirectory() as td:
         store, db_path = _make_store(td)
         conn = sqlite3.connect(db_path)
@@ -209,6 +209,85 @@ def test_doc_type_counts_and_patent_isolation():
         store.save_enrichment("c" * 64, {"title": "专利", "doc_type": "patent",
                                          "patent_no": "CN110346043A"}, [], [])
         assert store.doc_type_counts() == {"paper": 1, "book": 1, "patent": 1}
-        assert [r["doc_id"] for r in store.list_patents()] == ["c" * 64]
+        assert [r["doc_id"] for r in store.list_docs("patent")] == ["c" * 64]
         meta = store.get_paper_meta(["c" * 64])["c" * 64]
         assert meta["doc_type"] == "patent" and meta["patent_no"] == "CN110346043A"
+
+
+def test_standard_ledger_and_status():
+    """标准走的是跟专利同一套 list_docs / set_doc_status 机制，一份实现两类共用。"""
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        doc_id = "e" * 64
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                     (doc_id, "肥料中有毒有害物质的限量要求", "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+        store.save_enrichment(doc_id, {"title": "肥料中有毒有害物质的限量要求",
+                                       "doc_type": "standard", "doc_no": "GB 38400-2019",
+                                       "effective_date": "2020-07-01",
+                                       "authors": "国家市场监督管理总局"}, [], [])
+        rows = store.list_docs("standard")
+        assert len(rows) == 1
+        assert rows[0]["doc_no"] == "GB 38400-2019"
+        assert rows[0]["effective_date"] == "2020-07-01"
+        # 标准号里的空格/斜杠写法五花八门，解析时要能忽略这些差异
+        assert store.set_doc_status("GB38400-2019", "现行", "2026-08-04") == [doc_id]
+        assert store.list_docs("standard")[0]["legal_status"] == "现行"
+
+
+def test_doc_no_and_url_survive_reenrich():
+    """doc_no / url / effective_date 是重扫或人工 set-type 写进去的，
+    一次 enrich --force 不能把它们冲掉——跟 legal_status 同一个道理。"""
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        doc_id = "f" * 64
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                     (doc_id, "某报告", "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+        store.save_enrichment(doc_id, {"title": "某报告"}, [], [])
+        store.mark_doc_type(doc_id, "report", {"doc_no": "IFA-2024",
+                                               "url": "https://example.org/x",
+                                               "publisher": "FAO/IFA"})
+        # enrich --force 重跑：不带任何类型字段
+        store.save_enrichment(doc_id, {"title": "某报告"}, [], [])
+        meta = store.get_paper_meta([doc_id])[doc_id]
+        assert meta["doc_no"] == "IFA-2024"
+        assert meta["url"] == "https://example.org/x"
+
+
+def test_mark_doc_type_never_blanks_a_good_value():
+    """防呆：某次识别退化没抽出编号时，不能把上次抽对的编号冲成空。"""
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        doc_id = "9" * 64
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                     (doc_id, "某标准", "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+        store.mark_doc_type(doc_id, "standard", {"doc_no": "GB/T 1677-2008"})
+        store.mark_doc_type(doc_id, "standard", {"doc_no": "", "title": "增塑剂环氧值的测定"})
+        row = store.list_docs("standard")[0]
+        assert row["doc_no"] == "GB/T 1677-2008"   # 空值没有把旧值冲掉
+        assert row["title"] == "增塑剂环氧值的测定"  # 非空值照常写入
+
+
+def test_resolve_docs_by_title_fragment_and_prefix():
+    with tempfile.TemporaryDirectory() as td:
+        store, db_path = _make_store(td)
+        doc_id = "7" * 64
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO papers (id, title, mineru_md, status) VALUES (?,?,?,?)",
+                     (doc_id, "World Fertilizer Trends and Outlook 2024", "正文", "EXPORTED"))
+        conn.commit()
+        conn.close()
+        store.save_enrichment(doc_id, {"title": "World Fertilizer Trends and Outlook 2024"}, [], [])
+        assert store.resolve_docs("7777") == [doc_id]
+        assert store.resolve_docs("Fertilizer Trends") == [doc_id]
+        assert store.resolve_docs("完全不存在的东西") == []
+        # 限定类型后不该再匹配上（这篇还是 paper）
+        assert store.resolve_docs("Fertilizer Trends", "report") == []

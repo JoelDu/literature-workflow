@@ -69,14 +69,32 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
 - 手动：`review.py add-book [路径]`，PDF 走 pypdf 按 `BOOK_SPLIT_PAGES` 拆分再拼回同一 `doc_id`；EPUB 走 pandoc 直转。
 - 定时：`daemon.book_intake_job()`，每天 `BOOK_INTAKE_TIME` 扫描 `BOOK_INPUT_DIR`，按文件名排序、PDF 累计页数不超 `BOOK_DAILY_PAGE_BUDGET` 逐本处理（排最前的单本超预算大部头例外，会处理完，避免永远排不上），成功后按 `REVIEW_AUTO_INDEX` 自动增量建索引（`REVIEW_EMBED_BACKEND=local` 时只登记待办，实际嵌入留给夜间任务，见下）。
 
+**文献类型（`litreview/doctype.py`——加类型只改这一个文件）**
+- 8 种类型 + GB/T 7714-2015 码：`paper[J]` `book[M]` `patent[P]` `standard[S]` `report[R]` `thesis[D]` `conf[C]` `web[EB/OL]`。`DOC_TYPES` 是**唯一真相源**：`review.py` 的 `--corpus`/`--type`/`--status` 选项、MCP 的参数校验、`chunker` 的分块参数全部由它派生。**加一种 = 加一行词表 + 在 `stages.format_reference` 加一个分支**，`tests/test_reference_format.py::test_every_declared_type_prints_its_own_code` 会在漏了分支时当场炸。
+- ⚠️ **只有 `patent` 和 `standard` 能自动识别**（`detect: True`），这不是偷懒：专利有 INID 码、标准有强制封面格式，都是硬格式；而**报告/财报/网页跟一篇长论文在版式上没有任何可靠差别**，凭关键词猜的误判率高到会污染整个库。这几类只能 `review.py set-type` 人工指定，`test_only_patent_and_standard_claim_auto_detection` 盯着这条不被人偷偷放宽。
+- ⚠️ **自动识别一律要求 ≥2 个标记，绝不凭单个关键词定案**——论文正文写"按 GB/T 4945—2002 测定"是家常便饭。
+- `statuses_for(t)` 对没有"会失效"概念的类型返回**空列表**（`paper`/`report`/…）。曾经的真实 bug：它兜底返回专利那套选项，于是命令行允许把一篇期刊论文标成"已授权"。
+- `review.py types [--rescan [--apply]] [--only <类型>]` 是**唯一**的重扫入口（专利+标准一起扫，只跑正则、不调 LLM、默认 dry-run）。`patents --rescan` **已移除**，别再加回来。
+- `review.py set-type <doc_id前缀|专利号|标准号|标题片段> --type X [--no/--url/--title/--authors/--publisher/--place/--year]`；多条命中时拒绝执行，除非显式 `--all`。
+
+**标准（`doctype.detect_standard`）**
+- 判据：`中华人民共和国国家标准` 类抬头 + 标准号 + `发布`/`实施` 双日期，同样 ≥2 个标记。抽出标准号、中英文名、发布/实施日期、发布机构。
+- ⚠️ 三个真实的坑，**所有正样本都是从生产库原样抠出来的封面文本**（`tests/test_doctype.py`，以后改正则先来这里加真实样本）：①`代替 GB/T 1677—1981` 出现在真编号**前面**，先撞上就会把作废旧版号当本标准号；②MinerU 把斜杠破折号包进标签，封面 `GB/T 32952—2016` 解析成 `GB<sup>/</sup>T32952<sup>—</sup>2016`，不剥标签连编号都匹配不上；③造字子集乱码 `犌犅／犜7363—2021` = `GB/T 7363—2021`（只修了实测确认的 犌=G 犅=B 犜=T，没整表瞎猜）。
+- ⚠️ **`long=False`，与论文同套分块参数**——正文是逐条条款，大块反而检得糊。好处：论文→标准重新归类**不需要重建索引**。
+- 实施日期单独占 `effective_date` 列，**没有塞进专利的 `filing_date`**：两个日期含义完全不同，挤一列日后必然误读。
+- 现行/被代替/废止会变、PDF 里没有 → `review.py standards --set <标准号> --status 废止` 人工录入。**不拿实施日期冒充现行状态**。
+
 **专利（`litreview/patent.py`）**
 - 无独立入口，与论文同一条流水线；`enrich` 按扉页 INID 码（`(21)申请号`/`(22)申请日`/`(72)发明人`…）判定，**必须 ≥2 个标记**（库里真有一篇 ResearchGate 章节正文提到 "United States Patent"，单关键词必误判，已固化为回归用例）。扉页同时印授权公告号与申请公布号时取授权号。
 - ⚠️ **"状态"是两件不同的事，别合并成一列**：出版阶段（种别码 `A`/`B`/`U`/`S`）与保护期（申请日 + 20/10/15 年）印在 PDF 上、不会变，**读取时现算、不落库**（存成"已过期"会随时间变错且无人察觉）；驳回/撤回/欠年费失效/无效宣告这类法律状态**不在 PDF 上且会变**，只能人工核实，落 `legal_status` + `status_checked_at`（**必须带核实日期**）。没核实过一律显示"未核实"，不拿种别码冒充。
-- `review.py patents [--rescan [--apply]] [--set <专利号|文献ID> --status <状态>]`；`--rescan` 只跑正则、不调 LLM、默认 dry-run（`enrich --force` 会对全库重跑 LLM，为了重分类两篇专利不值得）。
-- ⚠️ `save_enrichment` 用的是 `INSERT OR REPLACE`（整行重写），所以写入前会先 SELECT 回 `legal_status`/`status_checked_at` 沿用——否则一次 `enrich --force` 就把人工核实结果冲成空。改那段代码务必保住这个行为，`tests/test_store.py` 有专门用例盯着。
+- `review.py patents [--set <专利号|文献ID> --status <状态>]`（重扫走 `types --rescan`）。
+- ⚠️ `save_enrichment` 用的是 `INSERT OR REPLACE`（整行重写），所以写入前会先 SELECT 回 `legal_status`/`status_checked_at`/`doc_no`/`url`/`effective_date` 沿用——否则一次 `enrich --force` 就把人工核实结果冲成空。改那段代码务必保住这个行为，`tests/test_store.py` 有专门用例盯着。
+- ⚠️ `mark_doc_type` 每列都是 `COALESCE(NULLIF(?,''), 旧值)`：一次退化的重新识别**永远不会**把已经正确的值抹成空。列名是拼进 SQL 的，所以有 `_MARKABLE_COLS` 白名单，改的时候别绕过它。
 
 **MCP Server（`mcp_server.py`）**
-- stdio 协议，7 个工具：`library_status`、`search_literature`（可 `corpus` 限定 paper/book/patent）、`get_paper_info`、`patent_status`（**只读**，法律状态不允许模型写库）、`generate_outline`、`start_review`（异步，秒回 job_id）、`review_status`（轮询）。
+- stdio 协议，7 个工具：`library_status`、`search_literature`（`corpus` 可限定词表里任一类型）、`get_paper_info`（标题/关键词/专利号/标准号）、`doc_status(doc_type, keyword)`（**只读**，专利法律状态与标准现行状态都不允许模型写库）、`generate_outline`、`start_review`（异步，秒回 job_id）、`review_status`（轮询）。
+- ⚠️ `patent_status` **已更名为 `doc_status`**（多一个 `doc_type` 参数，专利与标准共用）。其他设备只需重启一次 MCP client，工具是动态发现的、配置不用改。
+- 检索结果带类型标签（`[标准 GB 38400-2019]`）：调用方模型据此判断这段话出自强制性文件还是某篇论文的实验结论，两者可引用分量完全不同。
 - 由 `mcp_server.sh` 负责加载密钥、清理代理变量、指向生产库后启动。
 
 **夜间本地嵌入（`nightly_index.py`，2026-07-29 上线）**
@@ -177,13 +195,17 @@ docker compose exec literature-analyzer python cli.py doctor             # 网�
 docker compose exec literature-analyzer python cli.py reset --failed     # 一键重置失败任务重试
 ```
 
-### 手动干预指令（教材/专利/综述）
+### 手动干预指令（教材/类型/综述）
 ```bash
 python review.py add-book [路径]                      # 手动入库单本/目录/默认 BOOK_INPUT_DIR
 python -c "import daemon; daemon.book_intake_job()"    # 立即触发一次每日定时入库（不等凌晨）
+python review.py types                                # 分类总览：8 种类型各多少篇 + GB/T 7714 码
+python review.py types --rescan [--apply] [--only standard]  # 重扫认专利/标准，默认只预演
+python review.py set-type <文献> --type report --publisher "FAO/IFA" --year 2024  # 人工指定类型
 python review.py patents                              # 专利台账（出版阶段/保护期/法律状态）
-python review.py patents --rescan [--apply]           # 重扫存量文献认专利，默认只预演
-python review.py patents --set CN110346043A --status 驳回   # 人工录入法律状态并记核实日期
+python review.py patents --set CN110346043A --status 驳回    # 人工录入法律状态并记核实日期
+python review.py standards                            # 标准台账（标准号/实施日期/发布机构/状态）
+python review.py standards --set GB38400-2019 --status 废止  # 人工录入现行状态并记核实日期
 python review.py index / enrich / search / outline / generate  # 综述生成器全流程见 README
 ```
 
@@ -246,14 +268,16 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 | 指标 | 实际值 |
 |---|---|
 | 文献总数 | 179 篇/本（论文与教材同在 `papers` 表），全部 `EXPORTED` |
-| 分类 | `doc_type`：论文 157 · 教材 20 · 专利 2（专利法律状态均为"未核实"，待人工查证录入） |
+| 分类 | `doc_type`：论文 142 · 教材 20 · 标准 15 · 专利 2（标准与专利的状态均为"未核实"，待人工查证录入；报告/学位论文/会议/网页 各 0） |
 | 结构化元数据 | `paper_details` 179 · `paper_assets` 13928 · `paper_references` 5301 |
 | DOI 覆盖 | 77 / 176（44%），其余多为中文期刊与教材 |
 | 向量索引 | 167 个文档 / 12375 块（Qwen3-Embedding-8B，4096 维） |
 | Excel 汇总 | 218 行 |
-| 测试套件 | 73 用例全绿（`pytest`，`pytest.ini` 已限定 `testpaths=tests`） |
+| 测试套件 | 126 用例全绿（`pytest`，`pytest.ini` 已限定 `testpaths=tests`） |
 
-入库流水线、综述生成器、MCP 集成、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库、专利识别与状态台账均已完成；部署已去宿主机化，同一份 compose 可在作者机器/云服务器/别人的电脑上跑，并已在阿里云实机部署过一轮。
+入库流水线、综述生成器、MCP 集成、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库、专利与标准识别及状态台账、8 类文献类型词表均已完成；部署已去宿主机化，同一份 compose 可在作者机器/云服务器/别人的电脑上跑，并已在阿里云实机部署过一轮。
+
+**2026-08-04 类型重扫已对生产库执行完毕**（迁移前热备份 `batch_tracking.db.bak.20260804-145343`，257 MB）：`types --rescan --apply` 把 15 篇此前被当成论文的国标/行标归位（原论文数 157 → 142）。⚠️ 当初立项时按初版正则估的是 8 篇，实际 15 篇——差的 7 篇全被 MinerU 的 `<sup>` 标签和造字乱码挡住了，正则校准后才现形。另注：`cffb6ff4` 与 `aa1548c8` 是同一份 GB 38400-2019（一份 OCR 版，文件哈希不同所以查重没拦住），是否合并待定。因标准 `long=False`，本次重分类**不需要重建索引**。
 
 **欠缺项，按优先级**：
 

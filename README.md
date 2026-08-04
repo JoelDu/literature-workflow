@@ -173,7 +173,9 @@ python review.py status               # 索引状态
 python review.py index [--force]     # 手动建/重建向量索引（换嵌入模型后需 --force）
 python review.py enrich [--no-llm]   # 提取结构化元数据：中英标题/DOI/图表/参考文献 → paper_details 等新表
 python review.py search "关键词"      # 检索调试（默认走重排序，--no-rerank 看纯向量结果）
+python review.py types                # 文献分类总览：各类型篇数 + GB/T 7714 码（详见下文）
 python review.py patents              # 专利台账：出版阶段/保护期/法律状态（详见下文）
+python review.py standards            # 标准台账：标准号/实施日期/发布机构/现行状态
 python review.py outline "主题" -o outline.json   # 只生成大纲（可手工编辑后再传入 generate）
 python review.py generate "主题" [--outline outline.json] [--dry-run] \
     [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数]
@@ -188,7 +190,7 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
 - **检索链路**：Qwen3-Embedding-8B（4096 维，跨中英）向量召回 50 候选 → Qwen3-Reranker-8B 重排取 top 24 → DeepSeek-V4-Pro 逐条打分提炼证据（≥6 分保留）→ 只依据证据写作并强制引用标记 → 全局编号与 GB/T 7714 风格参考文献（含 DOI）。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。
 - **自动插图**：写完每章后，从本章已引用文献（论文或教材）的 `paper_assets` 里按图题与本章主题的重排相关度挑图（过阈值），把真实图片复制进 `reviews/assets/` 并插入正文，图注随全文统一编号。图片会一并嵌入导出的 Word（pandoc `--resource-path` 指向 .md 目录解析相对图路径）。
-- **输出格式**：标准论文式章节编号（`1 引言` → `2..N` 正文各章 → `N+1 结论与展望`），末尾 `参考文献` 不编号；不含摘要/关键字块。生成 Markdown（写入 Obsidian `reviews` 目录）的同时，用 pandoc 自动导出同名 `.docx`（导出前去掉 Obsidian wikilink 后缀，参考文献逐条独立成段），Word 导出失败不影响 markdown 主流程。参考文献按类型区分：论文 `[J]`（带 DOI + Obsidian 回链），教材/图书 `[M]`（`作者. 书名[M]. 版本. 出版地: 出版者, 年.`，无 DOI/回链）。
+- **输出格式**：标准论文式章节编号（`1 引言` → `2..N` 正文各章 → `N+1 结论与展望`），末尾 `参考文献` 不编号；不含摘要/关键字块。生成 Markdown（写入 Obsidian `reviews` 目录）的同时，用 pandoc 自动导出同名 `.docx`（导出前去掉 Obsidian wikilink 后缀，参考文献逐条独立成段），Word 导出失败不影响 markdown 主流程。参考文献按 GB/T 7714-2015 的**文献类型标识码**区分，8 种类型各走各的著录格式（见下文「文献类型」一节）。
 - 配置见 `.env.example` 的 litreview 段；依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`；Word 导出依赖系统装有 `pandoc`。
 
 ### 📖 教材/书籍入库（轻量检索语料）
@@ -202,7 +204,7 @@ python review.py add-book ./books/              # 批量（指定目录内所有
 python review.py add-book                       # 不传路径：扫描默认书籍目录 BOOK_INPUT_DIR
 python review.py add-book 大部头.pdf --no-llm    # 元数据只本地解析，出版社/版次留空待手填
 python review.py index                          # 入库后建索引（与论文共用检索库）
-python review.py search "某概念" --corpus book   # 只在教材中检索（默认 all=论文+教材混检）
+python review.py search "某概念" --corpus book   # 只在教材中检索（默认 all=全库混检）
 ```
 
 - **统一管理目录**：`BOOK_INPUT_DIR`（默认 `./input_books`）与 `MINERU_OUTPUT_DIR`平行——`add-book` 不传路径时默认扫描这里；解析结果落进 `BOOK_OUTPUT_DIR`（默认 `./book_output`，与 `MINERU_OUTPUT_DIR` 平行、不跟论文的解析结果混放），每本书按 `书名_doc_id前8位` 单独建一个子文件夹（拆分出的 PDF 分册、EPUB 抽出的图、full.md 等都在里面）。两个目录都可在 `.env` 里改。
@@ -215,17 +217,58 @@ python review.py search "某概念" --corpus book   # 只在教材中检索（�
   python -c "import daemon; daemon.book_intake_job()"
   ```
 
+### 🗂 文献类型（GB/T 7714-2015 码表）
+
+库里不止论文和教材：专利、国标行标、协会年报、企业财报、机构研究报告、网页资料都可能进来，它们的参考文献著录格式各不相同。类型词表集中在 **`litreview/doctype.py`** 一个文件里，**加一种类型 = 加一行词表 + 加一个著录分支**，命令行选项、MCP 参数校验、分块参数全部由它派生：
+
+| 类型键 | 名称 | GB/T 7714 码 | 归类方式 | 长文本分块 |
+|---|---|---|---|---|
+| `paper` | 期刊论文 | `[J]` | 默认 | 否 |
+| `book` | 专著/教材 | `[M]` | `add-book` 入库时指定 | 是 |
+| `patent` | 专利 | `[P]` | **封面正则自动识别** | 否 |
+| `standard` | 标准 | `[S]` | **封面正则自动识别** | 否 |
+| `report` | 报告 | `[R]` | 人工 `set-type` | 是 |
+| `thesis` | 学位论文 | `[D]` | 人工 `set-type` | 是 |
+| `conf` | 会议论文 | `[C]` | 人工 `set-type` | 否 |
+| `web` | 网络资源 | `[EB/OL]` | 人工 `set-type` | 否 |
+
+```bash
+python review.py types                            # 分类总览：各类型篇数 + 码 + 归类方式
+python review.py types --rescan                   # 重扫存量文献，找出被误判成论文的专利/标准（仅预演）
+python review.py types --rescan --apply           # 确认后写库（不调 LLM、不重解析，可重复执行）
+python review.py types --rescan --only standard   # 只扫标准
+python review.py set-type <doc_id或标题片段> --type report \
+    --publisher "FAO/IFA" --place Rome --year 2024          # 人工指定类型，顺带补著录项
+python review.py search "限量要求" --corpus standard         # 只在标准中检索
+```
+
+**⚠️ 只有专利和标准能自动识别，这是有原因的，不是偷懒。** 专利有 INID 码、标准有强制封面格式（`中华人民共和国国家标准` + 标准号 + `发布`/`实施` 双日期），都是全球/全国统一的硬格式；而**协会年报、企业财报、研究报告跟一篇长论文在版式上没有任何可靠差别**——扉页有标题有机构名有年份，再往下就是正文。硬要凭"出现了 Annual Report 字样"去猜，误判率高到会污染整个库。所以这几类**一律靠 `set-type` 人工指定**，词表里 `detect: False` 就是在写明这件事，别人想给它们加自动识别时会先撞上 `tests/test_doctype.py::test_only_patent_and_standard_claim_auto_detection`。
+
+自动识别一律要求**命中 ≥2 个标记**，单个关键词绝不定案：一篇论文正文里写"酸值按 GB/T 4945—2002 测定"是家常便饭，只凭一个标准号就判成标准，整个库都会被污染。
+
+### 📐 标准（自动识别，现行与否人工核实）
+
+`enrich` 阶段扫封面，抽出标准号、中英文名称、发布日期、实施日期、发布机构，写进 `doc_no` / `effective_date` 等列。三个真实的坑都已在 `tests/test_doctype.py` 里用**生产库原样抠出来的封面文本**锁住：
+
+- **`代替 GB/T 1677—1981` 出现在真编号前面**——先撞上它就会把被作废的旧版号当成本标准的号；
+- **MinerU 把斜杠/破折号包进 HTML 标签**——封面上印的是 `GB/T 32952—2016`，解析出来是 `GB<sup>/</sup>T32952<sup>—</sup>2016`，不先剥标签连编号都匹配不上；
+- **造字子集乱码**——`犌犅／犜7363—2021` 其实是 `GB/T 7363—2021`。只修了实测确认的 3 个字母（犌=G 犅=B 犜=T），没有整表瞎猜。
+
+标准的 `long=False`（与论文同一套分块参数）：正文是一条一条的条款，一条一个意思，用大块反而检得更糊。**好处是论文→标准的重新归类不需要重建索引。**
+
+标准也分"封面事实"和"人工结论"两类，跟专利同理：实施日期印在封面上、不会变；**现行/被代替/废止会随时间变化，PDF 里没有**，只能 `python review.py standards --set GB38400-2019 --status 废止` 人工录入。没核实过就显示「未核实」，**不会拿实施日期冒充现行状态**——一份已废止标准的限量值被当成现行的引用，后果是实打实的。
+
 ### 📄 专利（自动识别，法律状态人工核实）
 
 专利 PDF **不需要单独的入口**——跟论文走同一条流水线，`enrich` 阶段按扉页的 **INID 码**（WIPO ST.9 标准著录项目代码，`(21)申请号` `(22)申请日` `(72)发明人` `(54)发明名称` 等，全球专利文献通用）自动判定，命中 **≥2 个**标记才算数（只出现一次 "United States Patent" 的论文不会被误判）。识别为专利后 `doc_type='patent'`，发明人/申请人/申请日直接从 INID 码取，**跳过 LLM 补缺**（同教材的做法，省一次 API 调用）。
 
 ```bash
 python review.py patents                          # 专利台账
-python review.py patents --rescan                 # 重扫存量文献，找出被误判成论文的专利（仅预演）
-python review.py patents --rescan --apply         # 确认后写库（不调 LLM、不重解析，可重复执行）
 python review.py patents --set CN110346043A --status 驳回   # 人工录入法律状态，自动记核实日期
 python review.py search "余热回收" --corpus patent          # 只在专利中检索
 ```
+
+> 重扫存量文献统一走 `python review.py types --rescan`（专利和标准一起扫），**`patents --rescan` 已移除**——同一件事只留一个入口。
 
 **⚠️ 状态分两类，这是本功能的设计前提，改代码前务必看清 `litreview/patent.py` 模块头部说明：**
 
@@ -239,8 +282,9 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 - 种别码：CN `A`=发明申请公布（审查中）/ `B`=发明授权 / `U`=实用新型授权 / `S`=外观设计；US `A1`=申请公开、`B1`/`B2`=授权；EP `A*`=申请、`B*`=授权。扉页同时印着授权公告号和申请公布号时**取授权号**，它才代表当前阶段。
 - 保护期：申请日 + 20 年（发明）/ 10 年（实用新型）/ 15 年（外观设计），是纯算术。但这只是**期限上限**——欠缴年费、主动放弃、被宣告无效都会让专利早于此日失效，那些事件本地看不到。
 - 没人工核实过就显示「未核实」，**不会拿出版阶段冒充法律状态**（种别码 `B` 只说明它当年被授权过，不代表今天仍然有效）。
-- `legal_status` / `status_checked_at` 两列**不会被 `enrich --force` 冲掉**（`save_enrichment` 是 `INSERT OR REPLACE`，写入前会先取回旧值沿用），人工成果安全。
-- 新增的 4 列（`patent_no` / `filing_date` / `legal_status` / `status_checked_at`）全部可空、默认 NULL，随 `paper_details` 既有的热升级机制自动补列，对已有论文/教材行零影响。
+- `legal_status` / `status_checked_at` 两列**不会被 `enrich --force` 冲掉**（`save_enrichment` 是 `INSERT OR REPLACE`，写入前会先取回旧值沿用），人工成果安全；同样受保护的还有 `doc_no` / `url` / `effective_date`。
+- 新增的列（`patent_no` / `filing_date` / `legal_status` / `status_checked_at` / `doc_no` / `url` / `effective_date`）全部可空、默认 NULL，随 `paper_details` 既有的热升级机制自动补列，对已有论文/教材行零影响。**标准的实施日期单独占一列 `effective_date`，没有塞进专利的 `filing_date`**——两个日期含义完全不同，挤一列日后必然误读。
+- `set-type` 写库走 `mark_doc_type`，每一列都是 `COALESCE(NULLIF(?,''), 旧值)`：一次退化的重新识别**永远不会**把已经正确的值抹成空。
 
 ## 🔌 MCP Server（在大模型对话中直接调用）
 
@@ -250,15 +294,19 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 
 | 工具 | 说明 |
 |---|---|
-| `library_status` | 文献库概况（篇数/索引/元数据覆盖，按论文/教材/专利分列） |
-| `search_literature(query, top_k, corpus)` | 语义检索文献片段（向量召回 + 重排序，跨中英）；`corpus` 可限定 `paper`/`book`/`patent` |
-| `get_paper_info(keyword, limit)` | 按标题/关键词/专利号查结构化元数据（DOI/作者/期刊/TLDR，专利则给出阶段与保护期） |
-| `patent_status(keyword)` | 专利台账：出版阶段、保护期至、法律状态（**只读**，法律状态只能用 CLI 人工录入） |
+| `library_status` | 文献库概况（篇数/索引/元数据覆盖，按 8 种文献类型分列） |
+| `search_literature(query, top_k, corpus)` | 语义检索文献片段（向量召回 + 重排序，跨中英）；`corpus` 可限定为词表里的任一类型（`paper`/`book`/`patent`/`standard`/`report`/…） |
+| `get_paper_info(keyword, limit)` | 按标题/关键词/专利号/标准号查结构化元数据（DOI/作者/期刊/TLDR，专利给出阶段与保护期，标准给出实施日期与现行状态） |
+| `doc_status(doc_type, keyword)` | 专利/标准台账：出版阶段、保护期至、实施日期、人工核实状态（**只读**，状态只能用 CLI 人工录入） |
 | `generate_outline(topic, focus, sections)` | 生成综述大纲 JSON（同步，约 1 分钟） |
 | `start_review(topic, focus, words, sections, outline_json)` | 后台启动完整综述生成，立即返回 job_id |
 | `review_status(job_id)` | 查询生成进度/日志尾部/产出文件路径（markdown + Word 各一份） |
 
-> `patent_status` 刻意**不提供写入能力**——法律状态是要对外负责的结论，不能由模型自行判断后写进生产库；工具返回「未核实」时也明确要求调用方不要拿出版阶段替代作答。
+> `doc_status` 刻意**不提供写入能力**——专利的法律状态、标准的现行与否都是要对外负责的结论，不能由模型自行判断后写进生产库；工具返回「未核实」时也明确要求调用方不要拿出版阶段或实施日期替代作答。
+>
+> 检索结果会带类型标签：看到 `[标准 GB 38400-2019]` 才知道这段限量值出自强制性文件而非某篇论文的实验结论，两者的可引用分量完全不同。
+>
+> **`patent_status` 已更名为 `doc_status`**（多了个 `doc_type` 参数，专利和标准共用）。其他设备只需重启一次 MCP client——工具是动态发现的，配置文件不用改。
 
 综述生成耗时 7-30 分钟（取决于模型），远超 MCP 工具调用超时，所以采用**后台任务模式**：`start_review` 秒回 job_id，之后随时用 `review_status` 轮询，完成后返回 Obsidian 笔记路径。
 

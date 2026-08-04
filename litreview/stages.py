@@ -14,6 +14,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .models import Outline, OutlineSection, Evidence, SectionDraft, ReviewDoc
 from . import prompts
+from . import doctype as dt
 
 
 # ── LLM 调用与 JSON 解析 ──────────────────────────────────────────────────────
@@ -279,6 +280,69 @@ def _best_title(meta: dict) -> str:
     return _display_title(meta.get("title", "未知文献"))
 
 
+def _imprint(place: str, publisher: str, year: str) -> str:
+    """GB/T 7714 出版项：' 出版地: 出版者, 出版年.'。缺哪项就少哪项，不留占位符。"""
+    head = f"{place}: {publisher}" if (place and publisher) else (publisher or place)
+    if head:
+        return f" {head}, {year}." if year else f" {head}."
+    return f" {year}." if year else ""
+
+
+def format_reference(n: int, doc_id: str, m: dict) -> str:
+    """按文献类型排一条 GB/T 7714-2015 参考文献。
+
+    ⚠️ 必须按类型分发。早先这里写成 "if 书籍 … else 一律按 [J]"，结果专利、标准这些
+    非论文类型全被印成了期刊论文（`…[J].` 后面还跟个空的期刊名）。新增 doc_type 时，
+    doctype.DOC_TYPES 里加一行的同时，**这里也要补上对应的一支**，否则又会掉回 [J]。
+    """
+    doc_type = m.get("doc_type") or dt.DEFAULT_TYPE
+    code = dt.gb_code(doc_type)
+    raw_title = m.get("title", "未知文献")
+    title = _best_title(m)
+    year = m.get("year", "")
+    place, publisher = m.get("pub_place", ""), m.get("publisher", "")
+
+    # 标准和网络资源通常不署个人责任者，硬填"作者不详"反而是噪声——没有就整段省掉。
+    if doc_type in ("standard", "web") and not m.get("authors"):
+        authors = ""
+    else:
+        authors = _short_authors(m.get("authors", ""), m.get("language", "zh"), raw_title)
+    lead = f"{authors}. " if authors else ""
+
+    # 书籍不进 Obsidian、网络资源不走流水线，都没有笔记可链；其余类型链回单篇笔记
+    # （命名规则同 utils.generate_obsidian_note）。
+    if doc_type in ("book", "web"):
+        link = ""
+    else:
+        safe = "".join(c for c in raw_title if c.isalnum() or c in " -_").strip() or "Untitled_Paper"
+        link = f" [[{safe}_{doc_id[:8]}]]"
+
+    if code == "M":                     # 专著：作者. 书名[M]. 版本. 出版地: 出版者, 出版年.
+        edition = m.get("edition", "")
+        body = (f"[{n}] {lead}{title}[M]." + (f" {edition}." if edition else "")
+                + _imprint(place, publisher, year))
+    elif code == "P":                   # 专利：申请人. 专利名称: 专利号[P]. 申请日.
+        no = m.get("patent_no", "")
+        d = m.get("filing_date", "") or year
+        body = f"[{n}] {lead}{title}" + (f": {no}" if no else "") + "[P]." + (f" {d}." if d else "")
+    elif code == "S":                   # 标准：发布机构. 标准名称: 标准号[S]. 出版地: 出版者, 出版年.
+        no = m.get("doc_no", "")
+        body = (f"[{n}] {lead}{title}" + (f": {no}" if no else "") + "[S]."
+                + _imprint(place, publisher, year))
+    elif code == "EB/OL":               # 电子资源：责任者. 题名[EB/OL]. 出版年. 网址.
+        url = m.get("url", "")
+        body = f"[{n}] {lead}{title}[EB/OL]." + (f" {year}." if year else "") + (f" {url}." if url else "")
+    elif code in ("R", "D", "C"):       # 报告/学位论文/会议论文：责任者. 题名[X]. 出版项.
+        body = f"[{n}] {lead}{title}[{code}]." + _imprint(place, publisher, year)
+    else:                               # 期刊论文：作者. 题名[J]. 期刊, 年. DOI: xxx.
+        journal = m.get("journal", "")
+        tail = f" {journal}, {year}." if (journal and year) else \
+               (f" {journal}." if journal else (f" {year}." if year else ""))
+        doi = m.get("doi", "")
+        body = f"[{n}] {lead}{title}[J].{tail}" + (f" DOI: {doi}." if doi else "")
+    return body.rstrip() + link
+
+
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
                   words: tuple = (600, 1000), focus: str = "") -> SectionDraft:
@@ -356,47 +420,7 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
     new_sections = [SectionDraft(heading=d.heading, markdown=_renumber(d.markdown),
                                  cited_doc_ids=d.cited_doc_ids) for d in drafts]
 
-    references = []
-    for doc_id in ordered_docs:
-        m = paper_meta.get(doc_id, {})
-        n = numbering[doc_id]
-        raw_title = m.get("title", "未知文献")
-        authors = _short_authors(m.get("authors", ""), m.get("language", "zh"), raw_title)
-        title = _best_title(m)
-        year = m.get("year", "")
-
-        if m.get("doc_type") == "book":
-            # GB/T 7714 专著：作者. 书名[M]. [版本.] 出版地: 出版者, 出版年.（无 DOI/wikilink）
-            edition = m.get("edition", "")
-            place = m.get("pub_place", "")
-            publisher = m.get("publisher", "")
-            edition_part = f" {edition}." if edition else ""
-            if place and publisher:
-                imprint = f" {place}: {publisher}, {year}." if year else f" {place}: {publisher}."
-            elif publisher:
-                imprint = f" {publisher}, {year}." if year else f" {publisher}."
-            elif year:
-                imprint = f" {year}."
-            else:
-                imprint = ""
-            references.append((f"[{n}] {authors}. {title}[M].{edition_part}{imprint}").rstrip())
-            continue
-
-        # 期刊论文：作者. 题名[J]. 期刊, 年. DOI: xxx. + 回链 Obsidian 笔记
-        journal = m.get("journal", "")
-        tail = ""
-        if journal and year:
-            tail = f" {journal}, {year}."
-        elif journal:
-            tail = f" {journal}."
-        elif year:
-            tail = f" {year}."
-        doi = m.get("doi", "")
-        doi_part = f" DOI: {doi}." if doi else ""
-        # 文末 wikilink 链回单篇 Obsidian 笔记（笔记命名规则同 utils.generate_obsidian_note）
-        safe_title = "".join(c for c in raw_title if c.isalnum() or c in " -_").strip() or "Untitled_Paper"
-        wikilink = f" [[{safe_title}_{doc_id[:8]}]]"
-        references.append((f"[{n}] {authors}. {title}[J].{tail}{doi_part}").rstrip() + wikilink)
+    references = [format_reference(numbering[d], d, paper_meta.get(d, {})) for d in ordered_docs]
 
     return ReviewDoc(
         title=outline.title, topic=outline.topic,

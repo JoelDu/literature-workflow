@@ -6,16 +6,22 @@
 import re
 from dataclasses import dataclass
 
+from .doctype import is_long_form
+
 
 def chunk_params_for(doc_type: str, review_size: int, review_overlap: int,
                      book_size: int, book_overlap: int):
-    """按文档类型选块大小：书籍块更大（正文连贯、检索时要的上下文更长）。
+    """按文档类型选块大小：长篇连续文本（教材、报告）块更大，检索时要的上下文更长。
+
+    哪些算长篇由 doctype.DOC_TYPES 的 long 字段说了算，不在这里另列一份类型名单——
+    列两份迟早对不上。标准和专利虽然也是整本 PDF，但正文是条款和权利要求，
+    一条一个意思，用论文那档小块反而检得更准。
 
     索引编排有两份实现（白天 indexer.build_index 走在线嵌入，夜间 nightly_index.py
     走本地权重、能断点续跑），**这条映射必须是同一份**——否则加了新 doc_type 只改一边，
     两边分块结果就会悄悄不一致，同一篇文献白天夜里算出的块边界都对不上。
     """
-    return (book_size, book_overlap) if doc_type == "book" else (review_size, review_overlap)
+    return (book_size, book_overlap) if is_long_form(doc_type) else (review_size, review_overlap)
 
 
 @dataclass

@@ -12,6 +12,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from .store import VectorStore
 from .patent import detect_patent
+from . import doctype as dt
+from .doctype import detect_standard
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 _ASSET_TYPES = ("image", "chart", "table")
@@ -75,6 +77,46 @@ def _load_content_list(paper_dir: str) -> list:
         return json.load(f)
 
 
+def detect_doc_type(md_head: str) -> tuple:
+    """按封面文本判定文献类型 → (doc_type, 著录项目 dict)；认不出返回 ('', {})。
+
+    **只认封面带强制性格式的两类**：专利（INID 著录项目码）和标准（中华人民共和国国家标准
+    + 编号 + 发布/实施日期）。报告、财报、网页在正则眼里跟论文/书籍长得一模一样，
+    没有可靠特征，一律不猜——那些只能人工 `review.py set-type` 指定。详见 doctype 模块开头。
+
+    首次入库（run_enrich）和重扫存量（rescan_types）共用这一个函数，
+    保证"同一份 PDF 什么时候扫都判成同一类"。
+    """
+    pat = detect_patent(md_head or "")
+    if pat:
+        return "patent", pat
+    std = detect_standard(md_head or "")
+    if std:
+        return "standard", std
+    return "", {}
+
+
+def fields_for(doc_type: str, info: dict) -> dict:
+    """著录项目 dict → paper_details 列名。空值一律剔除，免得覆盖掉已有的好数据。"""
+    if doc_type == "patent":
+        f = {"patent_no": info.get("patent_no", ""), "filing_date": info.get("filing_date", ""),
+             "title": info.get("title", ""), "title_zh": info.get("title", ""),
+             "authors": info.get("inventors", ""), "publisher": info.get("assignee", ""),
+             "keywords": info.get("ipc", ""), "year": (info.get("filing_date", "") or "")[:4]}
+    elif doc_type == "standard":
+        # 标准的"作者"是发布机构；出版者优先取封面印的出版社，没有就用发布机构。
+        # 实施日期单独存一列：它决定"这份标准从哪天起算数"，是判断时效性的关键事实，
+        # 不能和专利的申请日挤在 filing_date 里——两个日期含义完全不同。
+        f = {"doc_no": info.get("doc_no", ""), "title": info.get("title", ""),
+             "title_zh": info.get("title", ""), "title_en": info.get("title_en", ""),
+             "authors": info.get("issuer", ""), "year": info.get("year", ""),
+             "effective_date": info.get("effective", ""),
+             "publisher": info.get("publisher", "") or info.get("issuer", "")}
+    else:
+        return {}
+    return {k: v for k, v in f.items() if v}
+
+
 def _llm_fill(client, model, title_file: str, md_head: str, local: dict, existing: dict) -> dict:
     """LLM 补缺：中英标题配对、关键词、规范化 authors/journal/year。只填空缺，不覆盖本地解析结果。"""
     from .stages import _chat_json
@@ -99,7 +141,7 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
     todo = store.docs_needing_enrich(force=force)
     report = {"total": len(todo), "enriched": 0, "failed": 0,
-              "with_doi": 0, "with_refs": 0, "assets": 0, "patents": 0}
+              "with_doi": 0, "with_refs": 0, "assets": 0, "patents": 0, "standards": 0}
     if not todo:
         console.print("[green]✔ 元数据已是最新，0 篇待提取。")
         return report
@@ -136,26 +178,17 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
                     "source": "local",
                 }
 
-                # 2) 专利判定：扉页 INID 码已把发明人/申请人/申请日全结构化了，
-                #    识别中就直接跳过 LLM 补缺（同书籍的做法），省一次 API 调用。
-                pat = detect_patent(md_head or "")
-                if pat:
-                    details.update({
-                        "doc_type": "patent",
-                        "patent_no": pat["patent_no"],
-                        "filing_date": pat["filing_date"],
-                        "title": pat["title"] or details["title"],
-                        "title_zh": pat["title"] or "",
-                        "authors": pat["inventors"] or details["authors"],
-                        "publisher": pat["assignee"],
-                        "keywords": pat["ipc"],
-                        "year": (pat["filing_date"] or "")[:4] or details["year"],
-                        "source": "patent-inid",
-                    })
-                    report["patents"] += 1
+                # 2) 类型判定：专利扉页的 INID 码、标准封面的编号与发布日期都是强制格式，
+                #    本地正则就能把著录项目抽全，命中就跳过 LLM 补缺（同书籍的做法），省一次调用。
+                kind, info = detect_doc_type(md_head or "")
+                if kind:
+                    details.update(fields_for(kind, info))
+                    details["doc_type"] = kind
+                    details["source"] = "patent-inid" if kind == "patent" else "standard-cover"
+                    report["patents" if kind == "patent" else "standards"] += 1
 
                 # 3) LLM 补缺（不覆盖已有非空字段）
-                if use_llm and client is not None and not pat:
+                if use_llm and client is not None and not kind:
                     try:
                         filled = _llm_fill(client, settings.REVIEW_MODEL, title or "",
                                            md_head or "", local, existing)
@@ -180,42 +213,46 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
 
     console.print(f"[bold green]✔ 元数据提取完成：成功 {report['enriched']} 篇（含 DOI {report['with_doi']} 篇、"
                   f"含参考文献 {report['with_refs']} 篇、图表 {report['assets']} 项、"
-                  f"识别为专利 {report['patents']} 篇），失败 {report['failed']} 篇。")
+                  f"识别为专利 {report['patents']} 篇、标准 {report['standards']} 篇），"
+                  f"失败 {report['failed']} 篇。")
     return report
 
 
-def rescan_patents(settings, console, apply: bool = False) -> dict:
-    """重扫存量文献，把漏判成论文的专利改回 doc_type='patent'。
+def rescan_types(settings, console, apply: bool = False, only: str = "") -> dict:
+    """重扫存量文献，把当年漏判成论文/教材的专利和标准归位。
 
-    只做本地正则 + 只改专利相关列，**不调用任何 LLM、不重解析 content_list**，
+    只做本地正则 + 只改类型相关列，**不调用任何 LLM、不重解析 content_list**，
     所以既不花钱也不会动到已有的标题/图表/参考文献。默认 dry-run，加 apply=True 才写库。
+    重复执行安全：判定逻辑与首次入库共用 detect_doc_type，扫多少次结果都一样。
+
+    only 可限定只扫某一类（'patent' / 'standard'），不传则两类都扫。
     """
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
     rows = store.docs_needing_enrich(force=True)      # 全量 EXPORTED：(id, title, images_dir, md头)
-    # 先记下扫描前的分类，报告里才能如实说出它原来被当成了什么（论文还是教材）
+    # 先记下扫描前的分类，报告里才能如实说出它原来被当成了什么——
+    # 这句必须读真实的旧值，写死成"原先被当成论文"就会在教材被重分类时说谎。
     was = store._doc_type_map()
     found, changed = [], 0
     for doc_id, title, _images_dir, md_head in rows:
-        pat = detect_patent(md_head or "")
-        if not pat:
+        kind, info = detect_doc_type(md_head or "")
+        if not kind or (only and kind != only):
             continue
-        found.append((doc_id, title, pat))
+        found.append((doc_id, title, kind, info))
         if apply:
-            store.mark_as_patent(doc_id, pat)
+            store.mark_doc_type(doc_id, kind, fields_for(kind, info))
             changed += 1
 
-    _labels = {"paper": "论文", "book": "教材"}
-    n_new = sum(1 for d, _t, _p in found if was.get(d, "paper") != "patent")
-    console.print(f"[cyan]扫描 {len(rows)} 篇，判定为专利 {len(found)} 篇"
+    n_new = sum(1 for d, _t, k, _i in found if was.get(d, dt.DEFAULT_TYPE) != k)
+    console.print(f"[cyan]扫描 {len(rows)} 篇，判定出 {len(found)} 篇"
                   f"（其中 {n_new} 篇是新识别出来的）。")
-    for doc_id, title, pat in found:
-        old = was.get(doc_id, "paper")
-        flag = "" if old == "patent" else \
-            f"  [yellow]← 原先被当成{_labels.get(old, old)}[/yellow]"
-        console.print(f"  {doc_id[:8]}  {pat['patent_no'] or '号码未识别':<16} "
-                      f"{(pat['title'] or title or '')[:34]}{flag}")
+    for doc_id, title, kind, info in found:
+        old = was.get(doc_id, dt.DEFAULT_TYPE)
+        flag = "" if old == kind else f"  [yellow]← 原先被当成{dt.label(old)}[/yellow]"
+        no = info.get("patent_no") or info.get("doc_no") or "编号未识别"
+        console.print(f"  {doc_id[:8]}  [{dt.gb_code(kind)}] {no:<18} "
+                      f"{(info.get('title') or title or '')[:30]}{flag}")
     if not apply:
         console.print("[yellow]以上为预演结果，未写库。确认无误后加 --apply 执行。")
     else:
-        console.print(f"[bold green]✔ 已更新 {changed} 篇为 doc_type='patent'。")
+        console.print(f"[bold green]✔ 已更新 {changed} 篇的 doc_type。")
     return {"scanned": len(rows), "found": len(found), "changed": changed}

@@ -6,6 +6,9 @@
   python review.py search "关键词" [-k 10]  检索调试
   python review.py outline "主题" [-o outline.json]
   python review.py generate "主题" [--outline f] [--dry-run]
+  python review.py types [--rescan [--apply]]   文献分类总览 / 重扫存量归位
+  python review.py set-type <ID> --type report  人工指定类型（报告/网页/财报…）
+  python review.py patents | standards          专利 / 标准台账
 """
 import os
 import sys
@@ -19,6 +22,9 @@ from rich.console import Console
 from rich.table import Table
 
 from utils import get_settings, log_run_event
+# 命令行选项（--corpus / --type / --status）全部由类型词表现生成，
+# 加一种文献类型只改 doctype.py，不用回来改 argparse。纯正则模块，导入不带任何重依赖。
+from litreview import doctype as dt
 
 console = Console()
 
@@ -193,44 +199,46 @@ def cmd_add_book(args):
                   + ("" if failed else " 运行 `python review.py index` 建索引。"))
 
 
+def _set_status(store, args, doc_type: str, allowed: list, noun: str):
+    """人工录入状态（专利的法律状态 / 标准的现行与否）。两类共用一份实现。
+
+    必须同时写核实日期：状态会随时间变化，没有日期就无从判断这条还准不准。
+    """
+    from datetime import date
+    if not args.status:
+        console.print(f"[red]--set 必须同时给 --status，可选：{'/'.join(allowed)}")
+        sys.exit(1)
+    today = date.today().isoformat()
+    hit = store.set_doc_status(args.set, args.status, today, doc_type)
+    if not hit:
+        console.print(f"[yellow]未匹配到{noun}「{args.set}」（可用编号、文献ID前缀或标题片段）。")
+        sys.exit(1)
+    console.print(f"[green]✔ 已将 {len(hit)} 篇标记为「{args.status}」，核实日期 {today}。")
+    log_run_event(mode="review", event="doc_status", status="success",
+                  extra={"ident": args.set, "type": doc_type,
+                         "status": args.status, "docs": len(hit)})
+
+
 def cmd_patents(args):
-    """专利台账：列表 / 重扫存量 / 人工核实法律状态。
+    """专利台账：列表 / 人工核实法律状态。
 
     列表里「出版阶段」和「保护期至」是从专利号和申请日现算出来的事实，不落库；
     「法律状态」只有人工核实过才有值——驳回、撤回、欠年费失效这些事件 PDF 里没有，
     也没法从本地推出来，所以宁可显示"未核实"，也不拿出版阶段冒充法律状态。
     """
-    from datetime import date
     from litreview.store import VectorStore
     from litreview.patent import (patent_stage, patent_expiry, is_term_expired,
                                   LEGAL_STATUSES)
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
 
-    if args.rescan:
-        from litreview.enrich import rescan_patents
-        rescan_patents(settings, console, apply=args.apply)
-        return
-
     if args.set:
-        if not args.status:
-            console.print("[red]--set 必须同时给 --status，"
-                          f"可选：{'/'.join(LEGAL_STATUSES)}")
-            sys.exit(1)
-        today = date.today().isoformat()
-        hit = store.set_patent_status(args.set, args.status, today)
-        if not hit:
-            console.print(f"[yellow]未匹配到专利「{args.set}」（可用专利号或文献ID前缀）。"
-                          "先跑 `python review.py patents` 看看台账。")
-            sys.exit(1)
-        console.print(f"[green]✔ 已将 {len(hit)} 篇标记为「{args.status}」，核实日期 {today}。")
-        log_run_event(mode="review", event="patent_status", status="success",
-                      extra={"ident": args.set, "status": args.status, "docs": len(hit)})
+        _set_status(store, args, "patent", LEGAL_STATUSES, "专利")
         return
 
-    rows = store.list_patents()
+    rows = store.list_docs("patent")
     if not rows:
         console.print("[yellow]库里还没有 doc_type='patent' 的记录。"
-                      "若确信已入库过专利，先跑 `python review.py patents --rescan` 预演一下。")
+                      "若确信已入库过专利，先跑 `python review.py types --rescan` 预演一下。")
         return
     # 列数压到 6 且名称允许折行——7 列挤在 80 字符终端里会被全部截成省略号，等于没显示。
     table = Table(title=f"📄 专利台账（{len(rows)} 篇）", show_lines=True)
@@ -257,6 +265,116 @@ def cmd_patents(args):
     console.print("[dim]「阶段」「保护期至」由专利号种别码与申请日现算，是 PDF 上的事实，不会变；\n"
                   "「法律状态」PDF 里没有且会随时间变化，需人工核实后录入：\n"
                   "  python review.py patents --set <专利号|文献ID> --status 驳回")
+
+
+def cmd_standards(args):
+    """标准台账：列表 / 人工核实现行状态。
+
+    标准最要命的是"被代替"和"废止"——封面上永远印着发布日和实施日，看不出它今天还算不算数，
+    而拿一份废止标准的限量值去写综述是会出事的。所以状态一栏同样只信人工核实。
+    """
+    from litreview.store import VectorStore
+    from litreview.doctype import statuses_for
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    allowed = statuses_for("standard")
+
+    if args.set:
+        _set_status(store, args, "standard", allowed, "标准")
+        return
+
+    rows = store.list_docs("standard")
+    if not rows:
+        console.print("[yellow]库里还没有 doc_type='standard' 的记录。"
+                      "若确信已入库过标准，先跑 `python review.py types --rescan` 预演一下。")
+        return
+    table = Table(title=f"📐 标准台账（{len(rows)} 篇）", show_lines=True)
+    table.add_column("标准号", style="cyan", no_wrap=True)
+    table.add_column("名称", overflow="fold")
+    table.add_column("实施日期", justify="center", no_wrap=True)
+    table.add_column("发布机构", overflow="fold")
+    table.add_column("状态", justify="center", overflow="fold")
+    for r in rows:
+        status = (f"{r['legal_status']}\n[dim]{r['status_checked_at']}[/dim]"
+                  if r["legal_status"] else "[dim]未核实[/dim]")
+        table.add_row(r["doc_no"] or f"[dim]{r['doc_id'][:8]}[/dim]", r["title"] or "-",
+                      r["effective_date"] or r["year"] or "-",
+                      r["inventors"] or r["assignee"] or "-", status)
+    console.print(table)
+    console.print("[dim]标准是否现行、有没有被新版代替，PDF 封面上看不出来，需查国家标准全文公开系统后录入：\n"
+                  f"  python review.py standards --set <标准号|文献ID> --status {allowed[0]}")
+
+
+def cmd_types(args):
+    """分类总览 / 重扫存量归位。"""
+    from litreview.store import VectorStore
+    from litreview import doctype as dt
+    if args.rescan:
+        from litreview.enrich import rescan_types
+        rescan_types(settings, console, apply=args.apply, only=args.only or "")
+        return
+
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    counts = store.doc_type_counts()
+    table = Table(title=f"🗂 文献分类总览（{sum(counts.values())} 篇）", show_lines=False)
+    table.add_column("类型", no_wrap=True)
+    table.add_column("GB/T 7714 码", justify="center", no_wrap=True)
+    table.add_column("篇数", justify="right", no_wrap=True)
+    table.add_column("归类方式", overflow="fold")
+    for key in dt.all_types():
+        n = counts.get(key, 0)
+        how = "封面正则自动识别" if dt.DOC_TYPES[key]["detect"] else "入库时指定 / set-type 人工指定"
+        table.add_row(dt.label(key), f"[{dt.gb_code(key)}]",
+                      str(n) if n else "[dim]0[/dim]", f"[dim]{how}[/dim]")
+    # 库里出现了词表以外的 doc_type（历史遗留或手改过库）也要显示出来，不能悄悄漏掉
+    for key, n in sorted(counts.items()):
+        if key not in dt.DOC_TYPES:
+            table.add_row(f"[yellow]{key}[/yellow]", "[dim]?[/dim]", str(n),
+                          "[yellow]不在类型词表里，参考文献会按 [J] 打印[/yellow]")
+    console.print(table)
+    console.print("[dim]只有专利和标准的封面带强制性格式，能靠正则可靠识别；\n"
+                  "报告、财报、协会资料、网页在正则眼里跟论文长得一样，只能人工指定：\n"
+                  "  python review.py set-type <文献ID|编号|标题片段> --type report")
+
+
+def cmd_set_type(args):
+    """人工指定文献类型，顺带补录参考文献著录要用到的字段。"""
+    from litreview.store import VectorStore
+    from litreview import doctype as dt
+    kind = dt.normalize(args.type)
+    if not kind:
+        console.print(f"[red]认不出类型「{args.type}」。可用："
+                      + "、".join(f"{k}({dt.label(k)})" for k in dt.all_types()))
+        sys.exit(1)
+
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    hits = store.resolve_docs(args.ident)
+    if not hits:
+        console.print(f"[yellow]未匹配到「{args.ident}」（可用文献ID前缀、编号或标题片段）。")
+        sys.exit(1)
+    meta = store.get_paper_meta(hits)
+    if len(hits) > 1 and not args.all:
+        console.print(f"[yellow]「{args.ident}」匹配到 {len(hits)} 篇，不确定你要改哪一篇：")
+        for doc_id in hits:
+            m = meta.get(doc_id, {})
+            console.print(f"  {doc_id[:8]}  [{dt.gb_code(m.get('doc_type'))}] "
+                          f"{(m.get('title_zh') or m.get('title') or '')[:50]}")
+        console.print("[dim]请用更精确的编号或文献ID前缀；确实要全改就加 --all。")
+        sys.exit(1)
+
+    fields = {"doc_no": args.no or "", "url": args.url or "", "title": args.title or "",
+              "authors": args.authors or "", "publisher": args.publisher or "",
+              "pub_place": args.place or "", "year": args.year or ""}
+    fields = {k: v for k, v in fields.items() if v}
+    for doc_id in hits:
+        m = meta.get(doc_id, {})
+        cur = m.get("doc_type") or dt.DEFAULT_TYPE
+        store.mark_doc_type(doc_id, kind, fields)
+        old = f"（原 {dt.label(cur)}）" if cur != kind else ""
+        title = args.title or m.get("title_zh") or m.get("title") or ""
+        console.print(f"[green]✔ {doc_id[:8]} → [{dt.gb_code(kind)}] {dt.label(kind)}{old}  "
+                      f"{title[:40]}")
+    log_run_event(mode="review", event="set_type", status="success",
+                  extra={"ident": args.ident, "type": kind, "docs": len(hits)})
 
 
 def cmd_outline(args):
@@ -423,8 +541,8 @@ def main():
     p.add_argument("query")
     p.add_argument("-k", "--top-k", type=int, default=10)
     p.add_argument("--no-rerank", action="store_true", help="只用向量分数，不做重排序")
-    p.add_argument("--corpus", choices=["all", "paper", "book", "patent"], default="all",
-                   help="限定检索来源（默认 all=论文+教材+专利混检）")
+    p.add_argument("--corpus", choices=["all"] + dt.all_types(), default="all",
+                   help="限定检索来源（默认 all=全部类型混检）")
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("enrich", help="提取结构化元数据（标题中英/DOI/图表/参考文献）")
@@ -440,14 +558,39 @@ def main():
     p.set_defaults(func=cmd_add_book)
 
     p = sub.add_parser("patents", help="专利台账：查看出版阶段/保护期，人工核实法律状态")
-    p.add_argument("--rescan", action="store_true",
-                   help="重扫存量文献，找出被误判成论文的专利（默认只预演，不写库、不调 LLM）")
-    p.add_argument("--apply", action="store_true", help="配合 --rescan：真正写库")
     p.add_argument("--set", metavar="专利号或文献ID", help="指定要更新法律状态的专利")
-    p.add_argument("--status", choices=["审查中", "已授权", "驳回", "撤回", "视为撤回",
-                                        "失效", "已过期", "无效", "未知"],
+    p.add_argument("--status", choices=dt.statuses_for("patent"),
                    help="配合 --set：人工核实到的法律状态，自动记录核实日期")
     p.set_defaults(func=cmd_patents)
+
+    p = sub.add_parser("standards", help="标准台账：查看标准号/实施日期，人工核实是否现行")
+    p.add_argument("--set", metavar="标准号或文献ID", help="指定要更新状态的标准")
+    p.add_argument("--status", choices=dt.statuses_for("standard"),
+                   help="配合 --set：人工核实到的状态（现行/被代替/废止…），自动记录核实日期")
+    p.set_defaults(func=cmd_standards)
+
+    p = sub.add_parser("types", help="文献分类总览；--rescan 重扫存量把专利/标准归位")
+    p.add_argument("--rescan", action="store_true",
+                   help="重扫存量文献，找出被误判成论文的专利和标准（默认只预演，不写库、不调 LLM）")
+    p.add_argument("--apply", action="store_true", help="配合 --rescan：真正写库")
+    p.add_argument("--only", choices=[k for k in dt.all_types() if dt.DOC_TYPES[k]["detect"]],
+                   help="配合 --rescan：只扫某一类")
+    p.set_defaults(func=cmd_types)
+
+    p = sub.add_parser("set-type", help="人工指定文献类型（报告/网页/财报等没法自动识别的）")
+    p.add_argument("ident", metavar="文献ID|编号|标题片段")
+    p.add_argument("--type", required=True, metavar="类型",
+                   help="可用：" + "、".join(f"{k}={dt.label(k)}[{dt.gb_code(k)}]"
+                                             for k in dt.all_types()))
+    p.add_argument("--no", metavar="编号", help="标准号/报告编号等")
+    p.add_argument("--url", help="网络资源的访问地址（[EB/OL] 必备）")
+    p.add_argument("--title", help="订正标题")
+    p.add_argument("--authors", metavar="责任者", help="作者/编者/发布机构，多个用分号隔开")
+    p.add_argument("--publisher", metavar="出版者", help="出版社/发布单位")
+    p.add_argument("--place", metavar="出版地", help="如：北京")
+    p.add_argument("--year", help="出版年")
+    p.add_argument("--all", action="store_true", help="匹配到多篇时全部修改")
+    p.set_defaults(func=cmd_set_type)
 
     p = sub.add_parser("outline", help="生成综述大纲")
     p.add_argument("topic")

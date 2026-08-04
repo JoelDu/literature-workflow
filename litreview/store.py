@@ -3,6 +3,7 @@
 与主管道共用 data/batch_tracking.db，表名 review_ 前缀隔离。
 """
 import os
+import re
 import json
 import hashlib
 import sqlite3
@@ -102,16 +103,21 @@ class VectorStore:
             raw_text  TEXT NOT NULL
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_refs_doc ON paper_references(doc_id)")
-        # 书籍/教材、专利需要的字段：增量热升级（paper_details 已存在于老库时补列）。
-        # 专利四列全部可空、默认 NULL，对已有的论文/教材行零影响。前两列是印在 PDF 上的事实，
-        # 后两列只由人工（review.py patents --set）写入——法律状态不在 PDF 里且会随时间变化，
-        # 详见 litreview/patent.py 模块头部说明。
+        # 各文献类型（教材/专利/标准/报告/网页）要用到的字段：增量热升级——
+        # paper_details 已存在于老库时按需补列，全部可空、默认 NULL，对已有行零影响。
+        # 其中 legal_status / status_checked_at 这两列**只由人工写入**
+        #（review.py patents|standards --set）：专利的法律状态、标准的现行与否都不在 PDF 上，
+        # 且会随时间变化，机器无从推断。详见 litreview/patent.py 与 doctype.py 的模块头部说明。
+        # 其余列（patent_no、doc_no、filing_date=申请日、effective_date=标准实施日…）
+        # 都是印在封面上的事实，由正则抽取，不会变。
         c.execute("PRAGMA table_info(paper_details)")
         _pd_cols = {row[1] for row in c.fetchall()}
         for _col, _decl in (("doc_type", "TEXT DEFAULT 'paper'"), ("publisher", "TEXT"),
                             ("pub_place", "TEXT"), ("edition", "TEXT"), ("isbn", "TEXT"),
                             ("patent_no", "TEXT"), ("filing_date", "TEXT"),
-                            ("legal_status", "TEXT"), ("status_checked_at", "TEXT")):
+                            ("legal_status", "TEXT"), ("status_checked_at", "TEXT"),
+                            ("doc_no", "TEXT"), ("url", "TEXT"),
+                            ("effective_date", "TEXT")):
             if _col not in _pd_cols:
                 c.execute(f"ALTER TABLE paper_details ADD COLUMN {_col} {_decl}")
         conn.commit()
@@ -313,7 +319,8 @@ class VectorStore:
         base_sql = """SELECT p.id, p.title, p.language, p.result_json,
                              d.title_zh, d.title_en, d.doi, d.authors, d.journal, d.year, d.keywords,
                              d.doc_type, d.publisher, d.pub_place, d.edition,
-                             d.patent_no, d.filing_date, d.legal_status, d.status_checked_at
+                             d.patent_no, d.filing_date, d.legal_status, d.status_checked_at,
+                             d.doc_no, d.url, d.effective_date
                       FROM papers p LEFT JOIN paper_details d ON d.doc_id = p.id"""
         if doc_ids:
             marks = ",".join("?" * len(doc_ids))
@@ -326,7 +333,8 @@ class VectorStore:
         for (doc_id, title, language, result_json,
              d_title_zh, d_title_en, d_doi, d_authors, d_journal, d_year, d_keywords,
              d_doc_type, d_publisher, d_pub_place, d_edition,
-             d_patent_no, d_filing_date, d_legal_status, d_status_checked) in rows:
+             d_patent_no, d_filing_date, d_legal_status, d_status_checked,
+             d_doc_no, d_url, d_effective) in rows:
             meta = {"title": title or "", "language": language or "zh",
                     "authors": "", "journal": "", "year": "", "tldr": "",
                     "title_zh": d_title_zh or "", "title_en": d_title_en or "",
@@ -335,7 +343,9 @@ class VectorStore:
                     "pub_place": d_pub_place or "", "edition": d_edition or "",
                     "patent_no": d_patent_no or "", "filing_date": d_filing_date or "",
                     "legal_status": d_legal_status or "",
-                    "status_checked_at": d_status_checked or ""}
+                    "status_checked_at": d_status_checked or "",
+                    "doc_no": d_doc_no or "", "url": d_url or "",
+                    "effective_date": d_effective or ""}
             if result_json:
                 try:
                     analysis = json.loads(result_json)
@@ -350,68 +360,105 @@ class VectorStore:
             out[doc_id] = meta
         return out
 
-    # ── 专利 ──────────────────────────────────────────────────────────────
+    # ── 规范性文件（专利 / 标准）──────────────────────────────────────────
+    # 这两类共用一套读写：都有"印在封面上的编号"和"不印在封面上、会随时间变化、
+    # 只能人工核实的状态"，机制完全同构，没必要写两遍。
 
-    def list_patents(self) -> list:
-        """返回全部 doc_type='patent' 的著录项目，按申请日倒序。
-        只回事实字段 + 人工写入的法律状态；出版阶段/到期日一律由 litreview.patent
-        在读取时现算，不落库——落库就会随时间过期且没人知道它过期了。"""
+    # mark_doc_type 允许写入的列。白名单是必需的：列名要直接拼进 SQL，
+    # 不设限就等于把 UPDATE 的列名开放给调用方拼字符串。
+    _MARKABLE_COLS = ("patent_no", "doc_no", "filing_date", "effective_date",
+                      "authors", "publisher", "pub_place", "year",
+                      "title", "title_zh", "title_en",
+                      "keywords", "journal", "isbn", "edition", "url")
+
+    def list_docs(self, doc_type: str) -> list:
+        """返回某一类型的全部著录项目，按编号/日期倒序。
+
+        只回事实字段 + 人工写入的状态；出版阶段、保护期届满日这类**推导值一律不落库**，
+        由 litreview.patent 在读取时现算——落库就会随时间过期，而且没人知道它过期了。
+        """
         conn = self._conn()
         rows = conn.execute(
-            """SELECT d.doc_id, COALESCE(d.title_zh, d.title, p.title), d.patent_no,
-                      d.filing_date, d.authors, d.publisher,
-                      d.legal_status, d.status_checked_at
+            """SELECT d.doc_id, COALESCE(NULLIF(d.title_zh,''), NULLIF(d.title,''), p.title),
+                      COALESCE(d.patent_no,''), COALESCE(d.doc_no,''),
+                      COALESCE(d.filing_date,''), COALESCE(d.authors,''),
+                      COALESCE(d.publisher,''), COALESCE(d.year,''),
+                      COALESCE(d.legal_status,''), COALESCE(d.status_checked_at,''),
+                      COALESCE(d.url,''), COALESCE(d.effective_date,'')
                FROM paper_details d LEFT JOIN papers p ON p.id = d.doc_id
-               WHERE d.doc_type = 'patent'
-               ORDER BY COALESCE(d.filing_date, '') DESC""").fetchall()
+               WHERE d.doc_type = ?
+               ORDER BY COALESCE(NULLIF(d.filing_date,''), d.year, '') DESC""",
+            (doc_type,)).fetchall()
         conn.close()
-        keys = ("doc_id", "title", "patent_no", "filing_date", "inventors",
-                "assignee", "legal_status", "status_checked_at")
+        keys = ("doc_id", "title", "patent_no", "doc_no", "filing_date", "inventors",
+                "assignee", "year", "legal_status", "status_checked_at", "url",
+                "effective_date")
         return [dict(zip(keys, r)) for r in rows]
 
-    def set_patent_status(self, ident: str, status: str, checked_at: str) -> list:
-        """人工写入法律状态。ident 可以是专利号（CN110346043A）或 doc_id 前缀。
-        返回被更新的 doc_id 列表；空列表表示没匹配上。"""
+    def resolve_docs(self, ident: str, doc_type: str = "") -> list:
+        """把用户随手给的一个标识符解析成 doc_id 列表。
+
+        依次尝试：doc_id 前缀 → 专利号 → 标准号（忽略空格差异）→ 标题片段。
+        命中多篇就全部返回，由调用方决定是报错还是批量处理——这里不替它做主。
+        """
+        key = (ident or "").strip()
+        if not key:
+            return []
+        flat = re.sub(r"[\s/]", "", key).upper()
+        cond = "(UPPER(d.doc_id) LIKE ? OR UPPER(COALESCE(d.patent_no,'')) = ? " \
+               "OR REPLACE(REPLACE(UPPER(COALESCE(d.doc_no,'')),' ',''),'/','') = ? " \
+               "OR COALESCE(d.title_zh,'') LIKE ? OR COALESCE(p.title,'') LIKE ?)"
+        args = [key.upper() + "%", key.upper(), flat, f"%{key}%", f"%{key}%"]
+        if doc_type:
+            cond += " AND d.doc_type = ?"
+            args.append(doc_type)
         conn = self._conn()
-        c = conn.cursor()
-        key = (ident or "").strip().upper()
-        rows = c.execute(
-            """SELECT doc_id FROM paper_details
-               WHERE doc_type='patent'
-                 AND (UPPER(COALESCE(patent_no,'')) = ? OR UPPER(doc_id) LIKE ?)""",
-            (key, key + "%")).fetchall()
-        hit = [r[0] for r in rows]
-        if hit:
-            marks = ",".join("?" * len(hit))
-            c.execute(f"""UPDATE paper_details SET legal_status=?, status_checked_at=?
-                          WHERE doc_id IN ({marks})""", [status, checked_at] + hit)
-            conn.commit()
+        rows = conn.execute(
+            f"""SELECT d.doc_id FROM paper_details d
+                LEFT JOIN papers p ON p.id = d.doc_id WHERE {cond}""", args).fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+
+    def set_doc_status(self, ident: str, status: str, checked_at: str,
+                       doc_type: str = "") -> list:
+        """人工写入状态（专利的法律状态 / 标准的现行与否）。
+
+        必须同时写核实日期：没有日期的状态过两年就无从判断还准不准，等于假数据。
+        返回被更新的 doc_id 列表；空列表表示没匹配上。
+        """
+        hit = self.resolve_docs(ident, doc_type)
+        if not hit:
+            return []
+        conn = self._conn()
+        marks = ",".join("?" * len(hit))
+        conn.execute(f"""UPDATE paper_details SET legal_status=?, status_checked_at=?
+                         WHERE doc_id IN ({marks})""", [status, checked_at] + hit)
+        conn.commit()
         conn.close()
         return hit
 
-    def mark_as_patent(self, doc_id: str, pat: dict) -> None:
-        """只改专利相关列 + doc_type，其余字段（标题/图表/参考文献）原样不动。
-        供重扫存量文献用：不重跑 LLM、不重解析 content_list，因此可以随便重复执行。"""
+    def mark_doc_type(self, doc_id: str, doc_type: str, fields: dict = None) -> None:
+        """把一篇文献归到指定类型，并写入随类型而来的著录项目。
+
+        只动 doc_type 和 fields 里给出的列，其余字段（图表、参考文献、DOI…）原样不动，
+        所以重扫存量文献时既不用重跑 LLM、也不用重解析 content_list，可以反复执行。
+        每一列都走 COALESCE(NULLIF(?,''), 列)：**新值非空才覆盖，空值一律沿用旧值**。
+        这条规则是防呆用的——某次识别退化没抽出编号时，不会把上次抽对的编号冲成空。
+        """
+        cols = {k: str(v or "") for k, v in (fields or {}).items()
+                if k in self._MARKABLE_COLS}
         conn = self._conn()
         c = conn.cursor()
         c.execute("SELECT 1 FROM paper_details WHERE doc_id=?", (doc_id,))
         if c.fetchone():
-            c.execute("""UPDATE paper_details
-                         SET doc_type='patent', patent_no=?, filing_date=?,
-                             authors=COALESCE(NULLIF(?,''), authors),
-                             publisher=COALESCE(NULLIF(?,''), publisher),
-                             year=COALESCE(NULLIF(?,''), year)
-                         WHERE doc_id=?""",
-                      (pat.get("patent_no", ""), pat.get("filing_date", ""),
-                       pat.get("inventors", ""), pat.get("assignee", ""),
-                       (pat.get("filing_date", "") or "")[:4], doc_id))
+            sets = ["doc_type=?"] + [f"{k}=COALESCE(NULLIF(?,''), {k})" for k in cols]
+            c.execute(f"UPDATE paper_details SET {', '.join(sets)} WHERE doc_id=?",
+                      [doc_type] + list(cols.values()) + [doc_id])
         else:
-            c.execute("""INSERT INTO paper_details
-                         (doc_id, doc_type, patent_no, filing_date, authors, publisher, year)
-                         VALUES (?,'patent',?,?,?,?,?)""",
-                      (doc_id, pat.get("patent_no", ""), pat.get("filing_date", ""),
-                       pat.get("inventors", ""), pat.get("assignee", ""),
-                       (pat.get("filing_date", "") or "")[:4]))
+            names = ["doc_id", "doc_type"] + list(cols)
+            c.execute(f"INSERT INTO paper_details ({', '.join(names)}) "
+                      f"VALUES ({','.join('?' * len(names))})",
+                      [doc_id, doc_type] + list(cols.values()))
         conn.commit()
         conn.close()
 
@@ -465,19 +512,21 @@ class VectorStore:
         c = conn.cursor()
         try:
             c.execute("BEGIN")
-            # INSERT OR REPLACE 会整行重写，若不先取出人工核实过的法律状态，
-            # 一次 enrich --force 就把它冲成空。这两列除非本次显式带值，否则一律沿用旧值。
+            # INSERT OR REPLACE 会整行重写，若不先取出人工填过的那几列，
+            # 一次 enrich --force 就把它们冲成空。这几列除非本次显式带值，否则一律沿用旧值：
+            # 状态与核实日期是人工核实结果，doc_no/url 是重扫或人工 set-type 写进去的。
+            _CARRY = ("legal_status", "status_checked_at", "doc_no", "url", "effective_date")
             _old = c.execute(
-                "SELECT legal_status, status_checked_at FROM paper_details WHERE doc_id=?",
-                (doc_id,)).fetchone() or ("", "")
-            _legal = details.get("legal_status") or _old[0] or ""
-            _checked = details.get("status_checked_at") or _old[1] or ""
+                f"SELECT {', '.join(_CARRY)} FROM paper_details WHERE doc_id=?",
+                (doc_id,)).fetchone() or ("",) * len(_CARRY)
+            _kept = {k: (details.get(k) or _old[i] or "") for i, k in enumerate(_CARRY)}
             c.execute("""INSERT OR REPLACE INTO paper_details
                          (doc_id, title, title_zh, title_en, doi, authors, journal, year,
                           keywords, n_figures, n_tables, n_refs, enriched_at, source,
                           doc_type, publisher, pub_place, edition, isbn,
-                          patent_no, filing_date, legal_status, status_checked_at)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          patent_no, filing_date, legal_status, status_checked_at,
+                          doc_no, url, effective_date)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (doc_id, details.get("title", ""), details.get("title_zh", ""),
                        details.get("title_en", ""), details.get("doi", ""),
                        details.get("authors", ""), details.get("journal", ""),
@@ -488,7 +537,8 @@ class VectorStore:
                        details.get("pub_place", ""), details.get("edition", ""),
                        details.get("isbn", ""),
                        details.get("patent_no", ""), details.get("filing_date", ""),
-                       _legal, _checked))
+                       _kept["legal_status"], _kept["status_checked_at"],
+                       _kept["doc_no"], _kept["url"], _kept["effective_date"]))
             c.execute("DELETE FROM paper_assets WHERE doc_id=?", (doc_id,))
             for a in assets:
                 c.execute("""INSERT INTO paper_assets (doc_id, asset_type, img_path, caption, page_idx)
