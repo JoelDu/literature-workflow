@@ -230,7 +230,7 @@ python review.py index / enrich / search / outline / generate  # 综述生成器
 
 **本机（同一台机器）**：
 ```bash
-claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_server.sh
+claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_server.sh
 ```
 换机器部署时改 `mcp_server.sh` 里的三个路径（密钥文件、数据库路径、项目根目录）。
 ⚠️ 该脚本目前仍**硬编码** `. /opt/docker_shared/api_keys.env`，没跟着去宿主机化一起改成 `${SHARED_ENV_FILE}`。别人的机器上没这个文件，`set -a` 下 source 失败会让脚本直接退出、MCP 起不来。发包前要修。

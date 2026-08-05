@@ -105,7 +105,15 @@ def main() -> int:
     dim = int(os.getenv("EMBEDDING_DIM", "4096"))
     # 标识与线上保持一致：已实证两者同属一个向量空间，混用无碍（见 local_embedder 文档串）
     model_label = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
-    model_path = os.getenv("LOCAL_EMBEDDING_MODEL_PATH", "/mnt/ripe/models/Qwen3-Embedding-8B")
+    # 没有默认值：本地嵌入模型放哪儿因机器而异，硬编码作者的 /mnt/ripe/models/...
+    # 只会让别人机器上报一个指向不存在目录的困惑错误。留空就明确提示去配。
+    model_path = os.getenv("LOCAL_EMBEDDING_MODEL_PATH", "").strip()
+    if not model_path:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 未配置 LOCAL_EMBEDDING_MODEL_PATH。\n"
+              f"       本脚本用本机模型做嵌入，需在 .env 里指向已下载的模型目录；\n"
+              f"       只想用在线嵌入的话不必跑本脚本（REVIEW_EMBED_BACKEND=remote 即可）。",
+              flush=True)
+        return 2
     review_size = int(os.getenv("REVIEW_CHUNK_SIZE", "1000"))
     review_overlap = int(os.getenv("REVIEW_CHUNK_OVERLAP", "150"))
     book_size = int(os.getenv("BOOK_CHUNK_SIZE", "4800"))

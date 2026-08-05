@@ -12,6 +12,8 @@ from datetime import datetime
 
 import numpy as np
 
+from db_schema import ensure_papers_table
+
 
 @dataclass
 class ScoredChunk:
@@ -43,6 +45,11 @@ class VectorStore:
     def ensure_schema(self) -> None:
         conn = self._conn()
         c = conn.cursor()
+        # papers 归主管道所有，这里只是确保它存在：本模块几乎每个查询都要 JOIN 它，
+        # 而刚装好、batch_pipeline 一次都没跑过的机器上它还不存在，
+        # 结果是 review.py / MCP 一上来就抛 no such table 的原始 traceback。
+        # DDL 只有 db_schema.py 一份，两边共用，不会各写各的。
+        ensure_papers_table(conn)
         c.execute("""CREATE TABLE IF NOT EXISTS review_chunks (
             chunk_id        INTEGER PRIMARY KEY AUTOINCREMENT,
             doc_id          TEXT NOT NULL,

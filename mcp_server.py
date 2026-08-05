@@ -126,8 +126,15 @@ def library_status() -> str:
     counts = _store().doc_type_counts()
     breakdown = "、".join(f"{dt.label(k)} {v}" for k, v in
                           sorted(counts.items(), key=lambda kv: -kv[1]))
+    # 空库（刚装好、主管道还没跑过）时 breakdown 是空串、latest 是 None，
+    # 直接拼进去会印成「0 篇（；最近入库时间 None）」——首次安装第一眼就是这个，
+    # 容易被当成出错了。所以两项都按有无分别成句。
+    if s["exported_docs"] == 0:
+        head = "0 篇（库是空的，把 PDF 放进 input_pdfs 等待处理即可）"
+    else:
+        head = f"{s['exported_docs']} 篇（{breakdown}；最近入库时间 {latest}）"
     return (f"文献库概况：\n"
-            f"- 已入库文献：{s['exported_docs']} 篇（{breakdown}；最近入库时间 {latest}）\n"
+            f"- 已入库文献：{head}\n"
             f"- 向量索引：{s['indexed_docs']} 篇 / {s['embedded_chunks']} 块"
             f"（模型 {settings.EMBEDDING_MODEL}，待索引 {s['pending_docs']} 篇）\n"
             f"- 结构化元数据：{n_details} 篇（DOI/中英标题/参考文献/图表）")

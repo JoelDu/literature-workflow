@@ -32,6 +32,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
+from db_schema import ensure_papers_table
 from utils import init_dirs, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 配置获取 ──────────────────────────────────────────────────────────────────
@@ -57,36 +58,18 @@ SKIP_STATUSES = (STATUS_SUBMITTED, STATUS_COMPLETED, STATUS_EXPORTED)
 # ── 数据库 ──────────────────────────────────────────────────────────────────
 
 def init_db() -> sqlite3.Connection:
-    """初始化 SQLite 数据库，并自动建立父目录，添加元数据和错误诊断列。"""
+    """初始化 SQLite 数据库，并自动建立父目录，添加元数据和错误诊断列。
+
+    papers 的 DDL 在 db_schema.py —— 那是它唯一的定义处，litreview.store 也 import
+    同一份，好让主管道没跑过的新库里 review.py / MCP 不至于撞 no such table。
+    """
     os.makedirs(os.path.dirname(settings.DB_PATH), exist_ok=True)
     conn = sqlite3.connect(settings.DB_PATH)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS papers (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        pdf_path TEXT,
-        language TEXT,
-        mineru_md TEXT,
-        images_dir TEXT,
-        status TEXT,
-        batch_provider TEXT,
-        batch_job_id TEXT,
-        result_json TEXT,
-        error_message TEXT,
-        processed_at TEXT
-    )""")
-    
-    # 动态检查缺失列进行热升级，防升级卡顿
-    c.execute("PRAGMA table_info(papers)")
-    existing_cols = {col[1] for col in c.fetchall()}
-    for col_name, col_type in [("error_message", "TEXT"), ("processed_at", "TEXT")]:
-        if col_name not in existing_cols:
-            try:
-                c.execute(f"ALTER TABLE papers ADD COLUMN {col_name} {col_type}")
-                console.print(f"[yellow]⚠️ 数据库结构升级：已添加 {col_name} 列。")
-            except Exception as e:
-                console.print(f"[red]数据库结构升级失败: {e}")
-                
+    ensure_papers_table(
+        conn,
+        on_upgrade=lambda col: console.print(f"[yellow]⚠️ 数据库结构升级：已添加 {col} 列。"),
+        on_error=lambda col, e: console.print(f"[red]数据库结构升级失败: {e}"),
+    )
     conn.commit()
     return conn
 

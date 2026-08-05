@@ -316,7 +316,7 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 **注册（Claude Code）**：
 
 ```bash
-claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_server.sh
+claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_server.sh
 ```
 
 **其他客户端（Claude Desktop / Cherry Studio 等）** 的 `mcpServers` 配置：
@@ -360,7 +360,7 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
         "-o", "BatchMode=yes",
         "-o", "ServerAliveInterval=30",
         "-p", "<端口>", "<用户>@<主机>",
-        "/path/to/literature_analyzer/mcp_server.sh"
+        "/path/to/literature-workflow/mcp_server.sh"
       ]
     }
   }
