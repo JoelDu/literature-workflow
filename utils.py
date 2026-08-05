@@ -13,15 +13,17 @@ from datetime import datetime
 
 import pandas as pd
 from jinja2 import Template
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
 
 # ── 配置模型与启动强校验 (Pydantic) ──────────────────────────────────────────
 
 class Settings(BaseModel):
-    MINERU_API_KEY: str = Field(..., min_length=1, description="MinerU API Key is required")
-    DEEPSEEK_API_KEY: str = Field(..., min_length=1, description="DeepSeek API Key is required")
-    GEMINI_API_KEY: str = Field(..., min_length=1, description="Gemini API Key is required")
+    # 凭据在真正创建对应客户端时校验。status/history/types 等纯本地命令不应因为
+    # 没有 API Key 而无法查看；DEEPSEEK_API_KEY 也只是 SiliconFlow 未配置时的回退。
+    MINERU_API_KEY: str = ""
+    DEEPSEEK_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""  # 仅兼容历史 Gemini Batch 任务，新任务不使用
     
     # 路径配置默认全部集中到安全的 data/ 目录下
     INPUT_PDF_DIR: str = "./input_pdfs"
@@ -52,7 +54,7 @@ class Settings(BaseModel):
     # remote=文档嵌入走在线 API；local=交给夜间任务 nightly_index.py 用本地权重跑。
     # 查询侧（mcp_server/review.py）永远走在线：本地单条要 195 秒冷启动，做不了交互。
     REVIEW_EMBED_BACKEND: str = "local"
-    LOCAL_EMBEDDING_MODEL_PATH: str = "/mnt/ripe/models/Qwen3-Embedding-8B"
+    LOCAL_EMBEDDING_MODEL_PATH: str = ""
     NIGHTLY_INDEX_DEADLINE: str = "08:00"     # 夜间嵌入任务的收工时间（HH:MM，到点存盘退出）
     RERANK_MODEL: str = "Qwen/Qwen3-Reranker-8B"
     RERANK_ENABLE: bool = True
@@ -87,8 +89,10 @@ class Settings(BaseModel):
 _settings = None
 
 def get_settings() -> Settings:
-    """获取强校验后的全局配置（单例模式）。
-    一旦发现 Key 缺失或格式不对，前置报错并优雅退出，适合长时守护进程。
+    """获取结构与类型校验后的全局配置（单例模式）。
+
+    API 凭据由对应客户端在真正发生网络操作时校验，使纯本地运维命令能在没有
+    `.env` 的全新安装上正常运行。
     """
     global _settings
     if _settings is None:
@@ -132,8 +136,7 @@ def get_settings() -> Settings:
                 "REVIEW_MIN_SCORE": int(os.getenv("REVIEW_MIN_SCORE", "6")),
                 "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "10")),
                 "REVIEW_EMBED_BACKEND": os.getenv("REVIEW_EMBED_BACKEND", "local"),
-                "LOCAL_EMBEDDING_MODEL_PATH": os.getenv("LOCAL_EMBEDDING_MODEL_PATH",
-                                                        "/mnt/ripe/models/Qwen3-Embedding-8B"),
+                "LOCAL_EMBEDDING_MODEL_PATH": os.getenv("LOCAL_EMBEDDING_MODEL_PATH", ""),
                 "NIGHTLY_INDEX_DEADLINE": os.getenv("NIGHTLY_INDEX_DEADLINE", "08:00"),
                 "REVIEW_MAP_CONCURRENCY": int(os.getenv("REVIEW_MAP_CONCURRENCY", "8")),
                 "REVIEW_OUTPUT_DIR": os.getenv("REVIEW_OUTPUT_DIR", "./obsidian_vault/reviews"),
@@ -294,6 +297,22 @@ def extract_key_sections(text: str, max_chars: int = 40000) -> str:
 
 # ── Obsidian 相对附件路径生成 ────────────────────────────────────────────────
 
+def build_note_metadata(title: str, markdown: str = "", language: str = "") -> dict:
+    """在笔记导出前判定可可靠识别的文献类型并整理模板元数据。
+
+    专利/标准复用 enrich 的同一识别器；其余类型没有可靠封面格式，继续按论文处理，
+    等人工 ``set-type``，避免为了标签正确而污染数据库分类。
+    """
+    from litreview import doctype as dt
+    from litreview.enrich import detect_doc_type, fields_for
+
+    doc_type, info = detect_doc_type(markdown or "")
+    doc_type = doc_type or dt.DEFAULT_TYPE
+    metadata = fields_for(doc_type, info) if info else {}
+    metadata.update({"title": title, "language": language, "doc_type": doc_type})
+    return metadata
+
+
 def generate_obsidian_note(
     paper_meta: dict,
     analysis: dict,
@@ -307,6 +326,21 @@ def generate_obsidian_note(
     """
     if template_path is None:
         template_path = get_template_path()
+
+    from litreview import doctype as dt
+
+    doc_type = dt.normalize(paper_meta.get("doc_type", "")) or dt.DEFAULT_TYPE
+    source_fields = {
+        "paper": ("期刊/会议", paper_meta.get("journal", "")),
+        "conf": ("会议", paper_meta.get("journal", "")),
+        "patent": ("专利号", paper_meta.get("patent_no", "")),
+        "standard": ("标准号", paper_meta.get("doc_no", "")),
+        "book": ("出版社", paper_meta.get("publisher", "")),
+        "report": ("发布机构", paper_meta.get("publisher", "")),
+        "thesis": ("授予单位", paper_meta.get("publisher", "")),
+        "web": ("网址", paper_meta.get("url", "")),
+    }
+    source_label, detected_source = source_fields.get(doc_type, ("来源", ""))
 
     with open(template_path, "r", encoding="utf-8") as f:
         template = Template(f.read())
@@ -333,12 +367,16 @@ def generate_obsidian_note(
             print(f"[yellow]未找到源图片文件: {img_path}")
 
     note_content = template.render(
+        doc_type=doc_type,
+        doc_type_label=dt.label(doc_type),
+        source_label=source_label,
+        source_value=detected_source or analysis.get("journal") or "未提取",
         language=analysis.get("language", paper_meta.get("language", "en")),
         current_date=datetime.now().strftime("%Y-%m-%d"),
         title=paper_meta.get("title", "Unknown Title"),
         authors=analysis.get("authors") or paper_meta.get("authors") or "未提取",
         year=analysis.get("year") or datetime.now().strftime("%Y"),
-        journal=analysis.get("journal") or "未提取",
+        journal=analysis.get("journal") or paper_meta.get("journal") or "未提取",
         tldr=analysis.get("tldr", ""),
         abstract=analysis.get("abstract", "") or paper_meta.get("abstract", ""),
         background=analysis.get("background", ""),
@@ -481,7 +519,14 @@ class TeeLogger:
             pass
 
     def write(self, message):
-        self.terminal.write(message)
+        try:
+            self.terminal.write(message)
+        except UnicodeEncodeError:
+            # Windows 的非 UTF-8 控制台（常见为 GBK）无法表示 emoji。终端显示时仅
+            # 替换不可编码字符，避免整条 CLI/daemon 崩溃；UTF-8 日志仍写入原文。
+            encoding = getattr(self.terminal, "encoding", None) or "ascii"
+            safe_message = message.encode(encoding, errors="replace").decode(encoding)
+            self.terminal.write(safe_message)
         try:
             fh = self._handle()
             fh.write(message)

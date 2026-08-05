@@ -1,12 +1,18 @@
 import os
+import json
+import sqlite3
 import shutil
 import unittest
 import tempfile
+from pathlib import Path
+from unittest.mock import patch
 import pandas as pd
 from datetime import datetime
 
 # 引入被测试模块
-from utils import calculate_pdf_hash, export_to_excel
+import batch_pipeline
+from db_schema import ensure_papers_table
+from utils import build_note_metadata, calculate_pdf_hash, export_to_excel, generate_obsidian_note
 from batch_pipeline import SKIP_STATUSES, RESUBMITTABLE_STATUSES
 
 
@@ -30,9 +36,9 @@ class TestLiteratureAnalyzer(unittest.TestCase):
         pdf1 = os.path.join(self.test_dir, "paper_alpha.pdf")
         pdf2 = os.path.join(self.test_dir, "paper_beta.pdf")
         
-        with open(pdf1, "w") as f:
+        with open(pdf1, "w", encoding="utf-8") as f:
             f.write("PDF-1.4 % 核心论文内容 Alpha")
-        with open(pdf2, "w") as f:
+        with open(pdf2, "w", encoding="utf-8") as f:
             f.write("PDF-1.4 % 核心论文内容 Beta - 完全不同的学术描述")
             
         hash1 = calculate_pdf_hash(pdf1)
@@ -141,6 +147,72 @@ class TestLiteratureAnalyzer(unittest.TestCase):
         
         # 新增文献断言
         self.assertIn("GPT-4 Technical Report", df_combined["标题"].values)
+
+    def test_obsidian_note_uses_detected_standard_type(self):
+        """自动识别的标准在首次导出时就应带正确类型与标准号。"""
+        cover = """# 中华人民共和国国家标准
+GB/T 1677—2008
+# 增塑剂环氧值的测定
+2008-06-18 发布
+2009-02-01 实施
+"""
+        meta = build_note_metadata("增塑剂环氧值的测定", cover, "zh")
+        note_path = generate_obsidian_note(
+            meta,
+            {"language": "zh", "authors": "标准化技术委员会", "year": "2008"},
+            [],
+            self.test_dir,
+            "a" * 64,
+        )
+        note = Path(note_path).read_text(encoding="utf-8")
+
+        self.assertEqual(meta["doc_type"], "standard")
+        self.assertEqual(meta["doc_no"], "GB/T 1677-2008")
+        self.assertIn('- "#standard"', note)
+        self.assertIn('document_type: "标准"', note)
+        self.assertIn('source: "GB/T 1677-2008"', note)
+        self.assertIn("**标准号**: GB/T 1677-2008", note)
+
+    def test_batch_export_passes_mineru_markdown_to_type_detection(self):
+        """批处理导出必须使用数据库里的原始 Markdown 做首次笔记判型。"""
+        conn = sqlite3.connect(":memory:")
+        ensure_papers_table(conn)
+        cover = "中华人民共和国国家标准 GB/T 1677—2008\n2008-06-18 发布"
+        conn.execute(
+            """INSERT INTO papers
+               (id, title, pdf_path, language, mineru_md, images_dir, status,
+                batch_provider, batch_job_id, result_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "b" * 64,
+                "增塑剂环氧值的测定",
+                "standard.pdf",
+                "zh",
+                cover,
+                "",
+                batch_pipeline.STATUS_COMPLETED,
+                "deepseek",
+                "job-1",
+                json.dumps({"authors": "标准化技术委员会", "year": "2008"}),
+            ),
+        )
+        conn.commit()
+
+        with (
+            patch.object(batch_pipeline, "generate_obsidian_note", return_value="standard.md") as render,
+            patch.object(batch_pipeline, "export_to_excel"),
+            patch.object(batch_pipeline, "log_run_event"),
+            patch.object(batch_pipeline.settings, "REVIEW_AUTO_INDEX", False),
+        ):
+            exported = batch_pipeline._export_completed(conn.cursor(), conn)
+
+        self.assertEqual(exported, 1)
+        note_meta = render.call_args.args[0]
+        self.assertEqual(note_meta["doc_type"], "standard")
+        self.assertEqual(note_meta["doc_no"], "GB/T 1677-2008")
+        status = conn.execute("SELECT status FROM papers").fetchone()[0]
+        self.assertEqual(status, batch_pipeline.STATUS_EXPORTED)
+        conn.close()
 
 
 if __name__ == "__main__":

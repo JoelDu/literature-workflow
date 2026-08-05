@@ -4,6 +4,7 @@
 paper_assets（图/表/图表 + 图题 + 页码）、paper_references（该论文引用的参考文献逐条）。
 """
 import os
+import posixpath
 import re
 import json
 import glob
@@ -54,7 +55,13 @@ def parse_content_list(blocks: list, folder_name: str = "") -> dict:
                     caption_parts.extend(str(x) for x in v if x)
             img_path = b.get("img_path", "") or ""
             if folder_name and img_path:
-                img_path = os.path.join(folder_name, img_path)
+                # 这是写入 SQLite/Markdown 的逻辑资源路径，不是当前机器上的文件路径。
+                # 固定使用 POSIX 分隔符，避免 Windows 入库后留下反斜杠，导致 Obsidian、
+                # pandoc 或迁移到 Linux 后找不到图片。
+                img_path = posixpath.join(
+                    folder_name.replace("\\", "/"),
+                    img_path.replace("\\", "/"),
+                )
             out["assets"].append({
                 "asset_type": btype,
                 "img_path": img_path,

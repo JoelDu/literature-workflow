@@ -14,7 +14,7 @@ from rich.progress import (
 
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
-from utils import init_dirs, generate_obsidian_note, export_to_excel, get_settings, calculate_pdf_hash, extract_original_abstract, load_processed_hashes, save_processed_hash, log_run_event, MIN_MARKDOWN_CHARS
+from utils import init_dirs, build_note_metadata, generate_obsidian_note, export_to_excel, get_settings, calculate_pdf_hash, extract_original_abstract, load_processed_hashes, save_processed_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 强前置校验配置 ──────────────────────────────────────────────────────────
 settings = get_settings()
@@ -167,7 +167,8 @@ def main():
 
             # Step 3: 保存 Obsidian 笔记，传入唯一 ID 防覆盖，并且图片复制并转为相对路径
             progress.update(main_task, description=f"[green]生成笔记: {filename}")
-            note_path = generate_obsidian_note({"title": title}, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
+            note_meta = build_note_metadata(title, md_text, analysis.get("language", ""))
+            note_path = generate_obsidian_note(note_meta, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
             note_filename = os.path.basename(note_path)
             obsidian_link_name = os.path.splitext(note_filename)[0]
 

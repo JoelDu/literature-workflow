@@ -93,21 +93,26 @@ def run_doctor():
     """全面诊断当前部署配置，对网络、密钥、文件权限进行体检。"""
     console.rule("[bold cyan]🩺 Literature Analyzer 系统健康体检 (Doctor)")
     
-    # 1. 检验三款 Key
+    # 1. 检验实际使用的凭据。DeepSeek 官方 Key 只是 SiliconFlow 未配置时的回退；
+    # Gemini 已不参与新任务，不再作为健康检查前置条件。
     console.print("\n[bold]1. API 密钥合规性校验:[/bold]")
-    keys = {
-        "MINERU_API_KEY": settings.MINERU_API_KEY,
-        "DEEPSEEK_API_KEY": settings.DEEPSEEK_API_KEY,
-        "GEMINI_API_KEY": settings.GEMINI_API_KEY
-    }
     all_keys_ok = True
-    for key_name, val in keys.items():
-        if not val or len(val) < 5:
-            console.print(f"  [-] [red]✖ {key_name} 缺失或无效！[/red]")
-            all_keys_ok = False
-        else:
-            masked = val[:4] + "*" * (len(val) - 8) + val[-4:] if len(val) > 8 else "****"
-            console.print(f"  [+] [green]✔ {key_name} 已配置[/green] ({masked})")
+    mineru_key = settings.MINERU_API_KEY
+    if not mineru_key or len(mineru_key) < 5:
+        console.print("  [-] [red]✖ MINERU_API_KEY 缺失或无效！[/red]")
+        all_keys_ok = False
+    else:
+        console.print("  [+] [green]✔ MINERU_API_KEY 已配置[/green] (****)")
+
+    sf_key = os.getenv("SILICONFLOW_API_KEY", "")
+    sf_base = os.getenv("SILICONFLOW_API_BASE", "")
+    if sf_key and sf_base:
+        console.print("  [+] [green]✔ SiliconFlow LLM 路由已配置[/green] (****)")
+    elif settings.DEEPSEEK_API_KEY:
+        console.print("  [+] [green]✔ 官方 DeepSeek 回退路由已配置[/green] (****)")
+    else:
+        console.print("  [-] [red]✖ 未配置 SiliconFlow 或官方 DeepSeek LLM 路由！[/red]")
+        all_keys_ok = False
             
     # 2. 挂载目录读写权校验
     console.print("\n[bold]2. 存储及挂载目录校验:[/bold]")
@@ -154,20 +159,13 @@ def run_doctor():
         except Exception:
             console.print("  [dim]  [-] MinerU 云接口无心跳应答（非致命错误）[/dim]")
             
-        # 测试 DeepSeek 连通
+        # 测试当前配置的 LLM 兼容接口连通性
+        llm_base = sf_base or os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
         try:
-            resp = requests.get("https://api.deepseek.com", timeout=5, proxies=proxies)
-            console.print(f"  [+] [green]✔ DeepSeek API 物理连通正常[/green] (Status: {resp.status_code})")
+            resp = requests.get(llm_base, timeout=5, proxies=proxies)
+            console.print(f"  [+] [green]✔ LLM API 物理连通正常[/green] (Status: {resp.status_code})")
         except Exception as e:
-            console.print(f"  [-] [red]✖ 无法连接至 DeepSeek API (请检查容器代理): {e}[/red]")
-            all_keys_ok = False
-            
-        # 测试 Gemini 连通
-        try:
-            resp = requests.get("https://generativelanguage.googleapis.com", timeout=5, proxies=proxies)
-            console.print(f"  [+] [green]✔ Gemini API 物理连通正常[/green] (Status: {resp.status_code})")
-        except Exception as e:
-            console.print(f"  [-] [red]✖ 无法连接至 Gemini API (请检查容器代理): {e}[/red]")
+            console.print(f"  [-] [red]✖ 无法连接至 LLM API (请检查容器代理): {e}[/red]")
             all_keys_ok = False
             
     except Exception as e:

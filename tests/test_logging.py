@@ -39,8 +39,8 @@ def test_tee_logger_rolls_over_at_midnight(tmp_path, monkeypatch):
     tee.write("今天的事\n")
     tee.flush()
 
-    assert (tmp_path / "app-2026-08-01.log").read_text() == "昨天的事\n"
-    assert (tmp_path / "app-2026-08-02.log").read_text() == "今天的事\n"
+    assert (tmp_path / "app-2026-08-01.log").read_text(encoding="utf-8") == "昨天的事\n"
+    assert (tmp_path / "app-2026-08-02.log").read_text(encoding="utf-8") == "今天的事\n"
 
 
 def test_tee_logger_appends_without_truncating(tmp_path, monkeypatch):
@@ -54,20 +54,20 @@ def test_tee_logger_appends_without_truncating(tmp_path, monkeypatch):
     second.write("CLI 写的\n")
     second.flush()
 
-    assert (tmp_path / "app-2026-08-01.log").read_text() == "daemon 写的\nCLI 写的\n"
+    assert (tmp_path / "app-2026-08-01.log").read_text(encoding="utf-8") == "daemon 写的\nCLI 写的\n"
 
 
 def test_tee_logger_prunes_expired_logs(tmp_path, monkeypatch):
     """跨天换文件时顺手删过期日志，保留期内的和别人的文件都不许动。"""
     old = tmp_path / "app-2026-06-01.log"
-    old.write_text("很久以前")
+    old.write_text("很久以前", encoding="utf-8")
     os.utime(old, (time.time() - 40 * 86400,) * 2)
 
     fresh = tmp_path / "app-2026-07-30.log"
-    fresh.write_text("前天")
+    fresh.write_text("前天", encoding="utf-8")
 
     other = tmp_path / "pipeline_history.jsonl"      # 不是本 prefix 的，别误删
-    other.write_text("{}")
+    other.write_text("{}", encoding="utf-8")
     os.utime(other, (time.time() - 400 * 86400,) * 2)
 
     _freeze(monkeypatch, datetime(2026, 8, 1, 3, 0, 0))
@@ -81,7 +81,7 @@ def test_tee_logger_prunes_expired_logs(tmp_path, monkeypatch):
 def test_tee_logger_retention_zero_keeps_everything(tmp_path, monkeypatch):
     """配 0 = 永久保留，别把人家的历史悄悄清了。"""
     old = tmp_path / "app-2020-01-01.log"
-    old.write_text("上古")
+    old.write_text("上古", encoding="utf-8")
     os.utime(old, (time.time() - 2000 * 86400,) * 2)
 
     _freeze(monkeypatch, datetime(2026, 8, 1, 3, 0, 0))
@@ -96,6 +96,21 @@ def test_tee_logger_survives_unwritable_dir(monkeypatch):
     tee = TeeLogger("/proc/nonexistent_dir", io.StringIO(), retention_days=0)
     tee.write("照样得回到终端\n")        # 不抛异常即为通过
     assert tee.terminal.getvalue() == "照样得回到终端\n"
+
+
+def test_tee_logger_survives_non_utf8_terminal(tmp_path):
+    """GBK 等终端显示不了 emoji 时不能拖垮 CLI，UTF-8 日志仍应保留原文。"""
+    raw = io.BytesIO()
+    terminal = io.TextIOWrapper(raw, encoding="gbk")
+    tee = TeeLogger(str(tmp_path), terminal, retention_days=0)
+
+    tee.write("状态📚正常\n")
+    tee.flush()
+
+    terminal.seek(0)
+    assert "状态" in terminal.read()
+    with open(tee.current_path(), encoding="utf-8") as log_file:
+        assert log_file.read() == "状态📚正常\n"
 
 
 def test_log_retention_days_falls_back_on_garbage(monkeypatch):

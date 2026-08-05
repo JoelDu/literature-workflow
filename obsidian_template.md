@@ -1,18 +1,20 @@
 ---
 aliases: []
 tags:
-  - "#paper"
+  - "#{{ doc_type }}"
   - "#{{ language }}"
 date: "{{ current_date }}"
 title: "{{ title }}"
+document_type: "{{ doc_type_label }}"
 authors: "{{ authors }}"
 year: "{{ year }}"
 journal: "{{ journal }}"
+source: "{{ source_value }}"
 ---
 
 # {{ title }}
 
-> **作者**: {{ authors }}  |  **年份**: {{ year }}  |  **期刊/会议**: {{ journal }}
+> **类型**: {{ doc_type_label }}  |  **作者/责任者**: {{ authors }}  |  **年份**: {{ year }}  |  **{{ source_label }}**: {{ source_value }}
 
 ## 💡 核心摘要 / TL;DR
 {{ tldr }}

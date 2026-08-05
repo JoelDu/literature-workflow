@@ -36,7 +36,8 @@ def test_parse_assets():
     assert types == {"table", "chart", "image"}
     table = next(a for a in out["assets"] if a["asset_type"] == "table")
     assert table["caption"] == "表1 水溶性防结块剂理化性质"
-    assert table["img_path"] == os.path.join("论文A_12345678", "images/aaa.jpg")
+    # 资源路径会写入 SQLite/Markdown，固定为 POSIX 分隔符，不能随测试宿主机变化。
+    assert table["img_path"] == "论文A_12345678/images/aaa.jpg"
     assert table["page_idx"] == 1
 
 
