@@ -36,9 +36,9 @@ class TestLiteratureAnalyzer(unittest.TestCase):
         pdf1 = os.path.join(self.test_dir, "paper_alpha.pdf")
         pdf2 = os.path.join(self.test_dir, "paper_beta.pdf")
         
-        with open(pdf1, "w") as f:
+        with open(pdf1, "w", encoding="utf-8") as f:
             f.write("PDF-1.4 % 核心论文内容 Alpha")
-        with open(pdf2, "w") as f:
+        with open(pdf2, "w", encoding="utf-8") as f:
             f.write("PDF-1.4 % 核心论文内容 Beta - 完全不同的学术描述")
             
         hash1 = calculate_pdf_hash(pdf1)
