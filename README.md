@@ -56,6 +56,9 @@ cd literature-workflow
 pip install -r requirements.txt
 ```
 
+> **仓库里只有代码，没有文献数据。** 数据库、Obsidian vault、已处理的 PDF 全在 `.gitignore` 里（`batch_tracking.db` 连着向量块早超过 GitHub 单文件 100 MB 上限），所以 clone 下来是个**空库**，跑起来后从零开始积累。
+> 想把已有文献库搬到新机器上，得单独复制 `DATA_ROOT` 指向的那个目录（默认 `./data`），clone 只解决代码这一半。
+
 ### 2. 配置环境变量
 
 复制 `.env.example` 为 `.env`，并填入你的 API Keys：
@@ -322,18 +325,27 @@ claude mcp add --scope user literature-review /path/to/literature_analyzer/mcp_s
 {
   "mcpServers": {
     "literature-review": {
-      "command": "/home/dudu/GoogleDrive/Antigravity/literature_analyzer/mcp_server.sh"
+      "command": "/path/to/literature-workflow/mcp_server.sh"
     }
   }
 }
 ```
 
-`mcp_server.sh` 负责加载密钥、清理代理变量、指向生产数据库后启动 server；换机器部署时需改脚本里的三个路径。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
+`mcp_server.sh` 负责加载密钥、清理代理变量、指向生产数据库后启动 server。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
 
 > [!WARNING]
-> `mcp_server.sh` 目前仍**硬编码** `. /opt/docker_shared/api_keys.env`，没跟着去宿主机化一起改成 `${SHARED_ENV_FILE}`。
-> 别人的机器上没有这个文件，脚本开头是 `set -a` 加 source，失败会直接退出、MCP 起不来。
-> 自己部署时请先把这一行改成你的密钥文件路径（或直接删掉，改用 `.env`）。
+> **`mcp_server.sh` 是整个仓库里唯一一个 clone 下来必须手改才能用的文件**，它没跟着去宿主机化一起改造，四行内容全是作者那台机器的绝对路径：
+>
+> ```sh
+> . /opt/docker_shared/api_keys.env                              # ① 密钥文件
+> export DB_PATH=/mnt/ripe/literature_analyzer_data/...          # ② 生产数据库
+> cd /home/dudu/GoogleDrive/Antigravity/literature_analyzer      # ③ 仓库位置
+> exec /home/dudu/.venv_lit/bin/python mcp_server.py             # ④ Python 解释器
+> ```
+>
+> 四处都要按自己的机器改。**其中 ① 最致命**：脚本开头是 `set -a` 加 source，文件不存在会让脚本直接退出，客户端的表现是"连上后立刻断开"、服务端日志里连一行都没有——和下面「经验教训」那三个坑现象一模一样，很容易查错方向。没有集中密钥文件的话，把这行删掉、改用仓库根目录的 `.env` 即可（`mcp_server.py` 自己会 `load_dotenv()`）。
+>
+> 主流程不受影响：Docker 那条路（`docker compose up -d`）所有路径都由 `.env` 的 `DATA_ROOT` 决定，clone 下来填两个 Key 就能跑，只有 MCP 这部分要动手。
 
 **远程接入（别的设备连回跑着文献库的那台机器）**：MCP 走 stdio，所以直接用 SSH 把命令跑在对端即可。以 Windows 上 Git 自带的 `ssh.exe` 为例：
 
