@@ -51,8 +51,8 @@ input_pdfs/
 推荐使用 Python 3.10+。克隆项目后安装依赖：
 
 ```bash
-git clone https://github.com/YourUsername/literature_analyzer.git
-cd literature_analyzer
+git clone https://github.com/JoelDu/literature-workflow.git
+cd literature-workflow
 pip install -r requirements.txt
 ```
 
