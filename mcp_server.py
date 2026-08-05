@@ -42,9 +42,9 @@ mcp = FastMCP("literature-review")
 # ── 独立日志（专用 logger + FileHandler，不挂在 root 上，不碰 stdout/stderr）───────
 # mcp 包会给 root logger 装 RichHandler（输出到 stderr），basicConfig 对已有
 # handler 的 root 是空操作，所以这里用独立 logger + propagate=False，确保稳定写文件。
-# 排查"客户端显示已连接又立刻断开"这类问题时看这个文件：
-#   tail -f /home/dudu/GoogleDrive/Antigravity/literature_analyzer/data/mcp_server.log
-_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# 日志跟随数据库目录，避免 MCP 指向外部 DATA_ROOT 时日志仍落在源码仓库里。
+# 排查"客户端显示已连接又立刻断开"时查看 <DB_PATH 目录>/mcp_server.log。
+_log_dir = os.path.dirname(os.path.abspath(settings.DB_PATH))
 os.makedirs(_log_dir, exist_ok=True)
 logger = logging.getLogger("mcp_server")
 logger.setLevel(logging.INFO)

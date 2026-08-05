@@ -331,21 +331,17 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
 }
 ```
 
-`mcp_server.sh` 负责加载密钥、清理代理变量、指向生产数据库后启动 server。可选环境变量 `MCP_OUTLINE_MODEL`（大纲生成模型，默认 Qwen2.5-72B-Instruct，比写作模型快）。
+`mcp_server.sh` 已去宿主机化：它自动以脚本所在目录作为项目根目录，默认读取同目录
+`.env`，数据库默认落在 `./data/batch_tracking.db`，无需修改脚本。需要覆盖时使用：
 
-> [!WARNING]
-> **`mcp_server.sh` 是整个仓库里唯一一个 clone 下来必须手改才能用的文件**，它没跟着去宿主机化一起改造，四行内容全是作者那台机器的绝对路径：
->
-> ```sh
-> . /opt/docker_shared/api_keys.env                              # ① 密钥文件
-> export DB_PATH=/mnt/ripe/literature_analyzer_data/...          # ② 生产数据库
-> cd /home/dudu/GoogleDrive/Antigravity/literature_analyzer      # ③ 仓库位置
-> exec /home/dudu/.venv_lit/bin/python mcp_server.py             # ④ Python 解释器
-> ```
->
-> 四处都要按自己的机器改。**其中 ① 最致命**：脚本开头是 `set -a` 加 source，文件不存在会让脚本直接退出，客户端的表现是"连上后立刻断开"、服务端日志里连一行都没有——和下面「经验教训」那三个坑现象一模一样，很容易查错方向。没有集中密钥文件的话，把这行删掉、改用仓库根目录的 `.env` 即可（`mcp_server.py` 自己会 `load_dotenv()`）。
->
-> 主流程不受影响：Docker 那条路（`docker compose up -d`）所有路径都由 `.env` 的 `DATA_ROOT` 决定，clone 下来填两个 Key 就能跑，只有 MCP 这部分要动手。
+| 变量 | 作用 |
+|---|---|
+| `MCP_ENV_FILE` | 指定另一份环境文件；显式指定但文件不存在时会报错退出 |
+| `MCP_PYTHON` | Python 解释器或虚拟环境路径，默认 `python3` |
+| `MCP_UNSET_PROXY` | 设为 `true` 时清理 HTTP/HTTPS/ALL_PROXY |
+| `DB_PATH` / `REVIEW_OUTPUT_DIR` | 指向已有文献库和综述输出目录 |
+
+可选环境变量 `MCP_OUTLINE_MODEL` 控制大纲生成模型（默认 Qwen2.5-72B-Instruct）。
 
 **远程接入（别的设备连回跑着文献库的那台机器）**：MCP 走 stdio，所以直接用 SSH 把命令跑在对端即可。以 Windows 上 Git 自带的 `ssh.exe` 为例：
 
@@ -369,10 +365,10 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
 
 这四个选项**都不是可有可无的**，缺任何一个的表现都是"客户端显示已连接后立刻断开"，见下方经验教训。改配置前先手动跑一次 `ssh -T -p <端口> <用户>@<主机> "whoami"` 确认链路本身通。
 
-**日志**：server 启动/就绪/退出以及每次工具调用（入参、耗时、异常堆栈）都会写入 `data/mcp_server.log`（不经过 stdout/stderr，不会污染 stdio 协议流）。排查"客户端显示已连接却立刻断开"一类问题时先看这个文件：
+**日志**：server 启动/就绪/退出以及每次工具调用（入参、耗时、异常堆栈）都会写入 `<DB_PATH 所在目录>/mcp_server.log`（不经过 stdout/stderr，不会污染 stdio 协议流）。排查"客户端显示已连接却立刻断开"一类问题时先看这个文件：
 
 ```bash
-tail -f /home/dudu/GoogleDrive/Antigravity/literature_analyzer/data/mcp_server.log
+tail -f "$(dirname "$DB_PATH")/mcp_server.log"
 ```
 
 如果连"MCP server 启动中"这条都没出现，说明进程根本没跑起来（传输层/SSH 问题，而非 server 代码本身）；如果启动日志有但没有任何工具调用记录，说明客户端连上后没有发起过请求。

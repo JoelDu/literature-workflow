@@ -48,8 +48,14 @@ def make_deepseek_client(deepseek_api_key: str = None, quiet: bool = False):
         if not quiet:
             print(f"[LLM Router] 正在使用 硅基流动 (SiliconFlow) {model} 进行无损文献分析。")
     else:
+        api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "未配置可用的 LLM：请设置 SILICONFLOW_API_KEY + SILICONFLOW_API_BASE，"
+                "或设置 DEEPSEEK_API_KEY"
+            )
         client = OpenAI(
-            api_key=deepseek_api_key or os.getenv("DEEPSEEK_API_KEY", ""),
+            api_key=api_key,
             base_url=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"),
             timeout=180,
         )
@@ -60,9 +66,11 @@ def make_deepseek_client(deepseek_api_key: str = None, quiet: bool = False):
 
 
 class LLMRouter:
-    def __init__(self, deepseek_api_key: str, gemini_api_key: str):
+    def __init__(self, deepseek_api_key: str = "", gemini_api_key: str = ""):
         self.deepseek_client, self.deepseek_model = make_deepseek_client(deepseek_api_key)
-        self.gemini_client = genai.Client(api_key=gemini_api_key)
+        # 新任务统一走 DeepSeek 兼容接口。仅在显式提供旧 Gemini Key 时构造客户端，
+        # 以便仍能拉取数据库里遗留的 Gemini Batch 任务。
+        self.gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 
         self.system_prompt = """\
 你是一个极其专业、细致的学术论文分析助手。请阅读以下由 PDF 转换而来的 Markdown 格式的论文内容，提取并总结出结构化信息。

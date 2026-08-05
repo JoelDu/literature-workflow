@@ -321,9 +321,10 @@ def epub_asset_relpath(src: str, mineru_output_dir: str) -> str:
     """
     absimg = os.path.abspath(src)
     try:
-        return os.path.relpath(absimg, os.path.abspath(mineru_output_dir))
+        # 返回值会持久化到数据库并写进 Markdown，必须与宿主机路径风格解耦。
+        return os.path.relpath(absimg, os.path.abspath(mineru_output_dir)).replace("\\", "/")
     except ValueError:
-        return src
+        return src.replace("\\", "/")
 
 
 def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = True) -> str:

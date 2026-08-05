@@ -11,6 +11,8 @@ class MinerUClient:
     def __init__(self, api_keys: str):
         # 支持逗号分隔的多个 key
         self.api_keys = [k.strip() for k in api_keys.split(",") if k.strip()]
+        if not self.api_keys:
+            raise ValueError("MINERU_API_KEY 未配置；解析 PDF/教材前请在环境中提供有效 Key")
         # 优先使用第二个 key (索引为 1) 进行文献处理，第一个 key 作为后备保障
         self.current_key_idx = 1 if len(self.api_keys) > 1 else 0
         self.base_url = "https://mineru.net/api/v4"

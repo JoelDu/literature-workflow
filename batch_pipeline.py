@@ -33,7 +33,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
 from db_schema import ensure_papers_table
-from utils import init_dirs, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event, MIN_MARKDOWN_CHARS
+from utils import init_dirs, build_note_metadata, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 配置获取 ──────────────────────────────────────────────────────────────────
 settings = get_settings()
@@ -402,6 +402,8 @@ def _submit_gemini_batch(requests: list, llm_router: LLMRouter, c, conn) -> tupl
             
     try:
         gm_client = llm_router.gemini_client
+        if gm_client is None:
+            raise ValueError("拉取或提交历史 Gemini Batch 任务需要配置 GEMINI_API_KEY")
         
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
         def do_submit():
@@ -611,6 +613,8 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
 
 def _fetch_gemini_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
     gm_client = llm_router.gemini_client
+    if gm_client is None:
+        raise ValueError("拉取历史 Gemini Batch 任务需要配置 GEMINI_API_KEY")
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def do_fetch_status():
@@ -705,7 +709,7 @@ def _export_completed(c, conn) -> int:
     # 限制单次导出最多 BATCH_SIZE_LIMIT 篇以平抑速率，按文献唯一ID进行 Excel 导出及防重写。
     """
     c.execute(
-        f"SELECT id, title, pdf_path, language, images_dir, result_json, batch_provider, batch_job_id FROM papers WHERE status=? LIMIT {settings.BATCH_SIZE_LIMIT}",
+        f"SELECT id, title, pdf_path, language, images_dir, result_json, batch_provider, batch_job_id, mineru_md FROM papers WHERE status=? LIMIT {settings.BATCH_SIZE_LIMIT}",
         (STATUS_COMPLETED,),
     )
     completed = c.fetchall()
@@ -714,7 +718,7 @@ def _export_completed(c, conn) -> int:
         return 0
 
     excel_rows = []
-    for doc_id, title, pdf_path, lang, images_dir, result_json, provider, job_id in completed:
+    for doc_id, title, pdf_path, lang, images_dir, result_json, provider, job_id, md_text in completed:
         try:
             analysis = json.loads(result_json)
         except (json.JSONDecodeError, TypeError):
@@ -727,7 +731,8 @@ def _export_completed(c, conn) -> int:
         images = [os.path.abspath(img) for img in images]
 
         # 导出 Obsidian，携带 doc_id 以确保生成带哈希的安全跨平台相对附件笔记
-        note_path = generate_obsidian_note({"title": title, "language": lang}, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
+        note_meta = build_note_metadata(title, md_text or "", lang)
+        note_path = generate_obsidian_note(note_meta, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
         note_filename = os.path.basename(note_path)
         obsidian_link_name = os.path.splitext(note_filename)[0]
 

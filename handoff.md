@@ -118,7 +118,7 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
 *   `litreview/`：综述生成器核心包——**`doctype.py`（8 类文献类型词表，唯一真相源，加类型只改它）**、`chunker.py`（分块）、`embedder.py`（Qwen3 向量化）、`reranker.py`（重排序）、`stages.py`（检索→打分→写作流程编排，含 `format_reference` 按类型分支著录）、`enrich.py`（结构化元数据提取）、`patent.py`（专利识别，只产出事实、不猜法律状态）、`figures.py`（自动插图）、`bookintake.py`（教材入库，PDF 拆分/EPUB 转换/定时调度）、`models.py`/`store.py`（SQLite 数据模型与读写）、`prompts.py`（各阶段提示词）。
 *   `mcp_server.py` + `mcp_server.sh`：MCP 协议 server，把检索/综述能力暴露给 Claude Code 等客户端。
 *   `mineru_client.py`：MinerU V4 API 客户端。已配置轮询重试、自动 Key 轮换及 ZIP 附件解压提取（Markdown、Images、DOCX、HTML、LaTeX 全格式取回）。
-*   `llm_router.py`：大模型客户端封装。处理 DeepSeek（主力）与 Gemini 的 Batch 任务构建及系统提示词管理。
+*   `llm_router.py`：大模型客户端封装。新任务统一走 SiliconFlow/官方 DeepSeek 兼容接口；Gemini 客户端仅为历史 Batch 任务兼容而按需初始化。
 *   `caj_converter.py`：CAJ 到 PDF 的转码核心（`mutool` 检测 + `caj2pdf`/`reportlab` 兜底降级）。
 *   `utils.py`：工具类，数据库状态定义、Obsidian 渲染逻辑、Excel 导出逻辑、配置读取（`get_settings`）、日志路径（跟随 `DB_PATH` 所在数据盘，而非项目目录）。
 *   `cli.py`：运维 CLI（`status`/`history`/`doctor`/`reset --failed`）。
@@ -232,8 +232,9 @@ python review.py index / enrich / search / outline / generate  # 综述生成器
 ```bash
 claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_server.sh
 ```
-换机器部署时改 `mcp_server.sh` 里的三个路径（密钥文件、数据库路径、项目根目录）。
-⚠️ 该脚本目前仍**硬编码** `. /opt/docker_shared/api_keys.env`，没跟着去宿主机化一起改成 `${SHARED_ENV_FILE}`。别人的机器上没这个文件，`set -a` 下 source 失败会让脚本直接退出、MCP 起不来。发包前要修。
+`mcp_server.sh` 自动以脚本所在目录为项目根目录并读取同目录 `.env`，无需手改路径。
+集中密钥文件、专用解释器和代理清理分别通过 `MCP_ENV_FILE`、`MCP_PYTHON`、
+`MCP_UNSET_PROXY=true` 覆盖；`DB_PATH` 与 `REVIEW_OUTPUT_DIR` 仍可直接指向生产数据盘。
 
 **远程（别的设备连回这台机器的库）**：走反向 SSH 隧道，不是 frp。
 ```text
@@ -296,12 +297,11 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
 1. **真实主题的端到端 `generate` 验收**——一直没用真实文献（而非造的假数据）完整跑过一遍，GB 格式引用和排版在真实数据上的表现仍未检验。这是最老的一条欠账。
 2. **Web UI（Phase 2）**——目前所有操作都是 CLI + MCP，"别人上传文件夹就能用"这个产品目标卡在这里。
 3. **打包分发（Phase 3）**，以及**尚未选定 LICENSE**（分发前必须定）。
-4. **`mcp_server.sh` 没跟着去宿主机化**：仍硬编码 `/opt/docker_shared/api_keys.env` 和三条绝对路径，别人的机器上直接跑不起来。
-5. **`obsidian_template.md` 还是"论文形状"，没跟上 8 类类型**（类型扩展后暴露出来的，实测生产库里 **15 篇标准/专利的笔记都被打成 `#paper` 标签、"期刊/会议"一栏写着"未提取"**）。根因是 `utils.generate_obsidian_note` 压根没把 `doc_type` 传进模板——渲染发生在导出阶段，那时 `enrich` 还没跑、类型还没定，所以不是改模板就能了事：要么把类型判定提前，要么在 `enrich` 认出类型后回头改写笔记的 frontmatter。**注意教材不生成笔记**，所以这事只影响专利/标准/以后 `set-type` 指定的报告等。参考文献著录（`stages.format_reference`）不受影响，那条链路是对的。
-6. **元数据补缺可以少烧一半 token**：现在 176/178 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
-7. **没有删除文献的命令**：见上方 §6 的删除清单，目前只能手写脚本按顺序清 6 张表 + 证据缓存 + 三处文件 + Excel，漏一处留孤儿。应做成 `review.py rm <文献> [--keep-source]`，复用 `resolve_docs()` 的解析逻辑，默认 dry-run。
-8. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
-9. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
-10. **Excel 220 行 > DB 178 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
-11. **专利法律状态目前全靠人工**：`patent.py` 只产出 PDF 上的事实，驳回/失效/无效这些得自己去国家知识产权局或 Google Patents 查了再 `--set` 录进来。将来若要自动同步，得接 CNIPA 或 Google Patents 的数据源，并保留 `status_checked_at` 语义（自动同步同样会过期）。
-12. **`review_index_meta` 有 2 行对不上块**：`a562003908bf`、`a93f17408bbb` 有 meta 行却零个 `review_chunks`（与本次删除无关，删除前的备份里同样如此），原因未查。表现是 `library_status` 报的"已索引篇数"比实际能检索到的多 2。
+4. **Obsidian 对人工后改类型仍需回写**：自动可识别的专利/标准已经在导出前判型并使用正确标签；但报告、学位论文、会议资料等只能在入库后 `set-type`，已有笔记不会随数据库类型自动重写。后续可增加 `sync-notes` 命令统一回写。
+5. **元数据补缺可以少烧一半 token**：现在 176/178 篇走了 LLM 补 `doi/authors/journal/year`，但其中 77 篇已经有 DOI——这些字段用 CrossRef 免费 API 查就是权威值，比 LLM 猜得准（可参考 JabRef 的 fetcher 思路，它是 MIT 协议）。
+6. **没有删除文献的命令**：见上方 §6 的删除清单，目前只能手写脚本按顺序清 6 张表 + 证据缓存 + 三处文件 + Excel，漏一处留孤儿。应做成 `review.py rm <文献> [--keep-source]`，复用 `resolve_docs()` 的解析逻辑，默认 dry-run。
+7. **夜间嵌入慢**：实测 250–300 秒/块，一本 500 块的大部头要连跑 3–4 晚。是本地 CPU bf16 推理的固有速度，除非上 GPU 或改用更小的嵌入模型。
+8. **容器以 root 运行**，产出文件属主是 root；镜像比需要的大约 400MB（Debian 的 `pandoc` 拖了 49 个包）。
+9. **Excel 220 行 > DB 178 篇**，两边对不上，原因未查（Excel 是只增不减地追加，可能含已重置/删除的历史行）。
+10. **专利法律状态目前全靠人工**：`patent.py` 只产出 PDF 上的事实，驳回/失效/无效这些得自己去国家知识产权局或 Google Patents 查了再 `--set` 录进来。将来若要自动同步，得接 CNIPA 或 Google Patents 的数据源，并保留 `status_checked_at` 语义（自动同步同样会过期）。
+11. **`review_index_meta` 有 2 行对不上块**：`a562003908bf`、`a93f17408bbb` 有 meta 行却零个 `review_chunks`（与本次删除无关，删除前的备份里同样如此），原因未查。表现是 `library_status` 报的"已索引篇数"比实际能检索到的多 2。
