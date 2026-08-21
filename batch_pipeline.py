@@ -21,7 +21,7 @@ def _safe_move_hijack(src, dst, **kwargs):
 import shutil
 shutil.move = _safe_move_hijack
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -32,7 +32,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
-from db_schema import ensure_papers_table
+from db_schema import ensure_papers_table, ensure_llm_quota_tables
+from litreview.token_budget import request_reserved_tokens, usage_totals
 from utils import init_dirs, build_note_metadata, generate_obsidian_note, export_to_excel, extract_key_sections, get_settings, calculate_pdf_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 配置获取 ──────────────────────────────────────────────────────────────────
@@ -70,6 +71,7 @@ def init_db() -> sqlite3.Connection:
         on_upgrade=lambda col: console.print(f"[yellow]⚠️ 数据库结构升级：已添加 {col} 列。"),
         on_error=lambda col, e: console.print(f"[red]数据库结构升级失败: {e}"),
     )
+    ensure_llm_quota_tables(conn)
     conn.commit()
     return conn
 
@@ -103,7 +105,7 @@ def prepare_batch() -> dict:
     )
 
     mineru_client = MinerUClient(settings.MINERU_API_KEY)
-    llm_router = LLMRouter(settings.DEEPSEEK_API_KEY, settings.GEMINI_API_KEY)
+    llm_router = LLMRouter()
 
     deepseek_requests = []
     gemini_requests = []
@@ -141,26 +143,17 @@ def prepare_batch() -> dict:
         if row:
             status, mineru_md, lang = row
             if status in SKIP_STATUSES:
+                # 若已入库（COMPLETED/EXPORTED）但仍留在输入目录，自动移动到归档目录防止堆积
+                new_pdf_path = os.path.join(settings.PROCESSED_PDF_DIR, os.path.basename(pdf_path))
+                if os.path.exists(pdf_path) and os.path.abspath(pdf_path) != os.path.abspath(new_pdf_path):
+                    shutil.move(pdf_path, new_pdf_path)
+                    c.execute("UPDATE papers SET pdf_path=? WHERE id=?", (new_pdf_path, doc_id))
+                    conn.commit()
                 continue
             # 优化：如果已经在数据库中存在解析完的 MD 文本，说明之前解析过但提交失败了，
             # 可以直接重用解析结果，不需要重复跑 MinerU
             if mineru_md and status in RESUBMITTABLE_STATUSES:
-                truncated = extract_key_sections(mineru_md)
-                # 根据语言直接构建大模型请求
-                # 统一使用 DeepSeek V3 处理中英文 (Gemini Key 目前已暂停)
-                deepseek_requests.append({
-                    "custom_id": doc_id,
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": llm_router.deepseek_model,
-                        "messages": [
-                            {"role": "system", "content": llm_router.system_prompt},
-                            {"role": "user", "content": f"请分析以下论文内容：\n\n{truncated}"},
-                        ],
-                        "response_format": {"type": "json_object"},
-                    },
-                })
+                deepseek_requests.append(llm_router.build_request(doc_id, mineru_md))
                 # 将 PDF 移动到归档，防重复扫描
                 new_pdf_path = os.path.join(settings.PROCESSED_PDF_DIR, os.path.basename(pdf_path))
                 if os.path.exists(pdf_path):
@@ -213,7 +206,6 @@ def prepare_batch() -> dict:
                         shutil.copy(docx_path, os.path.join(docx_dir, f"{title}.docx"))
 
                     lang = llm_router.detect_language(md_text)
-                    truncated = extract_key_sections(md_text)
 
                     # 提交前直接移动到归档路径，确保 DB 中的路径绝对不会挂空
                     new_pdf_path = os.path.join(settings.PROCESSED_PDF_DIR, filename)
@@ -228,21 +220,7 @@ def prepare_batch() -> dict:
                     conn.commit()
                     log_run_event(mode="batch", event="paper_parsed", title=title, doc_id=doc_id, status="success")
 
-                    # 按语言路由将哈希 doc_id 作为 API 端 custom_id
-                    # 统一使用 DeepSeek V3 处理中英文 (Gemini Key 目前已暂停)
-                    deepseek_requests.append({
-                        "custom_id": doc_id,
-                        "method": "POST",
-                        "url": "/v1/chat/completions",
-                        "body": {
-                            "model": llm_router.deepseek_model,
-                            "messages": [
-                                {"role": "system", "content": llm_router.system_prompt},
-                                {"role": "user", "content": f"请分析以下论文内容：\n\n{truncated}"},
-                            ],
-                            "response_format": {"type": "json_object"},
-                        },
-                    })
+                    deepseek_requests.append(llm_router.build_request(doc_id, md_text))
 
                 except Exception as e:
                     import requests
@@ -280,21 +258,7 @@ def prepare_batch() -> dict:
         if not mineru_md:
             continue
             
-        truncated = extract_key_sections(mineru_md)
-        # 统一使用 DeepSeek V3 处理中英文 (Gemini Key 目前已暂停)
-        deepseek_requests.append({
-            "custom_id": doc_id,
-            "method": "POST",
-            "url": "/v1/chat/completions",
-            "body": {
-                "model": llm_router.deepseek_model,
-                "messages": [
-                    {"role": "system", "content": llm_router.system_prompt},
-                    {"role": "user", "content": f"请分析以下论文内容：\n\n{truncated}"},
-                ],
-                "response_format": {"type": "json_object"},
-            },
-        })
+        deepseek_requests.append(llm_router.build_request(doc_id, mineru_md))
         added_from_db += 1
         
     if added_from_db > 0:
@@ -310,7 +274,7 @@ def prepare_batch() -> dict:
             if cid not in seen_custom_ids:
                 seen_custom_ids.add(cid)
                 deduped_deepseek_requests.append(req)
-        sub_cnt, fail_cnt = _submit_deepseek_batch(deduped_deepseek_requests, llm_router, c, conn)
+        sub_cnt, fail_cnt = _submit_openai_batches(deduped_deepseek_requests, llm_router, c, conn)
         report["submitted"] += sub_cnt
         report["submit_failed"] += fail_cnt
 
@@ -324,27 +288,72 @@ def prepare_batch() -> dict:
     return report
 
 
-def _submit_deepseek_batch(requests: list, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
-    console.print(f"[green]提交 {len(requests)} 个任务到 DeepSeek Batch API...")
-    ds_file = "deepseek_batch.jsonl"
+def _utc_date() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _quota_available(c) -> int:
+    today = _utc_date()
+    now = datetime.now(timezone.utc).isoformat()
+    # 与同步的元数据/证据调用共用同一模型账本。否则两条路径各自跑满 200 万，
+    # 实际会超过 gpt-5.4-mini 的项目日上限。
+    c.execute("INSERT OR IGNORE INTO llm_usage_model_daily (utc_date, model, updated_at) VALUES (?, ?, ?)",
+              (today, settings.ANALYSIS_MODEL, now))
+    c.execute("SELECT reserved_tokens, actual_total_tokens FROM llm_usage_model_daily WHERE utc_date=? AND model=?",
+              (today, settings.ANALYSIS_MODEL))
+    reserved, actual = c.fetchone()
+    return max(0, settings.LLM_DAILY_TOKEN_CAP - reserved - actual)
+
+
+def _split_for_quota(requests: list, available: int) -> list[list]:
+    """按 600k/当日剩余额度切组；一篇超出单批预算时不提交。"""
+    batches, current, current_tokens = [], [], 0
+    limit = min(settings.LLM_BATCH_TOKEN_CAP, available)
+    for request in requests:
+        reserved = request_reserved_tokens(request)
+        if reserved > settings.LLM_BATCH_TOKEN_CAP:
+            console.print(f"[red]跳过 {request['custom_id'][:8]}：单篇预估 {reserved} token 超过单批上限。")
+            continue
+        if current and current_tokens + reserved > limit:
+            batches.append(current)
+            available -= current_tokens
+            current, current_tokens, limit = [], 0, min(settings.LLM_BATCH_TOKEN_CAP, available)
+        if reserved <= limit:
+            current.append(request)
+            current_tokens += reserved
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _submit_openai_batches(requests: list, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
+    available = _quota_available(c)
+    batches = _split_for_quota(requests, available)
+    if not batches:
+        console.print(f"[yellow]UTC {_utc_date()} 可用生成额度不足；等待下一次 UTC 00:00 重置。")
+        return 0, 0
+    # 每次只提交一个批次：必须等取回真实 usage 后才允许递推下一批。
+    return _submit_openai_batch(batches[0], llm_router, c, conn)
+
+
+def _submit_openai_batch(requests: list, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
+    reserved_tokens = sum(request_reserved_tokens(r) for r in requests)
+    console.print(f"[green]提交 {len(requests)} 个任务到 OpenAI Batch（预留 {reserved_tokens} token）...")
+    ds_file = "openai_batch.jsonl"
     with open(ds_file, "w", encoding="utf-8") as f:
         for r in requests:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             
     try:
-        ds_client = llm_router.deepseek_client
+        ds_client = llm_router.openai_client
         
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
         def do_submit():
             with open(ds_file, "rb") as fh:
                 file_obj = ds_client.files.create(file=fh, purpose="batch")
             
-            # Extract file ID - SiliconFlow API wraps file ID in 'data' attribute of FileObject
             file_id = getattr(file_obj, "id", None)
-            if not file_id and hasattr(file_obj, "data") and isinstance(file_obj.data, dict):
-                file_id = file_obj.data.get("id")
             if not file_id:
-                console.print(f"[yellow]无法直接获取 file_obj.id, file_obj: {file_obj}")
                 raise ValueError(f"无法从 FileObject 提取 file_id: {file_obj}")
                 
             return ds_client.batches.create(
@@ -355,20 +364,28 @@ def _submit_deepseek_batch(requests: list, llm_router: LLMRouter, c, conn) -> tu
             
         batch_job = do_submit()
         batch_id = getattr(batch_job, "id", None)
-        if not batch_id and hasattr(batch_job, "data") and isinstance(batch_job.data, dict):
-            batch_id = batch_job.data.get("id")
         if not batch_id:
-            console.print(f"[yellow]无法直接获取 batch_job.id, batch_job: {batch_job}")
             raise ValueError(f"无法从 Batch 提取 batch_id: {batch_job}")
-        console.print(f"[bold green]DeepSeek Batch 提交成功！ID: {batch_id}")
+        now = datetime.now(timezone.utc).isoformat()
+        utc_date = _utc_date()
+        c.execute("INSERT INTO llm_batches (batch_id, model, utc_date, reserved_tokens, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'submitted', ?, ?)",
+                  (batch_id, llm_router.openai_model, utc_date, reserved_tokens, now, now))
+        c.execute("INSERT OR IGNORE INTO llm_usage_daily (utc_date, updated_at) VALUES (?, ?)", (utc_date, now))
+        c.execute("INSERT OR IGNORE INTO llm_usage_model_daily (utc_date, model, updated_at) VALUES (?, ?, ?)",
+                  (utc_date, llm_router.openai_model, now))
+        c.execute("UPDATE llm_usage_daily SET reserved_tokens=reserved_tokens+?, submitted_batches=submitted_batches+1, updated_at=? WHERE utc_date=?",
+                  (reserved_tokens, now, utc_date))
+        c.execute("UPDATE llm_usage_model_daily SET reserved_tokens=reserved_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
+                  (reserved_tokens, now, utc_date, llm_router.openai_model))
+        console.print(f"[bold green]OpenAI Batch 提交成功！ID: {batch_id}")
         
         for req in requests:
             c.execute(
-                "UPDATE papers SET status=?, batch_provider='deepseek', batch_job_id=?, error_message=NULL WHERE id=?",
+                "UPDATE papers SET status=?, batch_provider='openai', batch_job_id=?, error_message=NULL WHERE id=?",
                 (STATUS_SUBMITTED, batch_id, req["custom_id"]),
             )
         conn.commit()
-        log_run_event(mode="batch", event="batch_submitted", status="success", extra={"batch_id": batch_id, "provider": "deepseek", "count": len(requests)})
+        log_run_event(mode="batch", event="batch_submitted", status="success", extra={"batch_id": batch_id, "provider": "openai", "model": llm_router.openai_model, "count": len(requests), "reserved_tokens": reserved_tokens})
         
         # 成功后移除临时 jsonl
         if os.path.exists(ds_file):
@@ -376,7 +393,7 @@ def _submit_deepseek_batch(requests: list, llm_router: LLMRouter, c, conn) -> tu
         return len(requests), 0
         
     except Exception as e:
-        err_msg = f"DeepSeek Batch 提交失败: {str(e)}"
+        err_msg = f"OpenAI Batch 提交失败: {str(e)}"
         console.print(f"[bold red]{err_msg}")
         
         # 将本轮队列中的文献在 DB 中全部标为 SUBMIT_FAILED 并保存错误原因以防卡死
@@ -386,7 +403,7 @@ def _submit_deepseek_batch(requests: list, llm_router: LLMRouter, c, conn) -> tu
                 (STATUS_SUBMIT_FAILED, err_msg, req["custom_id"]),
             )
         conn.commit()
-        log_run_event(mode="batch", event="batch_submitted", status="failed", error=err_msg, extra={"provider": "deepseek", "count": len(requests)})
+        log_run_event(mode="batch", event="batch_submitted", status="failed", error=err_msg, extra={"provider": "openai", "count": len(requests)})
         
         if os.path.exists(ds_file):
             os.remove(ds_file)
@@ -460,7 +477,7 @@ def fetch_batch() -> dict:
     
     conn = init_db()
     c = conn.cursor()
-    llm_router = LLMRouter(settings.DEEPSEEK_API_KEY, settings.GEMINI_API_KEY)
+    llm_router = LLMRouter()
 
     c.execute("SELECT DISTINCT batch_job_id, batch_provider FROM papers WHERE status=?", (STATUS_SUBMITTED,))
     jobs = c.fetchall()
@@ -472,8 +489,11 @@ def fetch_batch() -> dict:
         for job_id, provider in jobs:
             console.print(f"检查 {provider} 任务: {job_id}")
             try:
-                if provider == "deepseek":
-                    comp_cnt, fail_cnt = _fetch_deepseek_results(job_id, llm_router, c, conn)
+                if provider == "openai":
+                    comp_cnt, fail_cnt = _fetch_openai_results(job_id, llm_router, c, conn)
+                elif provider == "deepseek":  # 仅拉取迁移前已提交任务，不会创建新任务
+                    from llm_router import make_legacy_siliconflow_client
+                    comp_cnt, fail_cnt = _fetch_deepseek_results(job_id, make_legacy_siliconflow_client(), c, conn)
                 elif provider == "gemini":
                     comp_cnt, fail_cnt = _fetch_gemini_results(job_id, llm_router, c, conn)
                 else:
@@ -506,6 +526,35 @@ def _mark_batch_failed(job_id: str, err_msg: str, c, conn) -> int:
     return len(rows)
 
 
+def _record_batch_usage(job_id: str, usage, c, conn, status: str) -> None:
+    """幂等落真实 usage；total_tokens 含输出/推理消耗时以它为唯一额度依据。"""
+    ensure_llm_quota_tables(conn)
+    c.execute("SELECT utc_date, model, reserved_tokens, usage_recorded FROM llm_batches WHERE batch_id=?", (job_id,))
+    batch = c.fetchone()
+    if not batch or batch[3]:
+        return
+    utc_date, model, reserved, _ = batch
+    inp, out, reasoning, total = usage_totals(usage)
+    now = datetime.now(timezone.utc).isoformat()
+    # 预留只用于防止并发超额。真实 usage 到账后释放预留并累计实际 total。
+    c.execute("UPDATE llm_usage_daily SET reserved_tokens=MAX(0, reserved_tokens-?), actual_input_tokens=actual_input_tokens+?, actual_output_tokens=actual_output_tokens+?, actual_reasoning_tokens=actual_reasoning_tokens+?, actual_total_tokens=actual_total_tokens+?, completed_batches=completed_batches+?, failed_batches=failed_batches+?, updated_at=? WHERE utc_date=?",
+              (reserved, inp, out, reasoning, total, int(status != 'failed'), int(status == 'failed'), now, utc_date))
+    c.execute("UPDATE llm_usage_model_daily SET reserved_tokens=MAX(0, reserved_tokens-?), actual_input_tokens=actual_input_tokens+?, actual_output_tokens=actual_output_tokens+?, actual_reasoning_tokens=actual_reasoning_tokens+?, actual_total_tokens=actual_total_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
+              (reserved, inp, out, reasoning, total, now, utc_date, model))
+    c.execute("UPDATE llm_batches SET actual_tokens=?, status=?, usage_recorded=1, updated_at=? WHERE batch_id=?",
+              (total, status, now, job_id))
+    conn.commit()
+
+
+def _record_batch_unknown_failure(job_id: str, c, conn) -> None:
+    """云端失败但拿不到 usage：保留预留，宁可少跑也绝不超出当日额度。"""
+    ensure_llm_quota_tables(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    c.execute("UPDATE llm_batches SET status='failed_unknown_usage', updated_at=? WHERE batch_id=? AND usage_recorded=0", (now, job_id))
+    c.execute("UPDATE llm_usage_daily SET failed_batches=failed_batches+1, updated_at=? WHERE utc_date=(SELECT utc_date FROM llm_batches WHERE batch_id=?)", (now, job_id))
+    conn.commit()
+
+
 def _read_batch_file(file_ref: str, client) -> str:
     """读取 Batch 的输出/错误文件。
 
@@ -520,8 +569,61 @@ def _read_batch_file(file_ref: str, client) -> str:
     return client.files.content(file_ref).content.decode("utf-8")
 
 
-def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
-    ds_client = llm_router.deepseek_client
+def _batch_request_count(status, name: str):
+    """读取 SDK 对象或原始 dict 中的 Batch request_counts 字段。"""
+    counts = getattr(status, "request_counts", None)
+    if counts is None and hasattr(status, "data") and isinstance(status.data, dict):
+        counts = status.data.get("request_counts")
+    value = getattr(counts, name, None)
+    if value is None and isinstance(counts, dict):
+        value = counts.get(name)
+    return value
+
+
+def _mark_failed_batch_lines(job_id: str, error_content: str, c, conn,
+                             fallback_count: int = 0) -> int:
+    """把错误文件中的单条请求闭环，返回本次标记的篇数。
+
+    SiliconFlow 的 Batch 允许一个任务里同时存在成功和失败请求。错误文件格式在
+    不同兼容层上略有差异，但都会保留 custom_id；如果错误文件无法提供 custom_id，
+    用该 Batch 尚未完成的记录作为兜底，避免留下永久的 BATCH_SUBMITTED。
+    """
+    failed = {}
+    for line in error_content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        custom_id = raw.get("custom_id")
+        if not custom_id:
+            continue
+        detail = raw.get("error") or raw.get("response") or raw
+        failed[custom_id] = f"Batch 单条请求失败: {str(detail)[:500]}"
+
+    if failed:
+        rows = [(doc_id, msg) for doc_id, msg in failed.items()]
+    elif fallback_count:
+        c.execute("SELECT id FROM papers WHERE batch_job_id=? AND status=?",
+                  (job_id, STATUS_SUBMITTED))
+        rows = [(row[0], "Batch 单条请求失败（错误文件未返回 custom_id）")
+                for row in c.fetchall()[:fallback_count]]
+    else:
+        rows = []
+
+    updated = 0
+    for doc_id, msg in rows:
+        cursor = c.execute("UPDATE papers SET status=?, error_message=? "
+                           "WHERE id=? AND status=?",
+                           (STATUS_BATCH_FAILED, msg, doc_id, STATUS_SUBMITTED))
+        updated += cursor.rowcount
+    conn.commit()
+    return updated
+
+
+def _fetch_openai_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
+    ds_client = getattr(llm_router, "openai_client", None) or llm_router.deepseek_client
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def do_fetch_status():
@@ -532,7 +634,7 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
     if not status_val and hasattr(status, "data") and isinstance(status.data, dict):
         status_val = status.data.get("status")
         
-    console.print(f"  DeepSeek 云端状态: {status_val}")
+    console.print(f"  OpenAI 云端状态: {status_val}")
     
     # 云端成功：正常解析
     if status_val == "completed":
@@ -547,10 +649,7 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
             # 此前这里直接 raise，异常被外层的「未知崩溃」兜底吞掉，论文就永远停在
             # BATCH_SUBMITTED —— 而 BATCH_SUBMITTED 不在阶段 1 的自动拾起名单里，等于永久卡死，
             # 且每一轮拉取都要再查一遍这个死批次。改成走 BATCH_FAILED 才能被重新提交。
-            rc = getattr(status, "request_counts", None)
-            done = getattr(rc, "completed", None)
-            if done is None and isinstance(rc, dict):
-                done = rc.get("completed")
+            done = _batch_request_count(status, "completed")
             if done:
                 # 有成功条目却拿不到输出文件，那是另一回事，照旧抛出交给上层记录
                 raise ValueError(f"无法从 Batch 提取 output_file_id: {status}")
@@ -564,8 +663,9 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
                     detail = _read_batch_file(error_file_id, ds_client).strip()[:500]
                 except Exception as e:
                     detail = f"(错误文件拉取失败: {e})"
-            err_msg = f"DeepSeek Batch 全部请求失败，云端无输出文件。错误详情: {detail}"
+            err_msg = f"OpenAI Batch 全部请求失败，云端无输出文件。错误详情: {detail}"
             console.print(f"[bold red]  {err_msg}")
+            _record_batch_unknown_failure(job_id, c, conn)
             return 0, _mark_batch_failed(job_id, err_msg, c, conn)
 
         @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
@@ -582,7 +682,8 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
             try:
                 res = json.loads(line)
                 doc_id = res["custom_id"]
-                content = res["response"]["body"]["choices"][0]["message"]["content"]
+                body = res["response"]["body"]
+                content = body["choices"][0]["message"]["content"]
                 c.execute("UPDATE papers SET status=?, result_json=?, error_message=NULL WHERE id=?", (STATUS_COMPLETED, content, doc_id))
                 success_count += 1
             except Exception as e:
@@ -596,19 +697,58 @@ def _fetch_deepseek_results(job_id: str, llm_router: LLMRouter, c, conn) -> tupl
                     pass
                 console.print(f"[yellow]解析结果行失败: {e}")
                 fail_count += 1
+
+        # 有 output_file 并不代表整批成功：失败请求会单独进入 error_file。
+        # 若不处理这里，混合批次中的失败文献会永久停在 BATCH_SUBMITTED。
+        error_file_id = getattr(status, "error_file_id", None)
+        if not error_file_id and hasattr(status, "data") and isinstance(status.data, dict):
+            error_file_id = status.data.get("error_file_id")
+        if error_file_id:
+            try:
+                failed_content = _read_batch_file(error_file_id, ds_client)
+                failed_count = _mark_failed_batch_lines(
+                    job_id, failed_content, c, conn,
+                    fallback_count=_batch_request_count(status, "failed") or 0,
+                )
+                fail_count += failed_count
+            except Exception as e:
+                console.print(f"[yellow]读取 Batch 错误文件失败: {e}")
+        # Batch 输出 JSONL 每条都有 usage；汇总后一次性记入当天账本。
+        usages = []
+        for line in result_content.splitlines():
+            try:
+                raw = json.loads(line)
+                usages.append(raw.get("response", {}).get("body", {}).get("usage"))
+            except json.JSONDecodeError:
+                pass
+        input_tokens = output_tokens = reasoning_tokens = total_tokens = 0
+        for usage in usages:
+            i, o, r, t = usage_totals(usage)
+            input_tokens += i; output_tokens += o; reasoning_tokens += r; total_tokens += t
+        _record_batch_usage(job_id, {"prompt_tokens": input_tokens, "completion_tokens": output_tokens,
+                                     "total_tokens": total_tokens,
+                                     "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}}, c, conn, "completed")
         conn.commit()
-        console.print(f"[green]DeepSeek 结果拉取完毕，成功 {success_count} 篇，失败 {fail_count} 篇。")
-        log_run_event(mode="batch", event="batch_fetched", status="success", extra={"batch_id": job_id, "provider": "deepseek", "completed": success_count, "failed": fail_count})
+        console.print(f"[green]OpenAI 结果拉取完毕，成功 {success_count} 篇，失败 {fail_count} 篇，实际 {total_tokens} token。")
+        log_run_event(mode="batch", event="batch_fetched", status="success", extra={"batch_id": job_id, "provider": "openai", "completed": success_count, "failed": fail_count, "actual_tokens": total_tokens})
         return success_count, fail_count
         
     # 云端失败：更新整个 Batch 涉及的所有论文为 BATCH_FAILED 状态以闭环
     elif status_val in ("failed", "cancelled", "expired"):
-        err_msg = f"DeepSeek 任务在云端夭折，返回状态: {status_val}"
+        err_msg = f"OpenAI 任务在云端夭折，返回状态: {status_val}"
         console.print(f"[bold red]  {err_msg}")
+        _record_batch_unknown_failure(job_id, c, conn)
         return 0, _mark_batch_failed(job_id, err_msg, c, conn)
         
     # 其余 pending/processing 状态保持不变
     return 0, 0
+
+
+def _fetch_deepseek_results(job_id: str, client, c, conn) -> tuple[int, int]:
+    """迁移前的 SiliconFlow Batch 兼容拉取入口；不计入 GPT 配额账本。"""
+    class _LegacyRouter:
+        deepseek_client = getattr(client, "deepseek_client", client)
+    return _fetch_openai_results(job_id, _LegacyRouter(), c, conn)
 
 
 def _fetch_gemini_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
@@ -770,20 +910,21 @@ def _export_completed(c, conn) -> int:
         export_to_excel(excel_rows, settings.EXCEL_OUTPUT_PATH)
         console.print(f"[bold green]共导出 {len(excel_rows)} 篇文献到 {settings.EXCEL_OUTPUT_PATH}")
 
-        # 导出后自动增量更新综述向量索引与结构化元数据（异常隔离：失败绝不影响导出结果）
+        # 导出后自动立即增量更新综述 4096 维 Qwen3 向量索引与结构化元数据（即时处理，无需夜间等待）
         if settings.REVIEW_AUTO_INDEX:
             try:
-                from llm_router import make_deepseek_client
                 from litreview.indexer import build_index
-                client, _ = make_deepseek_client(quiet=True)
-                build_index(settings, console, client)
+                exported_ids = [r["文献ID"] for r in excel_rows]
+                build_index(settings=settings, console=console, doc_ids=exported_ids)
             except Exception as e:
-                console.print(f"[yellow]⚠️ 综述索引自动更新失败（不影响导出，可手动运行 review.py index）: {e}")
+                console.print(f"[yellow]⚠️ 综述向量索引自动更新失败（不影响导出，可手动重试）: {e}")
             try:
+                from llm_router import make_openai_client
                 from litreview.enrich import run_enrich
-                run_enrich(settings, console, client, use_llm=settings.REVIEW_ENRICH_LLM)
+                llm_client, _ = make_openai_client(quiet=True)
+                run_enrich(settings, console, llm_client, use_llm=settings.REVIEW_ENRICH_LLM)
             except Exception as e:
-                console.print(f"[yellow]⚠️ 元数据自动提取失败（不影响导出，可手动运行 review.py enrich）: {e}")
+                console.print(f"[yellow]⚠️ 元数据自动提取失败（不影响导出，可手动重试）: {e}")
 
     return len(excel_rows)
 

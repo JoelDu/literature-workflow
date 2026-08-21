@@ -16,6 +16,10 @@ services:
       # 构建期要 git clone caj2pdf。作者机器上出网必须过宿主机回环代理，只能用 host；
       # 普通机器直连，用 default（Docker Desktop 不支持构建期 host 网络，别改默认值）。
       network: ${DOCKER_BUILD_NETWORK:-default}
+      args:
+        HTTP_PROXY: ${LIT_HTTP_PROXY:-${HTTP_PROXY:-}}
+        HTTPS_PROXY: ${LIT_HTTPS_PROXY:-${HTTPS_PROXY:-}}
+        NO_PROXY: ${NO_PROXY:-}
     # 同一台机器上要跑多套（比如「自己用」和「给别人用」各一份）时，容器名必须区分开，
     # 否则第二套起不来：Docker 的容器名全局唯一，冲突时直接报 name is already in use。
     # 换名字的同时记得改 DATA_ROOT，不然两套会共用同一个数据库和 vault，比冲突更糟。
@@ -48,17 +52,16 @@ services:
       #          只报待办不干活。本地 8B 嵌一篇论文约 24 分钟、占 15G 内存，只有大内存
       #          宿主机才配得起——2C2G 的云服务器上设 local 等于永远不建索引。
       - REVIEW_EMBED_BACKEND=${REVIEW_EMBED_BACKEND:-remote}
-      # 默认无代理（直连）。作者机器上 host 网络 + 宿主机回环代理，由 .env 覆盖。
-      #
-      # 变量名故意加 LIT_ 前缀，不能直接用 ${HTTP_PROXY:-}：compose 做变量替换时
-      # shell 环境的优先级高于 .env，而 HTTP_PROXY 恰恰是最容易被 export 的变量之一。
-      # 一旦用户 shell 里挂着代理，它会被悄悄注进容器；bridge 模式下 127.0.0.1 指的是
-      # 容器自己的回环，所有外部请求变成 connection refused，而配置文件上完全看不出来。
-      # ALL_PROXY 恒定置空：socks5 需要 httpx[socks]，镜像里没装，留着会让 openai 客户端初始化崩溃。
-      - HTTP_PROXY=${LIT_HTTP_PROXY:-}
-      - HTTPS_PROXY=${LIT_HTTPS_PROXY:-}
+      # 生成模型需要走代理。优先显式的 LIT_ 配置，否则继承宿主机的 HTTP/HTTPS 系统代理。
+      # 不传 ALL_PROXY：系统常同时设 SOCKS，它会优先于 HTTP(S) 代理且 SDK 未必有 socks 依赖。
+      # bridge 网络的代理地址必须是容器可访问的地址；宿主机回环代理请使用 host 网络或 host.docker.internal。
+      - HTTP_PROXY=${LIT_HTTP_PROXY:-${HTTP_PROXY:-}}
+      - HTTPS_PROXY=${LIT_HTTPS_PROXY:-${HTTPS_PROXY:-}}
       - ALL_PROXY=
       - WEBHOOK_URL=${WEBHOOK_URL:-}
+      # 共享密钥文件可能保留旧的 OpenAI key；生成模型必须以当前项目 .env 的值为准。
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
       # ── 以下全是容器内部路径，一律写死，故意不接受 .env 覆盖 ──
       # 必须与下面 volumes 的挂载点逐一对应。要换数据存放位置请改 DATA_ROOT，别改这里。
       #

@@ -14,7 +14,7 @@
 
 **两种运行模式**，由 `daemon.py` 常驻进程调度：
 - **实时模式**：每 10 分钟扫一次 `input_pdfs/`，来了新文件立刻处理
-- **批处理模式**：攒一批走 SiliconFlow 的 Batch API，成本打 5 折；按固定间隔轮询提交/拉结果（默认每 30 分钟提交、每 120 分钟拉取，`BATCH_SCAN_INTERVAL_MINUTES`/`BATCH_FETCH_INTERVAL_MINUTES` 可调），容器重启时还会做冷启动检测补跑
+- **批处理模式**：攒一批走 OpenAI `gpt-5.4-mini` Batch API；按固定间隔轮询提交/拉结果（默认每 30 分钟提交、每 120 分钟拉取，`BATCH_SCAN_INTERVAL_MINUTES`/`BATCH_FETCH_INTERVAL_MINUTES` 可调），容器重启时还会做冷启动检测补跑。按 UTC 日共用 200 万 token 账本、每批最多预留 60 万，拉到实际用量后才提交下一批。
 - **教材定时入库**：与上面两种模式互不干扰，固定每天 `BOOK_INTAKE_TIME`（默认 03:00）跑一次，按 `BOOK_DAILY_PAGE_BUDGET`（默认 2000 页）预算逐本处理 `BOOK_INPUT_DIR` 里的教材，用不完的页数留到下一晚，详见下方"教材/书籍入库"
 
 **生产级的细节打磨**（这些是踩过坑之后加的）：
@@ -29,7 +29,7 @@
 
 这是最近几轮迭代的重点，把"文献库"升级成了"能问能写"的检索增强生成系统。
 
-**检索链路**：文献分块 → Qwen3-Embedding-8B 向量化（4096 维，中英文跨语言检索能力强）→ 向量召回 50 个候选 → Qwen3-Reranker-8B 精排取 top 24 → 大模型逐条给证据打分（≥6 分才保留，避免拉不相关的内容进正文）→ 只依据筛选出的证据写作，并强制标注引用来源。
+**检索链路**：文献分块 → 硅基流动 Qwen3-Embedding-8B 向量化（4096 维，中英文跨语言检索能力强）→ Qwen3-Reranker-8B 精排保留每章 50 个候选 → `gpt-5.4-mini` 逐条给证据打分（≥6 分，最终最多 20 条）→ 固定 `gpt-5.4` 只依据筛选出的证据写作，并强制标注引用来源。
 
 **结构化元数据**：额外建了 `paper_details`（中英文标题/DOI/作者/期刊/年份/关键词，以及区分 8 种文献类型的 `doc_type`、专利的申请号/申请日/法律状态、标准的标准号/实施日期）、`paper_assets`（图表+图题+页码）、`paper_references`（每篇论文自己引用的参考文献逐条记录）三张表。提取策略是"免费优先"——先从 MinerU 产出的 `content_list.json` 本地解析（正则抓 DOI、按 block 类型取图表和参考文献），解析不出来的字段才调用大模型补，省了不少 token。
 
@@ -51,28 +51,64 @@
 
 **教材每日定时入库**：不用手动逐本跑 `add-book`——`daemon.py` 固定每天 `BOOK_INTAKE_TIME`（默认 03:00）扫一次 `BOOK_INPUT_DIR`，按文件名排序、PDF 累计页数不超过 `BOOK_DAILY_PAGE_BUDGET`（默认 2000）逐本入库，超预算的留到下一晚（排在最前的第一本例外，哪怕单本就超预算也会处理完，避免超大部头永远排不上）；EPUB 走 pandoc 不占用这个页数预算。成功入库后自动增量建索引（`REVIEW_AUTO_INDEX`）。想不等到凌晨立即跑一次，可执行 `python -c "import daemon; daemon.book_intake_job()"`。
 
-## 三、MCP Server：在对话里直接用
+## 三、MCP Server：在对话里直接用 (v3.1)
 
-`mcp_server.py` 把整个文献库检索和综述撰写能力包装成标准 MCP 协议 server，Claude Code / Claude Desktop / Cherry Studio 这些客户端配置一下就能在对话里直接调用，不用自己敲命令行。开放了 7 个工具：查库状态、语义检索（可按任一文献类型限定语料）、查单篇文献元数据（专利号、标准号也能查）、查专利/标准台账（`doc_status`）、生成大纲、后台起一篇综述（因为耗时 7-30 分钟，用的是"秒回 job_id + 轮询"的异步模式）、查生成进度。检索结果会带类型标签，调用方模型看到 `[标准 GB 38400-2019]` 才知道这段限量值出自强制性文件而非某篇论文的实验结论，两者的可引用分量完全不同。
+`mcp_server.py` 把整个文献库检索、引文图谱发现与高水平综述撰写能力包装成标准 MCP 协议 server，Claude Code / Claude Desktop / Cherry Studio / Antigravity 这些客户端配置一下就能在对话里直接调用。全量开放 **16 个工具**：
+- **文献库与审计**：`library_status`（馆藏指标）、`list_documents`（多维检索与过滤）、`library_reconcile`（四层数据对齐审计）、`get_paper_info`（单篇详情）、`doc_status`（法律/现行状态查阅）；
+- **前沿引文与滚雪球发现**：`get_citation_network`（图谱与局部子网）、`citation_expand`（OpenAlex 双轨滚雪球）、`list_discovery_candidates`（候选池管理）、`approve_candidates`（状态机审批）、`acquire_fulltext`（合法 OA PDF 暂存）、`ingest_acquired_candidates`（解析索引入库）；
+- **顶刊级综述引擎 (Thesis-Driven v3.1)**：
+  - `propose_review_angles`：**大纲前置人机对齐**，基于本地馆藏真实文献提炼 3 套顶刊级立论方案（Thesis + Research Gap + 6 类主线逻辑）；
+  - `generate_outline`：支持注入作者 Thesis 与 Research Gap 强约束，检索问题强制按【机理/工艺机制】+【量化参数/对照数据】+【现存缺陷/工业瓶颈】三元组输出，并执行 3 档字数动力学伸缩与文献门槛诊断；
+  - `start_review`：后台异步生成完整综述（秒回 job_id，单消费者 FIFO 调度），段落微观逻辑链推进、Markdown 横向对比矩阵表格与“一问一策”闭环展望；
+  - `review_status`：查询综述任务进度、心跳与章节检查点（支持跨重启持久化自愈）。
+- **生产级可靠性设计**：
+  - SQLite 默认启用 `WAL` 并发读写模式与 30s 超时；
+  - 增加 `@retry_on_db_locked(max_retries=5)` 指数退避重试装饰器；
+  - 启动自愈机制（Boot Self-Healing）：进程重启时自动将历史残留的 `running` 僵尸任务修复为 `interrupted`；
+  - 章节级检查点（Section Checkpointing）：每完成一章立即存入 `checkpoint_json` 并更新 `heartbeat_at`，单章节网络异常自动重试 3 次；
+  - 证据 Token 预算安全截断（上限 18,000 字符，彻底避免 400 Context Limit）；
+  - `@_logged_tool()` 防崩溃异常边界，确保 stdio JSON-RPC 管道永不断连。
 
-走 stdio 协议，所以除了本机直连，也能让别的设备通过 SSH 接进来共用同一个库（经一条反向隧道落到跑着文献库的那台机器上）。7 个工具对论文库全是**只读**的，唯一的写入是把生成的综述 md/docx 落盘。专利法律状态和标准现行状态尤其刻意只读——那是要对外负责的结论，不能让模型自己判断完就写进生产库，只能走 CLI 人工录入。
+
+## 四、Web UI 工作台与引文网络图谱 (v2.5)
+
+在 v2.5 中，系统实现了完整的浏览器端单页应用（SPA）工作台（已注册 systemd 7x24 常驻守护，全网卡监听 `0.0.0.0:8001`，局域网/Tailscale/本地均可秒开），让用户无需终端或 MCP 命令即可完成完整科研文献工作流：
+
+1. **概况看板 (Dashboard)**：
+   - **5 级严格互斥实体分区**：341 生产正常 + 3 生产隔离 + 3 测试入库 + 1 孤儿隔离 + 8766 外部占位 = 9114 Works（隔离总数精确为 4）。
+   - **能力指标**：真实 Qwen3-Embedding-8B 4096 维向量索引 Work（3 篇）。
+   - 外部候选生命周期漏斗与最近发现/审批审计流水卡片。
+2. **文献目录 (Library)**：
+   - 344 篇馆藏基线文献分页检索、多类型（论文/专著/专利/标准）与索引状态筛选；
+   - 详情抽屉展示中英文元数据、PDF 资产状态（大小/页数/SHA-256）、参考文献消歧明细表、出入向引用关系与共同参考文献同行。
+3. **引文网络图谱 (Network)**：
+   - 基于 **ECharts 5** 构建的力导向关系图，默认呈现 **9,110** 个可见节点与 **8,817** 条闭合边（`missing_endpoints = 0`，已排除 4 个隔离 Work）；
+   - 支持全局图谱与单篇文献局部子图切换、边类型动态过滤、节点缩放拖拽与详情卡片。
+4. **滚雪球发现 (Discovery)**：
+   - 种子文献多选，配置双向/深度/单轨上限/年份，异步触发 OpenAlex 发现；
+   - 双轨卡片展示 **Foundational 经典基石文献** 与 **Emerging 最新前沿文献**（附推荐理由与合法 OA 下载链接）。
+5. **候选池管理 (Candidates)**：
+   - 多维筛选候选池（355 篇：350 DISCOVERED / 1 APPROVED / 3 VECTOR_INDEXED / 1 QUARANTINED）；
+   - 批量审批确认弹窗与状态机硬约束拦截（非 DISCOVERED 状态禁止重复审批或状态倒退）。
+6. **入库流水线 (Pipeline)**：
+   - 针对已批准候选一键执行 `合法 OA 下载 ➔ PDF 验真 ➔ 正文解析 ➔ Qwen3 向量化 ➔ 图谱回填`，控制台实时日志滚动输出。
+7. **审计与日志 (Audit)**：
+   - Append-Only 审批决策审计表（`candidate_decisions`）、PDF 资产账本（`document_assets`）与发现批次记录。
 
 ## 技术栈小结
 
-Python 3.10+ / MinerU v4（PDF 多模态解析，强制 `vlm` 引擎）/ SiliconFlow 平台上的 DeepSeek-V3.1-Terminus（论文分析与综述写作，Batch API 打 5 折）+ Qwen3-Embedding-8B（4096 维向量化）+ Qwen3-Reranker-8B（精排）/ SQLite（状态、结构化元数据与向量，单文件）/ Jinja2（笔记与综述模板渲染）/ pandoc（Word 导出、EPUB 转换）/ FastMCP（MCP server）/ Docker + docker-compose（部署）。
-
-> 模型选型上有个硬约束：整个 SiliconFlow 账户里只有 DeepSeek V3 / V3.1-Terminus / R1 支持 Batch 推理，其余型号提交时直接报 `20088 not support batch inference`。而 V3 已于 2026-07-24 后全量返回 429、R1 是推理模型不适合结构化抽取——**Terminus 是目前唯一跑得通的选择**，换模型前务必先确认 Batch 支持。
+Python 3.10+ / MinerU v4（PDF 多模态解析，强制 `vlm` 引擎）/ OpenAI `gpt-5.4-mini`（论文分析、元数据、证据评分）/ OpenAI `gpt-5.4`（综述写作）/ SiliconFlow Qwen3-Embedding-8B（4096 维向量化）+ Qwen3-Reranker-8B（精排）/ SQLite（状态、结构化元数据与向量，单文件）/ Jinja2（笔记与综述模板渲染）/ pandoc（Word 导出、EPUB 转换）/ FastMCP（MCP server）/ Docker + docker-compose（部署）。
 
 ## 现状
 
-入库流水线和综述生成器都已跑通，有真实文献库在用：**178 篇/本已完整入库（论文 142、教材 20、标准 14、专利 2），向量索引覆盖 166 个文档、12320 个块**，结构化元数据 178 篇（含图表 13923 条、参考文献 5301 条）；另有 36 篇专利当日正在 Batch 里跑，尚未导出（统计口径一律是"已导出"，直接数 `papers` 表会多出在途的那些）。MCP 集成、检索精度升级（换 Qwen3 嵌入+重排）、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库、专利与标准识别及状态台账、8 类文献类型码表均已完成，**测试套件 126 个用例全绿**。
+入库流水线和综述生成器都已跑通，有真实文献库在用：**178 篇/本已完整入库（论文 142、教材 20、标准 14、专利 2），向量索引覆盖 166 个文档、12320 个块**，结构化元数据 178 篇（含图表 13923 条、参考文献 5301 条）；另有 36 篇专利当日正在 Batch 里跑，尚未导出（统计口径一律是"已导出"，直接数 `papers` 表会多出在途的那些）。MCP 集成、检索精度升级（换 Qwen3 嵌入+重排）、结构化元数据提取、GB 格式引用、章节编号、Word 导出、教材 EPUB 支持、每日定时入库、专利与标准识别及状态台账、8 类文献类型码表均已完成，**测试套件 189 个用例全绿**。
 
 类型重扫已于 2026-08-04 对生产库执行完毕（迁移前热备份 `batch_tracking.db.bak.20260804-145343`），把 15 篇此前被当成论文的国标/行标归位。⚠️ 立项时按初版正则估的是 8 篇，实际 15 篇——差的 7 篇全被 MinerU 的 `<sup>` 标签和造字乱码挡住了，正则校准后才现形。同日还删掉了一份重复文献：`cffb6ff4`（原生解析）与 `aa1548c8`（OCR 版）是同一份 GB 38400-2019，源文件哈希不同所以入库查重没拦住；删的是 OCR 版——两版限量值一致，但 OCR 版把限值渲染成 LaTeX 的 `$\leqslant 10$ mg/kg`，会实打实拉低「≤10 mg/kg」这类查询的命中率，且丢了一张图。删除前数据库和 Excel 都留了备份。剩下的 14 篇标准和 2 篇专利的状态目前都是"未核实"，待人工查证后用 `standards --set` / `patents --set` 录入。部署也已去宿主机化——同一份 compose 靠一个 `.env` 就能在开发机、云服务器、别人的电脑上跑，并已在阿里云实机验证过一轮。
 
 还欠着的：
 
 1. **一次真实主题的端到端 `generate` 验收**——始终没用真实文献（而非造的假数据）完整跑过，GB 引用和排版在真实数据上的表现仍是未知数。这是最老的一笔欠账。
-2. **Web UI**——目前全靠 CLI 和 MCP，"别人上传文件夹、填自己的 API Key 就能用"这个目标卡在这一步。
+2. ~~**Web UI**~~：**[已完成]** 完整 SPA 控制台已交付并正式验收通过，支持文献检索、引文网络力导向图谱、双轨滚雪球发现、候选审批与向量入库全流程。
 3. **打包分发与 LICENSE 选型**——分发之前必须定下来。
 4. **元数据补缺还在多花钱**：178 篇里 176 篇调了大模型补 `DOI/作者/期刊/年份`，但其中 77 篇本来就抓到了 DOI——这些字段直接查 CrossRef 免费 API 就是权威值，比让模型猜准得多。
 5. **Obsidian 笔记模板没跟上 8 类类型**：`obsidian_template.md` 是按期刊论文写死的，tag 恒为 `#paper`、抬头恒为「期刊/会议」，所以库里 15 篇标准和专利的笔记都顶着 `#paper` 标签、期刊栏写"未提取"。根因是笔记在导出阶段就渲染了，而类型要等 `enrich` 才判定——得把类型判定提前，或者在认出类型后回头改写笔记的 frontmatter。参考文献著录那条链路是对的，不受影响。

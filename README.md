@@ -5,7 +5,7 @@
 ## ✨ 核心特性
 
 - **高质量 PDF 解析**：集成 [MinerU](https://mineru.net/)，完美提取 PDF 中的复杂排版、公式和表格，输出高质量 Markdown。
-- **智能大模型分析**：集成 **硅基流动 (SiliconFlow) DeepSeek-V3.1-Terminus** 进行无损文献分析（中英文统一路由，不做语言分流）。
+- **智能大模型分析**：论文分析固定使用 OpenAI `gpt-5.4-mini`；嵌入与重排继续使用硅基流动 Qwen3。
 - **双模运行机制**：
   - **实时模式** (`RUN_MODE=realtime`)：常驻守护进程，每隔固定时间（默认 10 分钟）自动扫描 `input_pdfs/` 目录并即刻处理，生成 Obsidian 笔记与 Excel 记录。
   - **批处理模式** (`RUN_MODE=batch`)：利用大模型的 Batch API，享受 **50% 的成本折扣**。常驻守护进程按固定间隔轮询：每 `BATCH_SCAN_INTERVAL_MINUTES`（默认 30）分钟扫描并提交任务，每 `BATCH_FETCH_INTERVAL_MINUTES`（默认 120）分钟拉取结果，同时支持容器启动瞬间的冷启动检测，确保完美错峰。
@@ -32,7 +32,7 @@ input_pdfs/
         ├── 论文名_hash/
         │   ├── *.md (结构化 Markdown)
         │   └── images/
-        ↓ LLMRouter (统一路由至 SiliconFlow DeepSeek-V3.1-Terminus)
+        ↓ LLMRouter（固定 OpenAI gpt-5.4-mini）
     obsidian_vault/
         └── *.md (带 Frontmatter、原始摘要与插图的 Obsidian 笔记)
     data/
@@ -69,11 +69,8 @@ cp .env.example .env
 
 需要配置的特色参数：
 - `MINERU_API_KEY`: 申请自 MinerU 平台。**支持配置多个 Key**（使用英文逗号 `,` 分隔，例如 `key1,key2,key3`）。程序在运行中如果遇到某个 Key 额度不足 (HTTP 402/429) 或失效，会自动平滑切换到下一个备用 Key 进行处理，防止因额度问题中断流水线。
-- `DEEPSEEK_MODEL`: 文献分析模型，硅基流动上默认 `deepseek-ai/DeepSeek-V3.1-Terminus`，官方 DeepSeek 默认 `deepseek-chat`。
-
-  > ⚠️ **换模型前必须确认它支持 Batch 推理**，否则批处理模式在提交阶段就会 400 报 `20088 This model does not support batch inference`。实测（2026-08-02）硅基流动上支持 Batch 的只有 `DeepSeek-V3`、`DeepSeek-V3.1-Terminus`、`DeepSeek-R1` 三个；`V3.2` / `V4-Pro` / `V4-Flash` / `Qwen` 系列**同步调用正常但不能走 Batch**。而 `DeepSeek-V3` 自 2026-07-24 起在硅基流动上已彻底不可用（任何请求都返回 429 `System is too busy now`），`R1` 是推理模型不适合结构化抽取——所以默认值是 Terminus。
-  >
-  > 这个坑很隐蔽：走 Batch 时模型不可用只会在错误文件里留下一句 `Request failed: Unknown error.`，日志上完全看不出是模型的问题。怀疑模型时先用同步调用单独试一次。
+- `OPENAI_API_KEY`: 必填。论文分析固定 `gpt-5.4-mini`；综述正文固定 `gpt-5.4`。嵌入和重排仍需 `SILICONFLOW_API_KEY`。
+- 额度硬阀：`gpt-5.4-mini` 的论文分析（Batch）、元数据补缺和证据评分共用 UTC 日最多 200 万 token；论文分析每次 Batch 最多预留 60 万、单篇输入最多 20 万；取回结果后以实际 `total_tokens` 校正，再递推下一批。综述正文的 `gpt-5.4` 不走 Batch、每次同步返回即按实际用量入账，单独按 UTC 日最多 20 万 token。任一预留会越过对应上限时，任务不发起并等待下一个 UTC 00:00，避免超出免费额度。
 
 - `BATCH_SIZE_LIMIT`: 每次运行处理/导出的最大论文数量，默认为 `30`。如果您想增加每次运行处理的论文篇数，可以在环境变量中调大此数值。
 
@@ -88,7 +85,7 @@ cp .env.example .env
 ### 1. 部署准备
 ```bash
 cp .env.example .env
-# 编辑 .env，填第 1 段的 MINERU_API_KEY 和 SILICONFLOW_API_KEY 即可，其余各段都有能用的默认值
+# 编辑 .env，填第 1 段的 MINERU_API_KEY、SILICONFLOW_API_KEY、OPENAI_API_KEY 即可
 ```
 
 ### 2. 启动服务
@@ -161,7 +158,7 @@ docker compose exec literature-analyzer python cli.py reset --failed
 - `batch_pipeline.py`: 批处理处理逻辑实现（包含基于 SQLite 的提交与结果拉取状态流转）。
 - `cli.py`: 运维及状态/运行历史统计管理 CLI 终端。
 - `mineru_client.py`: 封装了 MinerU 的两步上传、解析轮询及结果下载，轮询间隔已优化为 10 秒。
-- `llm_router.py`: 大模型调用路由，内置 SiliconFlow / 官方 DeepSeek 双通道及原始摘要无损提取逻辑。
+- `llm_router.py`: 固定的 OpenAI 生成调用入口；论文分析请求会在构建时截断到单篇输入预算内，历史 SiliconFlow Batch 只允许拉取结果。
 - `utils.py`: 共享的工具函数，提供 Excel 导出、Obsidian 模板渲染、SHA-256 去重哈希计算、运行日志追加等。
 - `obsidian_template.md`: Jinja2 模板，定义了生成的 Obsidian 笔记排版样式。⚠️ 目前**是按期刊论文写死的**——tag 恒为 `#paper`，抬头恒为「期刊/会议」，专利和标准的笔记也照这个印。原因是渲染发生在导出阶段，那时 `enrich` 还没跑、`doc_type` 尚未判定，模板拿不到类型。参考文献著录不受影响（走 `stages.format_reference`，按 8 种类型分支）。
 - `review.py` + `litreview/`: 综述生成器（分块 → Qwen3-Embedding 向量检索 → Qwen3-Reranker 重排 → 证据打分 → 带引用归纳）。
@@ -174,27 +171,35 @@ docker compose exec literature-analyzer python cli.py reset --failed
 ```bash
 python review.py status               # 索引状态
 python review.py index [--force]     # 手动建/重建向量索引（换嵌入模型后需 --force）
-python review.py enrich [--no-llm]   # 提取结构化元数据：中英标题/DOI/图表/参考文献 → paper_details 等新表
+python review.py enrich [--no-llm]   # 提取结构化元数据：CrossRef 免费抓取权威信息 + 图表/参考文献
 python review.py search "关键词"      # 检索调试（默认走重排序，--no-rerank 看纯向量结果）
 python review.py types                # 文献分类总览：各类型篇数 + GB/T 7714 码（详见下文）
 python review.py patents              # 专利台账：出版阶段/保护期/法律状态（详见下文）
 python review.py standards            # 标准台账：标准号/实施日期/发布机构/现行状态
-python review.py outline "主题" -o outline.json   # 只生成大纲（可手工编辑后再传入 generate）
+python review.py rm "文献标题或ID"     # 安全级联删除文献（默认 dry-run 预演，加 --yes 执行）
+python review.py propose "主题" [--words 8000] # 【前置立论探测】从本地文献提炼 3 套顶刊级 Thesis & Gap 备选
+python review.py outline "主题" -o outline.json [--thesis "核心立论"] [--gap "学术缺口"] [--logic "主线逻辑"]
 python review.py generate "主题" [--outline outline.json] [--dry-run] \
-    [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数]
+    [--thesis "核心立论"] [--gap "学术缺口"] [--logic "主线分类逻辑"] \
+    [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数] [--lang zh|en]
 ```
 
 生成参数说明：
+- `propose`：大纲前置人机对齐，基于本地馆藏扫描 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 6 种主线分类逻辑）；
+- `--thesis`：一句话核心学术论点（作者要论证的核心判断，绝非进展流水账）；
+- `--gap`：一句话学术缺口/痛点（直击现有研究未做透、存在争议的关键矛盾）；
+- `--logic`：选定单一主线分类逻辑（如 `要素并列利弊暗转` / `现状-危害-对策问题导向` / `过程流`）；
 - `--focus`：侧重方向（如"侧重环保型材料与降解机理"），贯穿大纲设计、每章写作和引言结论；
-- `--words`：目标总字数，自动摊分到各章节（引言/结论各约 8%）；不指定时每章 600-1000 字；
+- `--words`：目标总字数，自动激活 **3 档字数动力学伸缩矩阵**（精简<8k/标准8-12k/深度>12k）及文献门槛诊断；
+- `--lang`：目标语言，可选 `zh`（中文综述）或 `en`（英文综述，按 1.6x 单词当量自动换算）；
 - `--sections`：主体章节数；不指定时由模型自定 3-6 个；
 - `--outline`：外部大纲文件（JSON 或 `## 章节标题` + `- 检索问题` 格式的 markdown），完全手工控制章节与检索方向，指定后跳过大纲生成。
 
-- **检索链路**：Qwen3-Embedding-8B（4096 维，跨中英）向量召回 50 候选 → Qwen3-Reranker-8B 重排取 top 24 → DeepSeek-V4-Pro 逐条打分提炼证据（≥6 分保留）→ 只依据证据写作并强制引用标记 → 全局编号与 GB/T 7714 风格参考文献（含 DOI）。
+- **检索链路**：硅基流动 Qwen3-Embedding-8B（4096 维，跨中英）向量召回候选 → Qwen3-Reranker-8B 精排 → `gpt-5.4-mini` 逐条打分提炼证据 → 固定 `gpt-5.4` 只依据证据写作并使用规范学术编号（如 `[@U-J25-001]`）强制引用 → 3 篇以上文献章节自动生成 Markdown 横向对比矩阵表格 → 全局顺序编号与 GB/T 7714-2015 规范参考文献列表。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。
 - **自动插图**：写完每章后，从本章已引用文献（论文或教材）的 `paper_assets` 里按图题与本章主题的重排相关度挑图（过阈值），把真实图片复制进 `reviews/assets/` 并插入正文，图注随全文统一编号。图片会一并嵌入导出的 Word（pandoc `--resource-path` 指向 .md 目录解析相对图路径）。
 - **输出格式**：标准论文式章节编号（`1 引言` → `2..N` 正文各章 → `N+1 结论与展望`），末尾 `参考文献` 不编号；不含摘要/关键字块。生成 Markdown（写入 Obsidian `reviews` 目录）的同时，用 pandoc 自动导出同名 `.docx`（导出前去掉 Obsidian wikilink 后缀，参考文献逐条独立成段），Word 导出失败不影响 markdown 主流程。参考文献按 GB/T 7714-2015 的**文献类型标识码**区分，8 种类型各走各的著录格式（见下文「文献类型」一节）。
-- 配置见 `.env.example` 的 litreview 段；依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`；Word 导出依赖系统装有 `pandoc`。
+- 配置见 `.env.example` 的 litreview 段；嵌入和重排依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`，生成调用依赖 `OPENAI_API_KEY`；Word 导出依赖系统装有 `pandoc`。
 
 ### 📖 教材/书籍入库（轻量检索语料）
 
@@ -214,7 +219,7 @@ python review.py search "某概念" --corpus book   # 只在教材中检索（�
 - **PDF 自动拆分**：书籍常超 MinerU 单任务页数上限，`add-book` 会用 `pypdf` 按 `BOOK_SPLIT_PAGES`（默认 180）把大 PDF 切成多份、逐份解析后拼回**同一 doc_id**（按整本 PDF 哈希，重复运行幂等）。
 - **EPUB 直接转换**：数字文本无需拆分/MinerU，`pandoc` 直接 epub→markdown 入库（`--extract-media` 抽图入 `paper_assets`）+ epub→docx 生成可读 Word（源文件同目录同名）。`--pages` 对 EPUB 无效。
 - **元数据**：PDF 书名取文件名；EPUB 优先读 OPF 的 `dc:title/creator/publisher/date/identifier`（读不到才回退文件名）。年份/ISBN 本地正则提取；作者/出版社/出版地/版次缺失时由**每本一次前置页 LLM 小调用**补齐（仅送封面/版权页附近 ~2500 字，几分钱级；`--no-llm` 可关，或本地元数据已齐全时自动跳过 LLM 调用）。
-- **依赖**：PDF 拆分依赖 `pypdf`；EPUB 转换依赖系统装有 `pandoc`；元数据 LLM 补齐依赖 `SILICONFLOW_API_KEY`。加入教材后语料变大，建议把 `RERANK_CANDIDATES` 调大（50→150）以保检索准确率。
+- **依赖**：PDF 拆分依赖 `pypdf`；EPUB 转换依赖系统装有 `pandoc`；元数据 LLM 补齐依赖 `OPENAI_API_KEY`。加入教材后语料变大，建议把 `RERANK_CANDIDATES` 调大（50→150）以保检索准确率。
 - **每日定时入库（守护进程）**：`daemon.py` 固定每天 `BOOK_INTAKE_TIME`（默认 `03:00`，本地时区）自动扫描 `BOOK_INPUT_DIR`，按文件名排序逐本处理，PDF 累计页数一旦超过 `BOOK_DAILY_PAGE_BUDGET`（默认 2000）就推迟到下一晚（但排在最前、单本就超预算的大部头仍会处理完，避免永远排不上）；EPUB 走 pandoc 不占该页数预算。成功入库后若 `REVIEW_AUTO_INDEX` 开启会自动增量建索引。手动立即触发一次（不等到凌晨）：
   ```bash
   python -c "import daemon; daemon.book_intake_job()"
@@ -332,7 +337,11 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
 ```
 
 `mcp_server.sh` 已去宿主机化：它自动以脚本所在目录作为项目根目录，默认读取同目录
-`.env`，数据库默认落在 `./data/batch_tracking.db`，无需修改脚本。需要覆盖时使用：
+`.env`，数据库默认落在 `./data/batch_tracking.db`，无需修改脚本。项目 `.env` 的
+OpenAI key/base 和 `LIT_HTTP_PROXY`/`LIT_HTTPS_PROXY` 具有最高优先级；检索固定走
+硅基流动 Qwen3，大纲和证据评分固定走 `gpt-5.4-mini`，章节、引言和结论固定走
+`gpt-5.4`。完整综述进入单消费者 FIFO 队列逐篇执行，知识检索不随综述排队。
+需要覆盖启动配置时使用：
 
 | 变量 | 作用 |
 |---|---|
@@ -381,3 +390,146 @@ tail -f "$(dirname "$DB_PATH")/mcp_server.log"
    Windows 上还有个额外诱因：Git for Windows 的 `ssh.exe` 被 MCP 客户端以纯 Win32 进程拉起时 `HOME` 可能没设置，于是找不到 `~/.ssh/id_ed25519`。这种情况要在 `args` 里补 `"-i", "C:/Users/<你>/.ssh/id_ed25519"`。
 
 排查顺序：**先在终端里手动跑一遍同样的 ssh 命令**（`ssh -T -p <端口> <用户>@<主机> "whoami"`）。手动能通而 MCP 不通，基本就是上面第 2、3 条；手动就不通，那是链路或认证问题，跟 MCP 无关。
+
+---
+
+## 🌐 四、Web UI 工作台与引文网络图谱 (v2.5)
+
+从 v2.5 起，系统内置了完整的现代 Web 控制台（Single Page Application），提供开箱即用的图形化操作体验，不再依赖命令行或 MCP 指令即可完成**文献浏览、引文网络力导向探索、OpenAlex 滚雪球发现、候选审批、合法 OA 下载与真实 Qwen3 向量入库**的全流程。
+
+### 1. Web 服务访问与多场景组网
+
+Web 控制台默认全网卡监听 `0.0.0.0:8001`，并已注册为 Linux 常驻系统服务（`literature-web.service`）：
+
+| 访问场景 | 访问 URL | 连接方式与说明 |
+| :--- | :--- | :--- |
+| **🏢 局域网 / 办公室** | **`http://10.39.183.207:8001`** | 同一 Wi-Fi / 局域网下秒开 |
+| **🏠 在家 / 出差远程** | **`http://100.83.137.43:8001`** | 笔记本登录 **Tailscale**，点对点 WireGuard 加密直连 |
+| **💻 服务器本机** | **`http://127.0.0.1:8001`** | 本地浏览器直连调试 |
+
+> 💡 **代理分流白名单提示**：
+> 若笔记本开启了代理软件（Clash / Surge / v2ray），请在代理软件中将 `10.0.0.0/8` 与 `100.64.0.0/10`（Tailscale 网段）加入 **Direct 直连白名单**，避免代理节点拦截导致 503 错误。
+
+#### 7×24 小时常驻守护与自愈 (Systemd)
+```bash
+# 查看服务运行状态
+systemctl status literature-web
+
+# 查看实时滚动日志
+journalctl -u literature-web -f
+
+# 重启 Web 服务
+sudo systemctl restart literature-web
+```
+
+### 2. 核心视图与模块架构
+
+```mermaid
+flowchart LR
+    A["📊 工作台概况<br>(Dashboard)"] --> B["📖 文献目录<br>(344+篇检索与详情)"]
+    B --> C["🕸️ 引文网络图谱<br>(ECharts 5 力导向交互)"]
+    C --> D["❄️ 滚雪球发现<br>(OpenAlex 双轨发现)"]
+    D --> E["🎯 候选池管理<br>(审批确认与状态机拦截)"]
+    E --> F["⚙️ 入库流水线<br>(OA下载/验真/Qwen3向量化)"]
+    F --> G["📜 审计与日志<br>(Append-Only 审计账本)"]
+    F --> C
+```
+
+1. **📊 工作台概况 (Dashboard)**:
+   * **5 级严格互斥实体分区**：
+     * 🏛️ 生产馆藏基线（341 篇正常 + 3 篇生产隔离 = 344 篇，只读）
+     * ✅ 完整测试入库（3 篇已验证 OA 文献）
+     * 🚫 隔离/不完整 Work（4 篇，含 1 篇测试孤儿与 3 篇脏数据种子）
+     * 🌐 外部未解析占位（8,766 篇引文消歧占位节点）
+     * *分区实体严格闭合总数 = 9,114*
+   * **能力指标**：真实 Qwen3 4096 维向量索引 Work（3 篇）；
+   * 外部候选全生命周期漏斗（`DISCOVERED ➔ APPROVED ➔ ACQUIRED ➔ PARSED ➔ GRAPH_INDEXED ➔ VECTOR_INDEXED`）；
+   * 最近发现批次与审批审计流水记录。
+2. **📖 文献目录 (Library)**:
+   * 支持按中英文标题、作者、DOI、期刊进行多维模糊检索；
+   * 按文献类型（学术论文、教材专著、发明专利、国家标准）及向量索引状态筛选；
+   * 集成出向引文数与馆内被引数展示，支持一键唤起文献详情抽屉与在图谱中高亮定位。
+3. **📄 文献详情抽屉 (Document Detail)**:
+   * 完整中英文元数据与 DOI 跳转；
+   * **PDF 资产验真状态**（`document_assets` 文件大小、页数、SHA-256 哈希、来源 URL）；
+   * **参考文献结构化消歧明细表**（解析题名、作者、年份、DOI、质量 Flag、解析状态）；
+   * **引文拓扑明细**：出向确认引用列表、馆内入向被引列表、共同参考文献同行（Bibliographic Coupling）。
+4. **🕸️ 引文网络图谱 (Citation Graph & 60 FPS 性能优化)**:
+   * **骨干极速模式 (默认)**：默认加载 **762 个骨干节点 / 469 条边**，涵盖 344 篇馆藏基线、测试 OA 及候选核心拓扑，数据包仅 **55 KB**，< 80 ms 秒开；
+   * **超低资源开销**：禁用持续物理引力动画（`layoutAnimation: false`），图谱稳定后**客户端 CPU 占用归零**，轻薄本与移动端流畅 60 FPS；
+   * **按需全景扩展**：在过滤栏中勾选“未解析边/叶子节点”，可一键展开至 **9,110 个节点 / 8,817 条闭合边** 的完整学术图谱；
+   * **局部子图聚焦**：点击任意文献节点或在文献目录中点击“图谱”，瞬间聚焦该文献的 1 阶出入向引文子图。
+5. **❄️ 滚雪球发现 (Snowball Discovery)**:
+   * 种子文献多选（预置核心文献）；
+   * 检索参数配置（双向/向后/向前、深度、单轨上限、前沿年份）；
+   * 异步后台任务启动与进度轮询；
+   * 双轨结果展示卡片：**Foundational 经典基石文献**与 **Emerging 最新前沿文献**，展示推荐理由与合法 OA 链接。
+6. **🎯 候选池管理 (Candidates)**:
+   * 多维筛选（批次 `run_id`、轨道、OA 状态、生命周期状态、关键词）；
+   * 批量勾选（1~5 篇）与批量批准/拒绝；
+   * **审批二次确认弹窗**：明确展示待操作清单、操作人身份确认与决策原因备注；
+   * **状态机硬约束拦截**：非 `DISCOVERED` 状态的候选在界面与后端双重拦截，禁止非法状态倒退。
+7. **⚙️ 入库流水线 (Pipeline)**:
+   * 针对 `APPROVED` 状态的候选一键启动全自动入库；
+   * 5 阶段进度指示：`已批准 ➔ OA下载与PDF验真 ➔ 正文切块与引用提取 ➔ Qwen3 4096维向量化 ➔ 图谱回填`；
+   * 实时控制台日志滚动输出，单篇失败不阻塞其他任务，入库完成后自动刷新引文图谱与漏斗。
+8. **📜 审计与日志 (Audit)**:
+   * Append-Only 审批决策记录（`candidate_decisions`）；
+   * PDF 资产账本（`document_assets`）；
+   * 滚雪球发现历史批次（`discovery_runs`）。
+
+---
+
+## 🛠️ 五、MCP Server 扩展工具集
+
+`mcp_server.py` 现已升级至 15 个工具，支持在 LLM 对话中直接调用全套文献管理、语义检索、引文图谱与综述写作能力：
+
+| 工具名 | 类别 | 描述 |
+| :--- | :--- | :--- |
+| `library_status` | 基础状态 | 查询馆藏统计、各类型文献数量、切块数与向量索引状态 |
+| `list_documents` | 文献目录 | 分页检索馆藏文献，支持关键词、类型、状态筛选 |
+| `library_reconcile` | 状态对齐 | 检查生产库与测试图谱/向量库的一致性与健康度 |
+| `search_literature` | 语义检索 | 语义检索（Qwen3 向量 + 重排），支持按文献类型限定语料 |
+| `get_paper_info` | 元数据 | 按标题/关键词/DOI/专利号/标准号查询详细结构化元数据 |
+| `doc_status` | 状态台账 | 查询专利法律状态与标准现行状态（只读） |
+| `generate_outline` | 综述大纲 | 依据检索主题生成综述大纲结构 JSON |
+| `start_review` | 综述生成 | 异步启动学术综述撰写，返回 job_id |
+| `review_status` | 综述进度 | 轮询综述生成进度与导出文件路径 |
+| `get_citation_network`| 引文图谱 | 查询单篇文献出入向引用、候选引用、共同参考文献与消歧统计 |
+| `citation_expand` | 滚雪球发现 | 启动基于 OpenAlex 的双轨引文滚雪球发现 |
+| `list_discovery_candidates`| 候选查询 | 分页查询与多维筛选外部发现候选池文献 |
+| `approve_candidates` | 候选审批 | 批准/拒绝候选文献入库（严格受状态机与审计表保护） |
+| `acquire_fulltext` | 全文获取 | 合法下载已批准候选的 OA PDF 并进行哈希验真 |
+| `ingest_acquired_candidates`| 向量入库 | 对已获取 PDF 执行正文解析、Qwen3 向量化与图谱节点/边回填 |
+
+---
+
+## 🔒 六、安全加固与只读物理隔离
+
+1. **生产库绝对保护**：
+   * 生产数据库 `/mnt/ripe/literature_analyzer_data/batch_tracking.db` 在所有 Web UI、图谱查询及测试连接中均强制配置 `sqlite3.connect("file:...mode=ro", uri=True)`；
+   * 任何试图向生产库执行 `INSERT`/`UPDATE`/`DELETE` 或 DDL 表操作的行为均会被 SQLite 底层直接拦截并抛出 `OperationalError: attempt to write a readonly database`。
+2. **孤儿 Work 隔离治理**：
+   * 针对未完成完整流水线的孤儿文献（如 `work_oa_w4391143884`），标记为 `QUARANTINED_INCOMPLETE` 并在 `eligible_for_citation_graph = 0` 下从默认图谱与向量检索中完全排除；
+   * 保留其资产及审计链，后续补齐完整解析与向量化后可平滑恢复。
+3. **自动化测试覆盖**：
+   * 全套测试套件（`pytest`）包含 **189 个用例**，覆盖 doctype 码表、chunker 切块、bookintake 教材、citation network 引文消歧、snowball 滚雪球、isolation 隔离回归、web API 及 MCP server，全量 100% 通过。
+
+
+---
+
+## 📦 七、统一数据资产存储架构
+
+所有通过手动投入（`input_pdfs/`）、教材入库（`input_books/`）及 Web UI / OA 滚雪球自动下载的文献，**全部统一汇聚在数据盘根目录 (`/mnt/ripe/literature_analyzer_data/`)**，绝不跨盘散落：
+
+```text
+/mnt/ripe/literature_analyzer_data/
+├── input_pdfs/          # 📥 论文待入库目录（新 PDF 放入后由守护进程自动捕获）
+├── processed_pdfs/      # 📦 统一 PDF 归档库（所有手动与自动入库的 PDF 原件）
+├── input_books/         # 📥 教材待入库目录（支持 PDF/EPUB，每日 03:00 预算入库）
+├── mineru_output/       # 🗂️ 统一图表与解析缓存（包含各论文高清插图与公式切片）
+├── obsidian_磷化工文献/ # 📝 统一 Obsidian Vault 知识库（论文笔记 + reviews/ 综述笔记）
+├── knowledge_base.xlsx  # 📊 统一 Excel 总表（全量文献元数据与结论总台账）
+├── batch_tracking.db    # 🗄️ 生产馆藏基线数据库（344 篇基线，mode=ro 严格只读保护）
+└── test_citation_network.db # 🕸️ 引文拓扑关系库（9,110 节点，支持动态发现与实时回填）
+```

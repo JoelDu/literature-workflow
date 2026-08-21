@@ -19,43 +19,26 @@ from . import doctype as dt
 
 # ── LLM 调用与 JSON 解析 ──────────────────────────────────────────────────────
 
-_fallback = {"client": None, "model": None, "tried": False}
-
-
-def _get_fallback_client():
-    """SiliconFlow 持续拥堵(429/503)时的官方 DeepSeek 兜底（仅 chat，embedding 仍走 SiliconFlow）。"""
-    if not _fallback["tried"]:
-        _fallback["tried"] = True
-        key = os.getenv("DEEPSEEK_API_KEY")
-        if key:
-            from openai import OpenAI
-            _fallback["client"] = OpenAI(
-                api_key=key,
-                base_url=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"),
-                timeout=180)
-            _fallback["model"] = "deepseek-chat"
-    return _fallback["client"], _fallback["model"]
-
-
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=60))
 def _chat_once(client, model: str, prompt: str, json_mode: bool) -> str:
+    from utils import get_settings
+    from .quota import reserve, reconcile
+    settings = get_settings()
+    max_tokens = 12_000 if model == "gpt-5.4" else 4_000
+    reservation = reserve(settings, model, prompt, max_tokens)
     kwargs = {"model": model,
               "messages": [{"role": "user", "content": prompt}],
-              "temperature": 0.3}
+              "temperature": 0.3,
+              "max_completion_tokens": max_tokens}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     resp = client.chat.completions.create(**kwargs)
+    reconcile(settings, model, reservation, resp.usage)
     return resp.choices[0].message.content
 
 
 def _chat(client, model: str, prompt: str, json_mode: bool = True) -> str:
-    try:
-        return _chat_once(client, model, prompt, json_mode)
-    except Exception:
-        fb_client, fb_model = _get_fallback_client()
-        if fb_client is None:
-            raise
-        return _chat_once(fb_client, fb_model, prompt, json_mode)
+    return _chat_once(client, model, prompt, json_mode)
 
 
 def parse_llm_json(text: str) -> dict:
@@ -103,15 +86,119 @@ def _chat_json(client, model: str, prompt: str) -> dict:
         return parse_llm_json(text2)
 
 
-# ── Stage A：大纲 ─────────────────────────────────────────────────────────────
+# ── 3 档字数自适应动力学伸缩矩阵 ─────────────────────────────────────────────
+
+def get_scaling_config(words: int = 0, target_lang: str = "zh") -> dict:
+    """根据综述目标字数与目标语言，计算 3 档自适应动力学参数与文献门槛。"""
+    is_en = target_lang.lower() in ("en", "english", "英文")
+    # 统一中英字数尺度：英文按 1.6 倍单词折算等效工作量
+    effective_words = words if words > 0 else (10000 if not is_en else 6000)
+    if is_en and words > 0:
+        effective_words = int(words * 1.6)
+
+    if effective_words < 8000:
+        # 档位 1: 精简快报型综述 (<8k 字)
+        return {
+            "tier": 1,
+            "tier_name": "精简快报综述 (<8,000字)",
+            "default_sections": 3,
+            "section_rule": "3-4 个紧凑主体章节",
+            "outline_max_papers": 50,
+            "rerank_top_k": 30,
+            "evidence_n": 12,
+            "intro_ratio": 0.10,
+            "concl_ratio": 0.12,
+            "min_papers_threshold": 30 if not is_en else 40,
+        }
+    elif effective_words <= 12000:
+        # 档位 2: 标准学术综述 (8k~12k 字)
+        return {
+            "tier": 2,
+            "tier_name": "标准学术综述 (8,000~12,000字)",
+            "default_sections": 5,
+            "section_rule": "5-6 个主体章节",
+            "outline_max_papers": 80,
+            "rerank_top_k": 50,
+            "evidence_n": 20,
+            "intro_ratio": 0.12,
+            "concl_ratio": 0.15,
+            "min_papers_threshold": 50 if not is_en else 65,
+        }
+    else:
+        # 档位 3: 深度长篇综述 (>12k 字)
+        return {
+            "tier": 3,
+            "tier_name": "长篇深度综述 (>12,000字)",
+            "default_sections": 7,
+            "section_rule": "7-9 个细分主体章节",
+            "outline_max_papers": 120,
+            "rerank_top_k": 80,
+            "evidence_n": 30,
+            "intro_ratio": 0.12,
+            "concl_ratio": 0.15,
+            "min_papers_threshold": 80 if not is_en else 100,
+        }
+
+
+# ── Stage 0：预立论与角度探测（Thesis & Gap Exploration）──────────────────────
+
+def propose_review_angles(topic: str, store, embedder, client, model, settings, console,
+                          words: int = 0, target_lang: str = "zh") -> list:
+    """基于馆藏真实文献，为综述主题提炼 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 主线逻辑）。"""
+    meta = store.get_paper_meta()
+    if not meta:
+        raise RuntimeError("文献库为空，无法提炼综述角度。请先运行主管道处理文献。")
+
+    scaling = get_scaling_config(words, target_lang=target_lang)
+    max_papers = scaling["outline_max_papers"]
+
+    keep_ids = set(meta.keys())
+    try:
+        topic_vec = embedder.embed_query(topic)
+        doc_vecs = store.doc_mean_vectors()
+        scored = [(doc_id, float(v @ topic_vec)) for doc_id, v in doc_vecs.items() if doc_id in meta]
+        if len(scored) > 10:
+            scores = sorted(s for _, s in scored)
+            threshold = scores[int(len(scores) * 0.3)]
+            keep_ids = {d for d, s in scored if s >= threshold}
+            if len(keep_ids) > max_papers:
+                keep_ids = {d for d, _ in sorted(scored, key=lambda x: -x[1])[:max_papers]}
+    except Exception as e:
+        console.print(f"[yellow]⚠️ 角度探测预筛失败（使用全部文献）: {e}")
+
+    digest_lines = []
+    for i, (doc_id, m) in enumerate(sorted(meta.items()), 1):
+        if doc_id not in keep_ids:
+            continue
+        cite_key = m.get("cite_key") or doc_id[:8]
+        doc_type_label = dt.label(m.get("doc_type", "paper"))
+        kw_tag = f" [关键词: {m['keywords']}]" if m.get("keywords") else ""
+        tldr_tag = f" 简评: {m['tldr']}" if m.get("tldr") else ""
+        line = f"[{i}] [{doc_type_label}] 《{_best_title(m)}》({m.get('year') or '年份不详'}, 编号:{cite_key}){kw_tag}{tldr_tag}"
+        digest_lines.append(line[:400])
+
+    prompt = prompts.PROPOSE_ANGLES_PROMPT.format(n=len(digest_lines), topic=topic,
+                                                 paper_digest="\n".join(digest_lines))
+    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt)
+    angles = data.get("angles", [])
+    if not angles:
+        raise RuntimeError(f"未能提炼出有效综述方案: {data}")
+    return angles
+
+
+# ── Stage A：大纲（结合立论与痛点精准构建）───────────────────────────────────
 
 def generate_outline(topic: str, store, embedder, client, model, settings, console,
-                     focus: str = "", n_sections: int = 0) -> Outline:
+                     focus: str = "", n_sections: int = 0, words: int = 0, target_lang: str = "zh",
+                     research_gap: str = "", thesis: str = "", mainline_logic: str = "") -> Outline:
     meta = store.get_paper_meta()
     if not meta:
         raise RuntimeError("文献库为空，无法生成大纲。请先运行主管道处理文献。")
 
-    # 主题向量预筛：剔除与主题明显无关的文献（如混入的比色学论文）
+    scaling = get_scaling_config(words, target_lang=target_lang)
+    max_outline_papers = scaling["outline_max_papers"]
+
+    # 主题向量预筛：剔除与主题明显无关的文献
     keep_ids = set(meta.keys())
     try:
         topic_vec = embedder.embed_query(topic)
@@ -121,10 +208,10 @@ def generate_outline(topic: str, store, embedder, client, model, settings, conso
             scores = sorted(s for _, s in scored)
             threshold = scores[int(len(scores) * 0.3)]  # 30 分位以下剔除
             keep_ids = {d for d, s in scored if s >= threshold}
-            # 保底：至多留 80 篇进大纲上下文
-            if len(keep_ids) > 80:
-                keep_ids = {d for d, _ in sorted(scored, key=lambda x: -x[1])[:80]}
-            console.print(f"[dim]主题预筛：{len(meta)} 篇 → {len(keep_ids)} 篇进入大纲上下文。")
+            # 按动力学档位动态截取候选上限
+            if len(keep_ids) > max_outline_papers:
+                keep_ids = {d for d, _ in sorted(scored, key=lambda x: -x[1])[:max_outline_papers]}
+            console.print(f"[dim]主题预筛：{len(meta)} 篇 → {len(keep_ids)} 篇进入大纲上下文（{scaling['tier_name']}）。")
     except Exception as e:
         console.print(f"[yellow]⚠️ 主题预筛失败（使用全部文献）: {e}")
 
@@ -132,16 +219,27 @@ def generate_outline(topic: str, store, embedder, client, model, settings, conso
     for i, (doc_id, m) in enumerate(sorted(meta.items()), 1):
         if doc_id not in keep_ids:
             continue
-        line = f"[{i}] 《{m['title']}》({m['year'] or '年份不详'}) {m['tldr']}"
-        digest_lines.append(line[:300])
+        cite_key = m.get("cite_key") or doc_id[:8]
+        doc_type_label = dt.label(m.get("doc_type", "paper"))
+        kw_tag = f" [关键词: {m['keywords']}]" if m.get("keywords") else ""
+        tldr_tag = f" 简评: {m['tldr']}" if m.get("tldr") else ""
+        line = f"[{i}] [{doc_type_label}] 《{_best_title(m)}》({m.get('year') or '年份不详'}, 编号:{cite_key}){kw_tag}{tldr_tag}"
+        digest_lines.append(line[:400])
 
-    section_rule = f"恰好 {n_sections} 个主体章节" if n_sections else "3-6 个主体章节"
+    section_rule = f"恰好 {n_sections} 个主体章节" if n_sections else scaling["section_rule"]
+    thesis_block = f"- 核心立论（Thesis）: {thesis}" if thesis else "- 核心立论（Thesis）: 针对主题核心技术瓶颈与机理分歧展开批判性综合，避免泛泛汇报进展"
+    gap_block = f"- 学术缺口（Research Gap）: {research_gap}" if research_gap else "- 学术缺口（Research Gap）: 聚焦现有研究所忽略的关键矛盾、工艺缺陷或理论实测不一致"
+    mainline_block = f"- 选定主线分类逻辑: {mainline_logic}" if mainline_logic else "- 选定主线分类逻辑: 沿清晰的因果链/问题导向层层递进，严禁无序拼盘"
+
     focus_line = (f"\n5. 用户指定的综述侧重方向：{focus}。章节设计必须围绕该侧重展开，"
                   f"与该侧重关系不大的方向不设章节。") if focus else ""
     prompt = prompts.OUTLINE_PROMPT.format(n=len(digest_lines), topic=topic,
+                                           thesis_block=thesis_block,
+                                           gap_block=gap_block,
+                                           mainline_block=mainline_block,
                                            section_rule=section_rule, focus_line=focus_line,
                                            paper_digest="\n".join(digest_lines))
-    data = _chat_json(client, model, prompt)
+    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt)
     outline = Outline.from_dict(data, topic=topic)
     if not outline.sections:
         raise RuntimeError(f"大纲生成失败，未产出任何章节: {data}")
@@ -175,9 +273,11 @@ def load_outline_file(path: str, topic: str) -> Outline:
 
 def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) -> dict:
     m = paper_meta.get(chunk.doc_id, {})
+    cite_key = m.get("cite_key") or chunk.doc_id[:8]
     prompt = prompts.MAP_PROMPT.format(
         heading=heading, questions=questions_text,
-        title=m.get("title", "未知"), year=m.get("year") or "年份不详",
+        title=_best_title(m), year=m.get("year") or "年份不详",
+        cite_key=cite_key,
         chunk_content=chunk.content[:5000],
     )
     data = _chat_json(client, model, prompt)
@@ -246,7 +346,8 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
 
 # ── Stage C：写作 ─────────────────────────────────────────────────────────────
 
-_CITE_RE = re.compile(r"\[@([0-9a-f]{8,12})\]")
+# 支持匹配规范编号 [@U-J25-001]、语义缩写 [@Wang2025] 以及哈希 [@d773f081]
+_CITE_RE = re.compile(r"\[@([A-Za-z0-9_\-]+)\]")
 
 
 # 标题尾缀 "_张三" 模式（文件名习惯：标题_第一作者）
@@ -347,32 +448,44 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
                   words: tuple = (600, 1000), focus: str = "") -> SectionDraft:
     blocks = []
-    valid_prefixes = set()
+    valid_cite_marks = set()
+    cite_to_doc = {}
     for i, ev in enumerate(evidence, 1):
         m = paper_meta.get(ev.doc_id, {})
-        prefix = ev.doc_id[:id_prefix_len]
-        valid_prefixes.add(prefix)
+        # 优先使用学术语义编号（如 U-J25-001），回退使用 doc_id 前缀
+        cite_key = m.get("cite_key") or ev.doc_id[:id_prefix_len]
+        valid_cite_marks.add(cite_key)
+        valid_cite_marks.add(ev.doc_id[:id_prefix_len])
+        valid_cite_marks.add(ev.doc_id)
+        cite_to_doc[cite_key] = ev.doc_id
+        cite_to_doc[ev.doc_id[:id_prefix_len]] = ev.doc_id
+        cite_to_doc[ev.doc_id] = ev.doc_id
+
+        doc_type_label = dt.label(m.get("doc_type", "paper"))
         blocks.append(
             f"[E{i}] 来源：{_short_authors(m.get('authors',''), m.get('language','zh'), m.get('title',''))}"
-            f"（{m.get('year') or '年份不详'}）《{_best_title(m)}》 引用标记 [@{prefix}]\n"
+            f"（{m.get('year') or '年份不详'}）《{_best_title(m)}》[{doc_type_label}] 引用标记 [@{cite_key}]\n"
             f"     证据：{ev.summary}"
         )
-    focus_line = f"\n6. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
+    focus_line = f"\n8. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
+    sample_1 = list(cite_to_doc.keys())[0] if cite_to_doc else "U-J25-001"
+    sample_2 = list(cite_to_doc.keys())[1] if len(cite_to_doc) > 1 else sample_1
+
     prompt = prompts.WRITE_SECTION_PROMPT.format(
         review_title=review_title, heading=section.heading,
         evidence_blocks="\n".join(blocks),
+        sample_cite_1=sample_1, sample_cite_2=sample_2,
         words_min=words[0], words_max=words[1], focus_line=focus_line)
     text = _chat(client, model, prompt, json_mode=False).strip()
 
     # 丢弃不在证据集中的引用标记（幻觉引用）
     def _filter_cite(m):
-        return m.group(0) if m.group(1) in valid_prefixes else ""
+        return m.group(0) if m.group(1) in valid_cite_marks else ""
     text = _CITE_RE.sub(_filter_cite, text)
 
-    prefix_to_doc = {ev.doc_id[:id_prefix_len]: ev.doc_id for ev in evidence}
     cited = []
     for m in _CITE_RE.finditer(text):
-        doc_id = prefix_to_doc.get(m.group(1))
+        doc_id = cite_to_doc.get(m.group(1))
         if doc_id and doc_id not in cited:
             cited.append(doc_id)
     return SectionDraft(heading=section.heading, markdown=text, cited_doc_ids=cited)
@@ -381,9 +494,18 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
 def write_intro_conclusion(outline: Outline, drafts: list, client, model,
                            intro_words: tuple = (300, 500),
                            concl_words: tuple = (400, 700), focus: str = "") -> tuple:
-    summaries = "\n".join(
-        f"## {d.heading}\n{d.markdown[:200]}..." for d in drafts)
-    focus_line = f"\n4. 本综述整体侧重方向：{focus}，引言的意义阐述与结论的展望均围绕它展开。" if focus else ""
+    # 提取各章节核心论点与关键发现矩阵（前 400 字符 + 结尾上位评述）
+    summary_blocks = []
+    for d in drafts:
+        body = d.markdown.strip()
+        preview = body[:350] + ("..." if len(body) > 350 else "")
+        # 提取结尾段落作为结论提炼抓手
+        paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+        last_p = paragraphs[-1][:200] if len(paragraphs) > 1 else ""
+        summary_blocks.append(f"## {d.heading}\n- 核心段落展开：{preview}\n- 本章上位结论与瓶颈：{last_p}")
+
+    summaries = "\n\n".join(summary_blocks)
+    focus_line = f"\n3. 本综述整体侧重方向：{focus}，引言的意义阐述与结论的展望均围绕它展开。" if focus else ""
     prompt = prompts.INTRO_CONCLUSION_PROMPT.format(
         review_title=outline.title, topic=outline.topic, section_summaries=summaries,
         intro_min=intro_words[0], intro_max=intro_words[1],
@@ -397,18 +519,23 @@ def write_intro_conclusion(outline: Outline, drafts: list, client, model,
 def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
                     paper_meta: dict, evidence_total: int,
                     id_prefix_len: int = 8) -> ReviewDoc:
-    # 全局引用编号：按正文出现顺序
-    prefix_to_doc = {}
+    # 建立全局 cite_key 和 doc_id 前缀到完整 doc_id 的映射
+    cite_to_doc = {}
     for d in drafts:
         for doc_id in d.cited_doc_ids:
-            prefix_to_doc[doc_id[:id_prefix_len]] = doc_id
+            m = paper_meta.get(doc_id, {})
+            cite_key = m.get("cite_key")
+            if cite_key:
+                cite_to_doc[cite_key] = doc_id
+            cite_to_doc[doc_id[:id_prefix_len]] = doc_id
+            cite_to_doc[doc_id] = doc_id
 
     numbering = {}   # doc_id → n
     ordered_docs = []
 
     def _renumber(text: str) -> str:
         def repl(m):
-            doc_id = prefix_to_doc.get(m.group(1))
+            doc_id = cite_to_doc.get(m.group(1))
             if doc_id is None:
                 return ""
             if doc_id not in numbering:

@@ -79,10 +79,8 @@ def book_intake_job():
     console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始每日教材定时入库...[/bold cyan]")
     try:
         from litreview.bookintake import run_scheduled_intake
-        from llm_router import make_deepseek_client
-        # 统一构造一次 SiliconFlow 客户端：既供 add_book/add_epub 的元数据补全用，
-        # 也供后面自动建索引（embeddings 无论如何都需要它，跟 REVIEW_ENRICH_LLM 无关）
-        client, _ = make_deepseek_client(quiet=True)
+        from llm_router import make_openai_client
+        client, _ = make_openai_client(quiet=True)
         use_llm = settings.REVIEW_ENRICH_LLM
         report = run_scheduled_intake(settings, console, client=client if use_llm else None, use_llm=use_llm)
 

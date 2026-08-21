@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Literature Analyzer — 科研文献智能分析与引文图谱工作站</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Markdown parser for online preview -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- ECharts 5 for Interactive Citation Network Graph -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="brand-section">
+        <div class="brand-logo">📚</div>
+        <div class="brand-info">
+          <h1>Literature Analyzer</h1>
+          <span>引文图谱与文献工作站 v2.5</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="dashboard">
+          <span class="icon">📊</span>
+          <span>工作台概况</span>
+        </button>
+        <button class="nav-item" data-tab="library">
+          <span class="icon">📖</span>
+          <span>文献目录</span>
+          <span class="nav-badge" id="nav-count-papers">0</span>
+        </button>
+        <button class="nav-item" data-tab="network">
+          <span class="icon">🕸️</span>
+          <span>引文网络图谱</span>
+          <span class="nav-badge" id="nav-count-edges">0</span>
+        </button>
+        <button class="nav-item" data-tab="discovery">
+          <span class="icon">❄️</span>
+          <span>滚雪球发现</span>
+        </button>
+        <button class="nav-item" data-tab="candidates">
+          <span class="icon">🎯</span>
+          <span>候选池管理</span>
+          <span class="nav-badge" id="nav-count-cands">0</span>
+        </button>
+        <button class="nav-item" data-tab="pipeline">
+          <span class="icon">⚙️</span>
+          <span>入库流水线</span>
+          <span class="nav-badge" id="nav-count-pipeline">0</span>
+        </button>
+        <button class="nav-item" data-tab="audit">
+          <span class="icon">📜</span>
+          <span>审计与日志</span>
+        </button>
+
+        <button class="nav-item" data-tab="settings">
+          <span class="icon">⚙️</span>
+          <span>系统与设置</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="system-mini-status">
+          <span class="status-dot ready" id="system-status-dot"></span>
+          <span id="system-status-text">系统就绪 (只读生产隔离)</span>
+        </div>
+        <button class="theme-toggle-btn" id="theme-toggle-btn">
+          <span>🌓</span>
+          <span id="theme-toggle-text">深色模式</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <!-- Top Bar -->
+      <header class="top-bar">
+        <div class="page-title-group">
+          <h2 id="page-title">工作台概况</h2>
+          <p id="page-desc">查看馆藏文献、引文网络拓扑、外部候选池与流水线运行状态</p>
+        </div>
+        <div class="top-actions">
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-data">
+            <span>🔄</span> 刷新数据
+          </button>
+          <button class="btn btn-primary btn-sm" id="btn-quick-expand">
+            <span>❄️</span> 滚雪球发现
+          </button>
+        </div>
+      </header>
+
+      <!-- TAB 1: 概况 / DASHBOARD -->
+      <section class="tab-view active" id="tab-dashboard">
+        <div class="stats-grid stats-grid-5">
+          <div class="stat-box">
+            <div class="stat-icon">🏛️</div>
+            <div class="stat-details">
+              <div class="num" id="dash-prod-baseline">344</div>
+              <div class="label">生产馆藏基线 (只读)</div>
+            </div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-icon emerald">✅</div>
+            <div class="stat-details">
+              <div class="num" id="dash-verified-works">3</div>
+              <div class="label">完整入库测试 Work</div>
+            </div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-icon teal">🧩</div>
+            <div class="stat-details">
+              <div class="num" id="dash-vector-indexed">3</div>
+              <div class="label">VECTOR_INDEXED (Qwen3)</div>
+            </div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-icon rose">🚫</div>
+            <div class="stat-details">
+              <div class="num" id="dash-quarantined-works">4</div>
+              <div class="label">隔离 / 不完整 Work</div>
+            </div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-icon gray">🌐</div>
+            <div class="stat-details">
+              <div class="num" id="dash-external-works">8,766</div>
+              <div class="label">外部未解析占位 Work</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Funnel & Graph Status Card -->
+        <div class="card mb-4">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">外部候选文献生命周期分布</h3>
+              <p class="card-desc">展示从外部发现、人工/AI审批到合法全文获取、正文解析与真实 Qwen3 向量索引的完整漏斗</p>
+            </div>
+          </div>
+          <div class="funnel-container" id="dash-funnel-bar">
+            <!-- Dynamic Funnel Rendered by JS -->
+          </div>
+        </div>
+
+        <div class="grid-2col">
+          <!-- Left: Recent Discovery Runs -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">最近滚雪球发现批次 (Discovery Runs)</h3>
+                <p class="card-desc">历史 OpenAlex 双轨引文发现记录</p>
+              </div>
+              <button class="btn btn-link btn-sm" id="btn-goto-discovery">进入发现 →</button>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>批次 ID</th>
+                    <th>方向 / 深度</th>
+                    <th>候选总数</th>
+                    <th>发现时间</th>
+                  </tr>
+                </thead>
+                <tbody id="dash-runs-tbody">
+                  <tr><td colspan="4" class="text-muted text-center">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Right: Recent Decisions & Ingested Works -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">最近审批审计记录 (Decisions)</h3>
+                <p class="card-desc">Append-only 审计日志链</p>
+              </div>
+              <button class="btn btn-link btn-sm" id="btn-goto-candidates">管理候选池 →</button>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>候选 ID</th>
+                    <th>动作</th>
+                    <th>来源</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody id="dash-decisions-tbody">
+                  <tr><td colspan="4" class="text-muted text-center">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: 文献目录 / LIBRARY -->
+      <section class="tab-view" id="tab-library">
+        <!-- Category Filter Pills Bar -->
+        <div class="card mb-3">
+          <div class="category-pills-bar" id="lib-category-pills">
+            <button class="category-pill-btn active" data-type="all">🌐 全部文献 (<span id="pill-count-all">344</span>)</button>
+            <button class="category-pill-btn" data-type="paper">📑 学术论文 (<span id="pill-count-paper">249</span>)</button>
+            <button class="category-pill-btn" data-type="patent">💡 发明专利 (<span id="pill-count-patent">42</span>)</button>
+            <button class="category-pill-btn" data-type="book">📚 教材专著 (<span id="pill-count-book">39</span>)</button>
+            <button class="category-pill-btn" data-type="standard">📐 行业标准 (<span id="pill-count-standard">14</span>)</button>
+          </div>
+        </div>
+
+        <!-- Filter Bar -->
+        <div class="card mb-3">
+          <div class="filter-grid">
+            <div class="form-group">
+              <label class="form-label">🔍 检索关键词</label>
+              <input type="text" class="form-input" id="lib-search-input" placeholder="输入中英文标题、作者、期刊或 DOI 搜索...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">📄 文献类型</label>
+              <select class="form-select" id="lib-type-select">
+                <option value="all">全部类型 (论文/专著/专利等)</option>
+                <option value="paper">学术论文 (Paper)</option>
+                <option value="book">教材专著 (Book)</option>
+                <option value="patent">发明专利 (Patent)</option>
+                <option value="standard">国家标准 (Standard)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🧩 向量索引状态</label>
+              <select class="form-select" id="lib-indexed-select">
+                <option value="all">全部状态</option>
+                <option value="true">已索引 (Indexed)</option>
+                <option value="false">未索引 (Unindexed)</option>
+              </select>
+            </div>
+            <div class="form-group flex-end">
+              <button class="btn btn-primary" id="btn-lib-search">
+                <span>🔍</span> 筛选
+              </button>
+              <button class="btn btn-secondary" id="btn-lib-reset">重置</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Documents Table -->
+        <div class="card">
+          <div class="card-header flex-between">
+            <div>
+              <h3 class="card-title">馆藏文献列表</h3>
+              <p class="card-desc">共检索到 <span id="lib-total-count" class="text-primary font-bold">0</span> 篇文献</p>
+            </div>
+            <div class="pagination-summary" id="lib-page-summary">第 1 / 1 页</div>
+          </div>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th style="min-width: 320px;">文献题名 (中英文规范篇名)</th>
+                  <th>作者 / 发表年份 / 出版源</th>
+                  <th>类型</th>
+                  <th>出向引文</th>
+                  <th>馆内被引</th>
+                  <th>向量索引</th>
+                  <th>快捷操作</th>
+                </tr>
+              </thead>
+              <tbody id="lib-docs-tbody">
+                <tr><td colspan="8" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination-footer" id="lib-pagination">
+            <!-- Pagination Controls -->
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: 引文网络图谱 / NETWORK -->
+      <section class="tab-view" id="tab-network">
+        <div class="card mb-3">
+          <div class="filter-grid">
+            <div class="form-group">
+              <label class="form-label">🌐 视图模式</label>
+              <select class="form-select" id="net-view-mode">
+                <option value="full">全局骨干网络总览 (Full Graph)</option>
+                <option value="seed">指定文献局部子图 (Local Subgraph)</option>
+              </select>
+            </div>
+            <div class="form-group span-2" id="net-seed-group">
+              <div class="flex-between mb-1">
+                <label class="form-label" style="margin-bottom:0;">🎯 选择或搜索聚焦核心文献</label>
+                <button class="btn btn-secondary btn-xs" id="btn-net-switch-full" type="button">🌐 切回全局图谱</button>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <select class="form-select" id="net-seed-select" style="flex:1;">
+                  <option value="">载入馆藏全部文献列表中...</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:6px;">
+                <input type="text" class="form-input" id="net-seed-search" placeholder="输入篇名关键词或 Work ID 搜索过滤..." style="flex:1;">
+                <button class="btn btn-primary btn-sm" id="btn-net-search-focus" type="button">🎯 聚焦此篇</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🔍 边类型过滤</label>
+              <div class="checkbox-group">
+                <label><input type="checkbox" id="net-filter-confirmed" checked> 确认边</label>
+                <label><input type="checkbox" id="net-filter-candidate" checked> 候选边</label>
+                <label><input type="checkbox" id="net-filter-unresolved"> 未解析边/叶子节点</label>
+              </div>
+            </div>
+            <div class="form-group flex-end">
+              <button class="btn btn-primary" id="btn-net-reload">
+                <span>🔄</span> 重新渲染
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-graph-layout">
+          <!-- Graph Container -->
+          <div class="card graph-canvas-card">
+            <div class="graph-legend-bar">
+              <span class="legend-item"><span class="dot blue"></span> 馆内核心文献</span>
+              <span class="legend-item"><span class="dot green"></span> 新入库 OA 文献</span>
+              <span class="legend-item"><span class="dot orange"></span> 待复核候选</span>
+              <span class="legend-item"><span class="dot gray"></span> 馆外未解析文献</span>
+            </div>
+            <div id="echarts-graph-container" style="width: 100%; height: 600px;"></div>
+          </div>
+
+          <!-- Node Detail Panel -->
+          <div class="card node-detail-card" id="net-node-card">
+            <div class="card-header">
+              <h3 class="card-title">节点拓扑详情</h3>
+            </div>
+            <div id="net-node-content" class="node-info-body">
+              <div class="empty-placeholder">点击图谱中任意节点可查看其出入向引用关系与消歧明细</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: 滚雪球发现 / DISCOVERY -->
+      <section class="tab-view" id="tab-discovery">
+        <div class="card mb-3">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">OpenAlex 引文滚雪球发现配置</h3>
+              <p class="card-desc">基于核心种子文献，沿出向引用（基石）与入向施引（前沿）双轨扩展高价值文献</p>
+            </div>
+          </div>
+          <div class="filter-grid">
+            <div class="form-group span-2">
+              <div class="flex-between mb-2">
+                <label class="form-label" style="margin-bottom:0;">🌱 种子文献配置 (支持多选、动态添加/删除与手动输入)</label>
+                <div class="btn-group-sm">
+                  <button class="btn btn-secondary btn-xs" id="btn-select-all-seeds" type="button">全选</button>
+                  <button class="btn btn-secondary btn-xs" id="btn-clear-seeds" type="button">清空</button>
+                </div>
+              </div>
+
+              <!-- Dynamic Seed Chips -->
+              <div class="seed-chips-container" id="disc-seed-chips"></div>
+
+              <!-- Quick Add Bar -->
+              <div class="seed-actions-grid mt-2" style="display:flex;flex-direction:column;gap:8px;">
+                <div style="display:flex;gap:8px;">
+                  <select class="form-select" id="disc-library-seed-select" style="flex:1;">
+                    <option value="">从馆藏 344 篇文献中选择添加...</option>
+                  </select>
+                  <button class="btn btn-secondary btn-sm" id="btn-add-library-seed" type="button">➕ 添加馆内种子</button>
+                </div>
+                <div style="display:flex;gap:8px;">
+                  <input type="text" class="form-input" id="disc-custom-seed-input" placeholder="或手动输入任意 Work ID、DOI (如 10.1016/...) 或 OpenAlex ID (如 W123456)..." style="flex:1;">
+                  <button class="btn btn-secondary btn-sm" id="btn-add-custom-seed" type="button">➕ 手动添加</button>
+                </div>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🧭 扩展方向</label>
+              <select class="form-select" id="disc-direction">
+                <option value="both">双向滚雪球 (基石 + 前沿)</option>
+                <option value="backward">仅向后追溯基石 (Backward)</option>
+                <option value="forward">仅向前跟踪前沿 (Forward)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🎯 共被引强度提纯</label>
+              <select class="form-select" id="disc-co-citation">
+                <option value="1" selected>全部候选 (≥1篇种子引用)</option>
+                <option value="2">核心交叉共被引 (≥2篇种子共同引用)</option>
+                <option value="3">强共识奠基论文 (≥3篇种子共同引用)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🔢 单轨上限 (每轨篇数)</label>
+              <select class="form-select" id="disc-limit">
+                <option value="10">10 篇/轨</option>
+                <option value="20" selected>20 篇/轨</option>
+                <option value="50">50 篇/轨</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">📅 前沿文献最近年份</label>
+              <select class="form-select" id="disc-years">
+                <option value="3" selected>近 3 年 (2023 - 2026)</option>
+                <option value="5">近 5 年 (2021 - 2026)</option>
+              </select>
+            </div>
+            <div class="form-group flex-end">
+              <button class="btn btn-primary" id="btn-launch-discovery">
+                <span>🚀</span> 启动滚雪球发现
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Dual-Track Results -->
+        <div class="discovery-results-grid">
+          <!-- Foundational Track -->
+          <div class="card">
+            <div class="card-header track-header foundational">
+              <div>
+                <h3 class="card-title">🏛️ Foundational 经典基石文献</h3>
+                <p class="card-desc">被种子文献高频引用的底层理论与基础综述</p>
+              </div>
+              <span class="badge badge-foundational" id="disc-found-count">0 篇</span>
+            </div>
+            <div class="card-scroll-list" id="disc-found-list">
+              <div class="text-center text-muted py-4">暂无数据，请从历史批次载入或启动新发现</div>
+            </div>
+          </div>
+
+          <!-- Emerging Track -->
+          <div class="card">
+            <div class="card-header track-header emerging">
+              <div>
+                <h3 class="card-title">🚀 Emerging 最新前沿文献</h3>
+                <p class="card-desc">近 3 年施引种子文献的最新工业应用与研究进展</p>
+              </div>
+              <span class="badge badge-emerging" id="disc-emerg-count">0 篇</span>
+            </div>
+            <div class="card-scroll-list" id="disc-emerg-list">
+              <div class="text-center text-muted py-4">暂无数据，请从历史批次载入或启动新发现</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: 候选池管理 / CANDIDATES -->
+      <section class="tab-view" id="tab-candidates">
+        <div class="card mb-3">
+          <div class="filter-grid">
+            <div class="form-group">
+              <label class="form-label">🔍 关键词搜索</label>
+              <input type="text" class="form-input" id="cand-search-input" placeholder="按题名、作者、DOI 或候选 ID 搜索...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">🛤️ 轨道分类</label>
+              <select class="form-select" id="cand-track-select">
+                <option value="ALL">全部轨道 (Foundational + Emerging)</option>
+                <option value="FOUNDATIONAL">Foundational 基石轨道</option>
+                <option value="EMERGING">Emerging 前沿轨道</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🔓 OA 开放获取</label>
+              <select class="form-select" id="cand-oa-select">
+                <option value="all">全部</option>
+                <option value="true" selected>仅看合法 OA 开放获取</option>
+                <option value="false">非 OA 文献</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">🚦 生命周期状态</label>
+              <select class="form-select" id="cand-status-select">
+                <option value="all">全部生命周期</option>
+                <option value="DISCOVERED" selected>DISCOVERED (待审批)</option>
+                <option value="APPROVED">APPROVED (已批准)</option>
+                <option value="VECTOR_INDEXED">VECTOR_INDEXED (已入库)</option>
+                <option value="REJECTED">REJECTED (已拒绝)</option>
+              </select>
+            </div>
+            <div class="form-group flex-end">
+              <button class="btn btn-primary" id="btn-cand-search">
+                <span>🔍</span> 筛选候选
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Action Toolbar -->
+        <div class="action-bar mb-3">
+          <div class="action-info">
+            已勾选 <span id="cand-selected-count" class="font-bold text-primary">0</span> 篇候选文献
+          </div>
+          <div class="action-buttons">
+            <button class="btn btn-success btn-sm" id="btn-batch-approve" disabled>
+              <span>✅</span> 批量批准 (APPROVE)
+            </button>
+            <button class="btn btn-danger btn-sm" id="btn-batch-reject" disabled>
+              <span>❌</span> 批量拒绝 (REJECT)
+            </button>
+            <button class="btn btn-primary btn-sm" id="btn-goto-pipeline">
+              <span>⚙️</span> 进入入库流水线 →
+            </button>
+          </div>
+        </div>
+
+        <!-- Candidates Table -->
+        <div class="card">
+          <div class="card-header flex-between">
+            <div>
+              <h3 class="card-title">候选文献列表</h3>
+              <p class="card-desc">共检索到 <span id="cand-total-count" class="text-primary font-bold">0</span> 篇候选记录</p>
+            </div>
+            <div class="pagination-summary" id="cand-page-summary">第 1 / 1 页</div>
+          </div>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th style="width: 40px;"><input type="checkbox" id="cand-select-all"></th>
+                  <th>候选题名</th>
+                  <th>轨道</th>
+                  <th>作者 / 年份</th>
+                  <th>期刊 / 会议</th>
+                  <th>被引 / 共被引</th>
+                  <th>OA 状态</th>
+                  <th>生命周期状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="cand-list-tbody">
+                <tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="pagination-footer" id="cand-pagination">
+            <!-- Pagination Controls -->
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 6: 入库流水线 / PIPELINE -->
+      <section class="tab-view" id="tab-pipeline">
+        <div class="card mb-3">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">已批准候选文献获取与入库流水线</h3>
+              <p class="card-desc">自动执行合法 OA 全文下载、真实 Chrome 自动化反爬绕过、正文解析、Qwen3 向量索引与引文网络图谱回填</p>
+            </div>
+            <div class="flex-gap-sm">
+              <button class="btn btn-secondary" id="btn-refresh-pending-pipe">🔄 刷新状态</button>
+              <button class="btn btn-primary" id="btn-start-ingest-pipeline">
+                <span>🚀</span> 一键启动全部待入库
+              </button>
+            </div>
+          </div>
+          <div class="pipeline-flow-steps">
+            <div class="pipe-step active" id="step-approved">
+              <div class="step-num">1</div>
+              <div class="step-label">已批准候选 (APPROVED)</div>
+            </div>
+            <div class="pipe-arrow">➔</div>
+            <div class="pipe-step" id="step-acq">
+              <div class="step-num">2</div>
+              <div class="step-label">合法 OA / 浏览器自动化下载</div>
+            </div>
+            <div class="pipe-arrow">➔</div>
+            <div class="pipe-step" id="step-parse">
+              <div class="step-num">3</div>
+              <div class="step-label">正文切块与引用提取</div>
+            </div>
+            <div class="pipe-arrow">➔</div>
+            <div class="pipe-step" id="step-embed">
+              <div class="step-num">4</div>
+              <div class="step-label">Qwen3 4096维向量化</div>
+            </div>
+            <div class="pipe-arrow">➔</div>
+            <div class="pipe-step" id="step-graph">
+              <div class="step-num">5</div>
+              <div class="step-label">引文图谱回填 (VECTOR_INDEXED)</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pipeline Sub Navigation -->
+        <div class="card mb-3">
+          <div class="sub-nav-tabs" id="pipe-sub-tabs">
+            <button class="sub-tab-btn active" data-pipe-sub="pending">
+              📋 待入库队列 (<span id="pipe-badge-pending">0</span>)
+            </button>
+            <button class="sub-tab-btn" data-pipe-sub="failed">
+              ⚠️ 获取失败需人工干预 (<span id="pipe-badge-failed">0</span>)
+            </button>
+            <button class="sub-tab-btn" data-pipe-sub="success">
+              🎉 已成功入库文献 (<span id="pipe-badge-success">0</span>)
+            </button>
+          </div>
+        </div>
+
+        <div class="grid-2col">
+          <!-- Sub Section 1: Pending Ingestion List -->
+          <div class="card pipe-sub-card active" id="pipe-card-pending">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">待入库候选列表</h3>
+                <p class="card-desc">已审核通过，等待或已完成全文获取的文献</p>
+              </div>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="min-width: 260px;">文献题名</th>
+                    <th>状态</th>
+                    <th style="min-width: 140px;">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="pipe-pending-tbody">
+                  <tr><td colspan="3" class="text-center text-muted">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Sub Section 2: Failed / Needs Human Intervention List -->
+          <div class="card pipe-sub-card" id="pipe-card-failed" style="display: none;">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">获取失败 / 需人工干预文献</h3>
+                <p class="card-desc">目标出版商反爬拦截或需权限，支持真实浏览器重试、本地 PDF 补录或移出</p>
+              </div>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="min-width: 240px;">文献题名</th>
+                    <th>失败原因 / 建议</th>
+                    <th style="min-width: 190px;">人工干预操作</th>
+                  </tr>
+                </thead>
+                <tbody id="pipe-failed-tbody">
+                  <tr><td colspan="3" class="text-center text-muted">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Sub Section 3: Successfully Ingested Works -->
+          <div class="card pipe-sub-card" id="pipe-card-success" style="display: none;">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">已成功入库与图谱回填文献</h3>
+                <p class="card-desc">已完成 4096 维密集语义向量切块，已回填入库至引文网络拓扑</p>
+              </div>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="min-width: 240px;">Work ID 与题名</th>
+                    <th>向量索引</th>
+                    <th style="min-width: 110px;">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="pipe-success-tbody">
+                  <tr><td colspan="3" class="text-center text-muted">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Live Pipeline Execution Console -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3 class="card-title">流水线任务实时控制台</h3>
+                <p class="card-desc" id="pipe-task-desc">暂无运行中任务</p>
+              </div>
+              <button class="btn btn-secondary btn-xs" id="btn-clear-pipe-console">清空日志</button>
+            </div>
+            <div class="console-box" id="pipe-console-box" style="min-height: 380px; max-height: 480px;">
+              <div class="log-line text-muted">[系统] 就绪，点击“一键启动全部待入库”或单篇“立即入库”即可执行...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Hidden PDF File Upload Input -->
+        <input type="file" id="pipe-pdf-file-input" accept=".pdf,application/pdf" style="display: none;">
+      </section>
+
+      <!-- TAB 7: 审计与运行记录 / AUDIT -->
+      <section class="tab-view" id="tab-audit">
+        <div class="card mb-3">
+          <div class="sub-nav-tabs">
+            <button class="sub-tab-btn active" data-sub="decisions">审批决策审计 (candidate_decisions)</button>
+            <button class="sub-tab-btn" data-sub="assets">PDF 资产元数据 (document_assets)</button>
+            <button class="sub-tab-btn" data-sub="runs">滚雪球发现批次 (discovery_runs)</button>
+          </div>
+        </div>
+
+        <!-- Sub 1: Candidate Decisions -->
+        <div class="card audit-sub-card active" id="audit-sub-decisions">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">候选审批决策审计日志 (Strictly Append-Only)</h3>
+              <p class="card-desc">记录所有 SYSTEM_TEST 和 USER 审批动作、原因、时间与生命周期状态流转</p>
+            </div>
+          </div>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Decision ID</th>
+                  <th>候选 ID</th>
+                  <th>动作</th>
+                  <th>前置状态 ➔ 新状态</th>
+                  <th>来源</th>
+                  <th>决策原因</th>
+                  <th>时间</th>
+                  <th>操作人</th>
+                </tr>
+              </thead>
+              <tbody id="audit-decisions-tbody">
+                <tr><td colspan="8" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Sub 2: Document Assets -->
+        <div class="card audit-sub-card" id="audit-sub-assets" style="display:none;">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">文献 PDF 文件资产账本 (document_assets)</h3>
+              <p class="card-desc">真实 PDF 哈希、大小、页数与来源 URL 记录</p>
+            </div>
+          </div>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Asset ID</th>
+                  <th>Work ID</th>
+                  <th>SHA-256 哈希</th>
+                  <th>大小 (Bytes)</th>
+                  <th>页数</th>
+                  <th>状态</th>
+                  <th>来源 URL</th>
+                  <th>入库时间</th>
+                </tr>
+              </thead>
+              <tbody id="audit-assets-tbody">
+                <tr><td colspan="8" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Sub 3: Discovery Runs -->
+        <div class="card audit-sub-card" id="audit-sub-runs" style="display:none;">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">滚雪球发现历史批次 (discovery_runs)</h3>
+              <p class="card-desc">OpenAlex 检索参数、统计账本与时间戳</p>
+            </div>
+          </div>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Run ID</th>
+                  <th>种子列表</th>
+                  <th>方向 / 深度</th>
+                  <th>物化候选数</th>
+                  <th>基石 / 前沿</th>
+                  <th>新外部候选</th>
+                  <th>发现时间</th>
+                </tr>
+              </thead>
+              <tbody id="audit-runs-tbody">
+                <tr><td colspan="7" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 8: 系统设置 / SETTINGS -->
+      <section class="tab-view" id="tab-settings">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">系统环境与模型配置</h3>
+              <p class="card-desc">管理 SiliconFlow、MinerU 等 API Keys 与向量模型参数</p>
+            </div>
+          </div>
+          <div class="form-grid-2col">
+            <div class="form-group">
+              <label class="form-label">SiliconFlow API Key</label>
+              <input type="password" class="form-input" id="set-siliconflow-key">
+            </div>
+            <div class="form-group">
+              <label class="form-label">MinerU API Key</label>
+              <input type="password" class="form-input" id="set-mineru-key">
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Document Detail Modal -->
+  <div class="modal-overlay" id="modal-doc-detail" style="display: none;">
+    <div class="modal-card modal-lg">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modal-doc-title">文献详情</h3>
+        <button class="modal-close-btn" id="btn-close-doc-modal">✕</button>
+      </div>
+      <div class="modal-body" id="modal-doc-body">
+        <!-- Injected by JS -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Candidate Approval Confirmation Modal -->
+  <div class="modal-overlay" id="modal-confirm-decision" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="confirm-modal-title">确认候选文献审批</h3>
+        <button class="modal-close-btn" id="btn-close-confirm-modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="confirm-modal-desc">您确定要对以下候选执行操作吗？</p>
+        <div class="confirm-items-list" id="confirm-modal-items"></div>
+        <div class="form-group mt-3">
+          <label class="form-label">审批决策依据 / 原因备注</label>
+          <input type="text" class="form-input" id="confirm-modal-reason" value="USER_SELECTED_FOR_CITATION_GRAPH_EXPANSION">
+        </div>
+        <div class="form-group">
+          <label class="form-label">操作人标识</label>
+          <input type="text" class="form-input" id="confirm-modal-operator" value="user_web_ui">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btn-cancel-confirm">取消</button>
+        <button class="btn btn-primary" id="btn-execute-confirm">确认执行</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+  <!-- Native Popover Toast Container (Modern Web Guidance) -->
+  <div id="toast-container" popover="manual" class="toast-container"></div>
+</body>
+</html>

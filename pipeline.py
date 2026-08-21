@@ -51,7 +51,7 @@ def main():
     console.rule("[bold blue]文献知识库自动构建 Pipeline (实时模式)")
 
     mineru_client = MinerUClient(settings.MINERU_API_KEY)
-    llm_router = LLMRouter(settings.DEEPSEEK_API_KEY, settings.GEMINI_API_KEY)
+    llm_router = LLMRouter()
 
     # 加载已处理的文献哈希，避免重复处理
     processed_hashes = load_processed_hashes(settings.EXCEL_OUTPUT_PATH)
@@ -210,10 +210,17 @@ def main():
         export_to_excel(excel_rows, settings.EXCEL_OUTPUT_PATH)
         console.print(f"[green]✅ 已写入 {len(excel_rows)} 条记录到 {settings.EXCEL_OUTPUT_PATH}")
 
+        # Step 7: 自动就地建立 4096 维 Qwen3 向量索引（云端 SiliconFlow 立即处理，无需等待夜间）
+        try:
+            from litreview.indexer import build_index
+            console.rule("[bold cyan]自动触发 4096 维 Qwen3 向量化构建")
+            build_index(settings=settings, console=console, doc_ids=[r["文献ID"] for r in excel_rows])
+        except Exception as e:
+            console.print(f"[yellow]⚠️ 实时向量化触发异常（可稍后重试）: {e}")
+
     console.rule("[bold green]✅ 所有文献处理完成！")
     return len(excel_rows)
 
 
 if __name__ == "__main__":
     main()
-

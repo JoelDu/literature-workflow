@@ -43,10 +43,9 @@ def _require_siliconflow():
 
 
 def _make_client():
-    from llm_router import make_deepseek_client
-    client, chat_model = make_deepseek_client(quiet=True)
-    review_model = settings.REVIEW_MODEL or chat_model
-    return client, review_model
+    from llm_router import make_openai_client
+    client, _analysis_model = make_openai_client(quiet=True)
+    return client, settings.REVIEW_MODEL
 
 
 def cmd_index(args):
@@ -54,9 +53,12 @@ def cmd_index(args):
     # 嵌入后端=local 时 build_index 只报待办、把活留给夜间脚本，全程不碰 SiliconFlow，
     # 不该因为没配 key 就把命令整个挡掉（本地方案的默认部署就是不配 key 的）。
     client = None
-    if getattr(settings, "REVIEW_EMBED_BACKEND", "local") != "local":
+    if getattr(settings, "REVIEW_EMBED_BACKEND", "remote") != "local":
         _require_siliconflow()
-        client, _ = _make_client()
+        # 嵌入端点继续使用硅基流动的 OpenAI-compatible client。
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
+                        base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180)
     report = build_index(settings, console, client, force=args.force)
     deferred = report.get("deferred", 0)
     log_run_event(mode="review", event="index_build",
@@ -98,7 +100,9 @@ def _make_reranker():
 def cmd_search(args):
     _require_siliconflow()
     from litreview.store import VectorStore
-    client, _ = _make_client()
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
+                    base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180)
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
     embedder = _make_embedder(client)
     qvec = embedder.embed_query(args.query)
@@ -137,7 +141,6 @@ def cmd_enrich(args):
     client = None
     use_llm = settings.REVIEW_ENRICH_LLM and not args.no_llm
     if use_llm:
-        _require_siliconflow()
         client, _ = _make_client()
     report = run_enrich(settings, console, client, force=args.force, use_llm=use_llm)
     log_run_event(mode="review", event="enrich", status="success",
@@ -151,7 +154,6 @@ def cmd_add_book(args):
     use_llm = settings.REVIEW_ENRICH_LLM and not args.no_llm
     client = None
     if use_llm:
-        _require_siliconflow()
         client, _ = _make_client()
 
     # 不传路径时默认扫描统一的书籍输入目录（与 INPUT_PDF_DIR 平行，自动创建）
@@ -377,16 +379,105 @@ def cmd_set_type(args):
                   extra={"ident": args.ident, "type": kind, "docs": len(hits)})
 
 
-def cmd_outline(args):
+def cmd_rm(args):
+    from litreview.store import VectorStore
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    hits = store.resolve_docs(args.ident)
+    if not hits:
+        console.print(f"[yellow]未找到与「{args.ident}」匹配的文献。[/yellow]")
+        return
+    if len(hits) > 1 and not args.all:
+        console.print(f"[yellow]「{args.ident}」匹配到 {len(hits)} 篇文献，为防误删请精确指定，或加 --all 确认全部删除：[/yellow]")
+        meta = store.get_paper_meta(hits)
+        for d in hits:
+            m = meta.get(d, {})
+            console.print(f"  {d[:8]}  《{m.get('title','-')}》 ({m.get('year') or '-'})")
+        return
+
+    keep_source = not args.delete_source
+    dry_run = not args.yes
+
+    if dry_run:
+        console.print(f"[cyan]=== 预演删除 (Dry-Run: 实际未删除，加 --yes 执行真正删除) ===[/cyan]")
+
+    for doc_id in hits:
+        res = store.delete_doc(doc_id, settings=settings, keep_source=keep_source, dry_run=dry_run)
+        status_tag = "[yellow]预演删除[/yellow]" if dry_run else "[green]已安全删除[/green]"
+        files_str = ", ".join(os.path.basename(f) for f in res["files_removed"]) if res["files_removed"] else "无"
+        console.print(f"{status_tag}: {doc_id[:8]} 《{res['title']}》\n"
+                      f"  - 数据库：papers 1 行, details {res['details_deleted']} 行, "
+                      f"chunks {res['chunks_deleted']} 条, assets {res['assets_deleted']} 条, "
+                      f"refs {res['refs_deleted']} 条, 证据缓存 {res['evidence_cache_deleted']} 条\n"
+                      f"  - Excel：移除 {res['excel_rows_removed']} 行\n"
+                      f"  - 物理文件/目录 ({len(res['files_removed'])} 项)：{files_str}")
+
+    if dry_run:
+        console.print(f"\n[bold yellow]以上为预演结果。确认要彻底删除请执行：\n  python review.py rm \"{args.ident}\" --yes{' --delete-source' if args.delete_source else ''}{' --all' if args.all else ''}[/bold yellow]")
+    else:
+        console.print(f"[bold green]✔ 级联删除完成：共清理 {len(hits)} 篇文献。[/bold green]")
+        log_run_event(mode="review", event="doc_remove", status="success",
+                      extra={"ident": args.ident, "docs": len(hits), "keep_source": keep_source})
+
+
+def cmd_ls(args):
+    import mcp_server
+    text = mcp_server.list_documents.__wrapped__(
+        query=args.query or "",
+        doc_type=args.type or "",
+        vector_status=args.vector_status or "",
+        sort_by=args.sort_by or "processed_at",
+        sort_order=args.sort_order or "desc",
+        cursor=args.cursor or 0,
+        limit=args.limit or 20
+    )
+    console.print(text)
+
+
+def cmd_reconcile(args):
+    import mcp_server
+    text = mcp_server.library_reconcile.__wrapped__()
+    console.print(text)
+
+
+def cmd_propose(args):
+    """预立论探测：从本地文献库提炼 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 主线逻辑）。"""
+    from litreview.store import VectorStore
+    from litreview.stages import propose_review_angles
+    client, _ = _make_client()
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
     _require_siliconflow()
+    from openai import OpenAI
+    embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))
+    console.print(f"[cyan]正在为主题「{args.topic}」扫描本地文献并提炼顶刊级立论方案...")
+    angles = propose_review_angles(args.topic, store, embedder, client, settings.ANALYSIS_MODEL,
+                                   settings, console, words=args.words or 0, target_lang=args.lang or "zh")
+    console.rule(f"[bold green]💡 综述立论与学术缺口备选方案（共 {len(angles)} 套）")
+    for a in angles:
+        console.print(f"\n[bold yellow]方案 {a.get('angle_id')}: 《{a.get('title')}》[/bold yellow]")
+        console.print(f"  [cyan]🎯 核心立论 (Thesis):[/cyan] {a.get('thesis')}")
+        console.print(f"  [red]🔍 学术缺口 (Gap):[/red] {a.get('research_gap')}")
+        console.print(f"  [blue]📐 主线逻辑:[/blue] {a.get('mainline_logic')}")
+        console.print(f"  [dim]💡 预期学术增量: {a.get('target_value')}")
+        secs = a.get('suggested_sections', [])
+        if secs:
+            console.print(f"  [dim]📋 建议章节: {' → '.join(secs)}")
+
+
+def cmd_outline(args):
     from litreview.store import VectorStore
     from litreview.stages import generate_outline
     client, model = _make_client()
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
-    embedder = _make_embedder(client)
+    _require_siliconflow()
+    from openai import OpenAI
+    embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))
     console.print(f"[cyan]正在为主题「{args.topic}」生成综述大纲...")
     outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
-                               focus=args.focus or "", n_sections=args.sections or 0)
+                               focus=args.focus or "", n_sections=args.sections or 0,
+                               words=args.words or 0, target_lang=args.lang or "zh",
+                               research_gap=getattr(args, 'gap', '') or '',
+                               thesis=getattr(args, 'thesis', '') or '',
+                               mainline_logic=getattr(args, 'logic', '') or '')
     console.rule(f"[bold green]📋 {outline.title}")
     for i, sec in enumerate(outline.sections, 1):
         console.print(f"[bold]{i}. {sec.heading}[/bold]")
@@ -399,7 +490,6 @@ def cmd_outline(args):
 
 
 def cmd_generate(args):
-    _require_siliconflow()
     import time
     from litreview.store import VectorStore
     from litreview.stages import (generate_outline, load_outline_file, gather_evidence,
@@ -409,7 +499,9 @@ def cmd_generate(args):
 
     client, model = _make_client()
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
-    embedder = _make_embedder(client)
+    _require_siliconflow()
+    from openai import OpenAI
+    embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))
     reranker = _make_reranker()
     if reranker:
         console.print(f"[dim]重排序已启用: {settings.RERANK_MODEL}")
@@ -423,9 +515,13 @@ def cmd_generate(args):
         outline = load_outline_file(args.outline, args.topic)
         console.print(f"[cyan]使用外部大纲: {outline.title}（{len(outline.sections)} 章节）")
     else:
-        console.print(f"[cyan]阶段 A：生成大纲...")
+        console.print(f"[cyan]阶段 A：生成大纲（结合立论与痛点）...")
         outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
-                                   focus=focus, n_sections=args.sections or 0)
+                                   focus=focus, n_sections=args.sections or 0,
+                                   words=args.words or 0, target_lang=args.lang or "zh",
+                                   research_gap=getattr(args, 'gap', '') or '',
+                                   thesis=getattr(args, 'thesis', '') or '',
+                                   mainline_logic=getattr(args, 'logic', '') or '')
         console.print(f"[green]✔ 大纲: {outline.title}（{len(outline.sections)} 章节）")
 
     # 字数分配：--words 指定全文目标总字数时，按写作指南篇幅权重摊分
@@ -447,7 +543,8 @@ def cmd_generate(args):
     section_evidence = []
     for i, sec in enumerate(outline.sections, 1):
         console.print(f"[cyan]阶段 B：收集证据 [{i}/{len(outline.sections)}] {sec.heading} ...")
-        ev = gather_evidence(sec, store, embedder, client, model, settings, console, paper_meta,
+        ev = gather_evidence(sec, store, embedder, client, settings.ANALYSIS_MODEL,
+                             settings, console, paper_meta,
                              reranker=reranker)
         console.print(f"  [green]✔ 保留 {len(ev)} 条证据")
         section_evidence.append(ev)
@@ -592,19 +689,54 @@ def main():
     p.add_argument("--all", action="store_true", help="匹配到多篇时全部修改")
     p.set_defaults(func=cmd_set_type)
 
-    p = sub.add_parser("outline", help="生成综述大纲")
-    p.add_argument("topic")
+    p = sub.add_parser("rm", help="安全级联删除文献（清除 6 张数据库表、3 处文件及 Excel 记录，默认 dry-run 预演）")
+    p.add_argument("ident", metavar="文献ID|编号|标题片段", help="要删除的文献（支持哈希前缀、专利/标准号、标题片段）")
+    p.add_argument("--yes", "-y", action="store_true", help="确认执行真正删除（未加此参数时仅预演输出）")
+    p.add_argument("--all", action="store_true", help="匹配到多篇时全部删除")
+    p.add_argument("--delete-source", action="store_true", help="同时从 processed_pdfs 删除源 PDF/EPUB（默认保留源文件）")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("ls", help="分页浏览文献目录与多维过滤（替代查 Excel）")
+    p.add_argument("-q", "--query", help="标题/作者/DOI/关键词模糊过滤")
+    p.add_argument("-t", "--type", choices=dt.all_types(), help="文献类型过滤")
+    p.add_argument("-v", "--vector-status", choices=["indexed", "pending", "not_eligible"], help="向量索引状态过滤")
+    p.add_argument("--sort-by", choices=["processed_at", "year", "title"], default="processed_at", help="排序字段")
+    p.add_argument("--sort-order", choices=["asc", "desc"], default="desc", help="排序方向")
+    p.add_argument("--cursor", type=int, default=0, help="分页游标偏移量")
+    p.add_argument("-n", "--limit", type=int, default=20, help="每页数量（默认 20）")
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("reconcile", help="严格只读地执行 SQLite/Excel/文件/索引四层数据对齐审计诊断")
+    p.set_defaults(func=cmd_reconcile)
+
+    p = sub.add_parser("propose", help="【大纲前置人机对齐】扫描本地文献，提炼 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 主线逻辑）")
+    p.add_argument("topic", help="综述主题")
+    p.add_argument("--words", type=int, help="目标字数预估（默认按 10000 字标准综述）")
+    p.add_argument("--lang", choices=["zh", "en"], default="zh", help="目标语言（默认 zh）")
+    p.set_defaults(func=cmd_propose)
+
+    p = sub.add_parser("outline", help="生成综述大纲（支持注入 Thesis 与 Research Gap）")
+    p.add_argument("topic", help="综述主题")
     p.add_argument("-o", "--output", help="保存大纲 JSON 的路径")
     p.add_argument("--focus", help="侧重方向（如：侧重工业应用与成本对比）")
-    p.add_argument("--sections", type=int, help="主体章节数（默认由模型定 3-6 个）")
+    p.add_argument("--words", type=int, help="目标总字数（自动匹配 3 档伸缩与门槛）")
+    p.add_argument("--sections", type=int, help="主体章节数（默认由模型根据字数档位自定）")
+    p.add_argument("--gap", help="一句话学术缺口与痛点（如：未解决的微塑料土壤降解矛盾）")
+    p.add_argument("--thesis", help="一句话核心立论（如：论证生物基改性可完全替代石化聚氨酯）")
+    p.add_argument("--logic", help="选定单一主线分类逻辑（如：要素并列利弊暗转 / 现状-危害-对策）")
+    p.add_argument("--lang", choices=["zh", "en"], default="zh", help="目标语言（默认 zh）")
     p.set_defaults(func=cmd_outline)
 
-    p = sub.add_parser("generate", help="生成完整综述")
-    p.add_argument("topic")
+    p = sub.add_parser("generate", help="生成完整综述（支持立论注入、多文献对比矩阵与一问一策展望）")
+    p.add_argument("topic", help="综述主题")
     p.add_argument("--outline", help="外部大纲文件（JSON 或 markdown）")
-    p.add_argument("--focus", help="侧重方向，贯穿大纲设计与全文写作（如：侧重环保型材料与降解机理）")
+    p.add_argument("--focus", help="侧重方向，贯穿大纲设计与全文写作")
     p.add_argument("--words", type=int, help="目标总字数（自动摊分到各章节与引言/结论）")
     p.add_argument("--sections", type=int, help="主体章节数（默认由模型定 3-6 个）")
+    p.add_argument("--gap", help="一句话学术缺口与痛点")
+    p.add_argument("--thesis", help="一句话核心立论")
+    p.add_argument("--logic", help="选定单一主线分类逻辑")
+    p.add_argument("--lang", choices=["zh", "en"], default="zh", help="目标语言（默认 zh）")
     p.add_argument("--dry-run", action="store_true", help="停在证据阶段，打印证据表")
     p.set_defaults(func=cmd_generate)
 

@@ -8,6 +8,7 @@ import posixpath
 import re
 import json
 import glob
+import sqlite3
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
@@ -15,9 +16,58 @@ from .store import VectorStore
 from .patent import detect_patent
 from . import doctype as dt
 from .doctype import detect_standard
+from .fetcher import fetch_crossref
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 _ASSET_TYPES = ("image", "chart", "table")
+
+
+def _sync_obsidian_note(doc_id: str, details: dict, settings, db_path: str):
+    """当识别出特定类型（专利、标准等）或元数据更新后，自动同步更新 Obsidian 笔记的排版与 frontmatter。"""
+    vault = getattr(settings, "OBSIDIAN_VAULT_DIR", "")
+    if not vault or not os.path.isdir(vault):
+        return
+    existing_notes = glob.glob(os.path.join(vault, f"*_{doc_id[:8]}.md"))
+    if not existing_notes:
+        return
+    try:
+        from utils import generate_obsidian_note
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT title, language, images_dir, result_json FROM papers WHERE id=?", (doc_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return
+        title, lang, images_dir, result_json = row
+        analysis = {}
+        if result_json:
+            try:
+                analysis = json.loads(result_json)
+            except Exception:
+                analysis = {}
+        images = []
+        if images_dir and os.path.exists(images_dir):
+            for ext in ["*.png", "*.jpg", "*.jpeg"]:
+                images.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
+
+        meta = {
+            "title": details.get("title") or title,
+            "language": lang or "zh",
+            "doc_type": details.get("doc_type", "paper"),
+            "patent_no": details.get("patent_no", ""),
+            "doc_no": details.get("doc_no", ""),
+            "filing_date": details.get("filing_date", ""),
+            "effective_date": details.get("effective_date", ""),
+            "publisher": details.get("publisher", ""),
+            "journal": details.get("journal", ""),
+            "year": details.get("year", ""),
+            "doi": details.get("doi", ""),
+            "authors": details.get("authors", ""),
+        }
+        generate_obsidian_note(meta, analysis, images, vault, doc_id)
+    except Exception:
+        pass
 
 
 def _resolve_paper_dir(images_dir: str, db_path: str) -> str:
@@ -194,21 +244,42 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
                     details["source"] = "patent-inid" if kind == "patent" else "standard-cover"
                     report["patents" if kind == "patent" else "standards"] += 1
 
-                # 3) LLM 补缺（不覆盖已有非空字段）
+                # 3) CrossRef Fetcher 免费权威元数据检索（若已提取到 DOI）
+                if not kind and details["doi"]:
+                    try:
+                        cr_meta = fetch_crossref(details["doi"])
+                        if cr_meta:
+                            if cr_meta.get("title") and not details.get("title_en"):
+                                details["title_en"] = cr_meta["title"]
+                            if cr_meta.get("authors"):
+                                details["authors"] = cr_meta["authors"]
+                            if cr_meta.get("journal"):
+                                details["journal"] = cr_meta["journal"]
+                            if cr_meta.get("year"):
+                                details["year"] = cr_meta["year"]
+                            if cr_meta.get("publisher"):
+                                details["publisher"] = cr_meta["publisher"]
+                            details["source"] = "local+crossref"
+                    except Exception as e:
+                        console.print(f"[dim]CrossRef 检索跳过 {doc_id[:8]}: {e}[/dim]")
+
+                # 4) LLM 补缺（不覆盖已有非空字段）
                 if use_llm and client is not None and not kind:
                     try:
-                        filled = _llm_fill(client, settings.REVIEW_MODEL, title or "",
+                        filled = _llm_fill(client, settings.ANALYSIS_MODEL, title or "",
                                            md_head or "", local, existing)
                         for k in ("title_zh", "title_en", "keywords"):
-                            details[k] = filled.get(k, "")
+                            if not details.get(k):
+                                details[k] = filled.get(k, "")
                         for k in ("doi", "authors", "journal", "year"):
                             if not details.get(k):
                                 details[k] = filled.get(k, "")
-                        details["source"] = "local+llm"
+                        details["source"] = "local+crossref+llm" if details["source"] == "local+crossref" else "local+llm"
                     except Exception as e:
                         console.print(f"[yellow]⚠️ LLM 补缺失败 {doc_id[:8]}（保留本地结果）: {e}")
 
                 store.save_enrichment(doc_id, details, local["assets"], local["refs"])
+                _sync_obsidian_note(doc_id, details, settings, settings.DB_PATH)
                 report["enriched"] += 1
                 report["with_doi"] += 1 if details["doi"] else 0
                 report["with_refs"] += 1 if local["refs"] else 0
@@ -246,7 +317,9 @@ def rescan_types(settings, console, apply: bool = False, only: str = "") -> dict
             continue
         found.append((doc_id, title, kind, info))
         if apply:
-            store.mark_doc_type(doc_id, kind, fields_for(kind, info))
+            fields = fields_for(kind, info)
+            store.mark_doc_type(doc_id, kind, fields)
+            _sync_obsidian_note(doc_id, {"doc_type": kind, **fields}, settings, settings.DB_PATH)
             changed += 1
 
     n_new = sum(1 for d, _t, k, _i in found if was.get(d, dt.DEFAULT_TYPE) != k)

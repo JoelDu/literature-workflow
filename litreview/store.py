@@ -29,17 +29,22 @@ def md_hash(text: str) -> str:
 
 
 class VectorStore:
-    def __init__(self, db_path: str, dim: int):
+    def __init__(self, db_path: str, dim: int, readonly: bool = False):
         self.db_path = db_path
         self.dim = dim
+        self.readonly = readonly
         self._matrix = None       # np.ndarray (n, dim)
         self._meta = None         # list[dict] 与矩阵行对应
         self._fingerprint = None  # 建矩阵那一刻的库指纹，用于发现别的进程写入的新向量
-        self.ensure_schema()
+        if not self.readonly:
+            self.ensure_schema()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA busy_timeout=30000")  # 与守护进程并发写时等待而非报错
+        if self.readonly:
+            conn = sqlite3.connect(f"file:{os.path.abspath(self.db_path)}?mode=ro", uri=True)
+        else:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("PRAGMA busy_timeout=30000")  # 与守护进程并发写时等待而非报错
         return conn
 
     def ensure_schema(self) -> None:
@@ -124,7 +129,10 @@ class VectorStore:
                             ("patent_no", "TEXT"), ("filing_date", "TEXT"),
                             ("legal_status", "TEXT"), ("status_checked_at", "TEXT"),
                             ("doc_no", "TEXT"), ("url", "TEXT"),
-                            ("effective_date", "TEXT")):
+                            ("effective_date", "TEXT"),
+                            ("quarantine_status", "TEXT DEFAULT 'NORMAL'"),
+                            ("quarantine_reason", "TEXT"),
+                            ("cite_key", "TEXT")):
             if _col not in _pd_cols:
                 c.execute(f"ALTER TABLE paper_details ADD COLUMN {_col} {_decl}")
         conn.commit()
@@ -132,18 +140,26 @@ class VectorStore:
 
     # ── 索引写入 ──────────────────────────────────────────────────────────
 
-    def docs_needing_index(self) -> list:
+    def docs_needing_index(self, doc_ids: list = None) -> list:
         """返回 [(doc_id, mineru_md, doc_type)]：未索引 / 内容变化 / 上次嵌入未完成的 EXPORTED 文档。
+        若传入 doc_ids 则仅检查指定文档。
         doc_type 供索引时按类型选块大小（书籍块更大）。"""
         conn = self._conn()
         c = conn.cursor()
-        c.execute("""
+        where_clause = "p.status = 'EXPORTED' AND p.mineru_md IS NOT NULL AND p.mineru_md != ''"
+        params = []
+        if doc_ids:
+            marks = ",".join("?" * len(doc_ids))
+            where_clause += f" AND p.id IN ({marks})"
+            params = list(doc_ids)
+
+        c.execute(f"""
             SELECT p.id, p.mineru_md, m.md_hash, m.embedded, COALESCE(d.doc_type, 'paper')
             FROM papers p
             LEFT JOIN review_index_meta m ON m.doc_id = p.id
             LEFT JOIN paper_details d ON d.doc_id = p.id
-            WHERE p.status = 'EXPORTED' AND p.mineru_md IS NOT NULL AND p.mineru_md != ''
-        """)
+            WHERE {where_clause}
+        """, params)
         rows = c.fetchall()
         conn.close()
         out = []
@@ -251,8 +267,11 @@ class VectorStore:
         self._fingerprint = fingerprint
         conn = self._conn()
         c = conn.cursor()
-        c.execute("""SELECT chunk_id, doc_id, section_title, content, embedding
-                     FROM review_chunks WHERE embedding IS NOT NULL""")
+        c.execute("""SELECT c.chunk_id, c.doc_id, c.section_title, c.content, c.embedding
+                     FROM review_chunks c
+                     LEFT JOIN paper_details d ON c.doc_id = d.doc_id
+                     WHERE c.embedding IS NOT NULL
+                       AND COALESCE(d.quarantine_status, 'NORMAL') = 'NORMAL'""")
         rows = c.fetchall()
         conn.close()
         if not rows:
@@ -327,7 +346,7 @@ class VectorStore:
                              d.title_zh, d.title_en, d.doi, d.authors, d.journal, d.year, d.keywords,
                              d.doc_type, d.publisher, d.pub_place, d.edition,
                              d.patent_no, d.filing_date, d.legal_status, d.status_checked_at,
-                             d.doc_no, d.url, d.effective_date
+                             d.doc_no, d.url, d.effective_date, d.cite_key
                       FROM papers p LEFT JOIN paper_details d ON d.doc_id = p.id"""
         if doc_ids:
             marks = ",".join("?" * len(doc_ids))
@@ -341,7 +360,7 @@ class VectorStore:
              d_title_zh, d_title_en, d_doi, d_authors, d_journal, d_year, d_keywords,
              d_doc_type, d_publisher, d_pub_place, d_edition,
              d_patent_no, d_filing_date, d_legal_status, d_status_checked,
-             d_doc_no, d_url, d_effective) in rows:
+             d_doc_no, d_url, d_effective, d_cite_key) in rows:
             meta = {"title": title or "", "language": language or "zh",
                     "authors": "", "journal": "", "year": "", "tldr": "",
                     "title_zh": d_title_zh or "", "title_en": d_title_en or "",
@@ -352,7 +371,8 @@ class VectorStore:
                     "legal_status": d_legal_status or "",
                     "status_checked_at": d_status_checked or "",
                     "doc_no": d_doc_no or "", "url": d_url or "",
-                    "effective_date": d_effective or ""}
+                    "effective_date": d_effective or "",
+                    "cite_key": d_cite_key or ""}
             if result_json:
                 try:
                     analysis = json.loads(result_json)
@@ -412,17 +432,17 @@ class VectorStore:
         if not key:
             return []
         flat = re.sub(r"[\s/]", "", key).upper()
-        cond = "(UPPER(d.doc_id) LIKE ? OR UPPER(COALESCE(d.patent_no,'')) = ? " \
+        cond = "(UPPER(p.id) LIKE ? OR UPPER(COALESCE(d.patent_no,'')) = ? " \
                "OR REPLACE(REPLACE(UPPER(COALESCE(d.doc_no,'')),' ',''),'/','') = ? " \
                "OR COALESCE(d.title_zh,'') LIKE ? OR COALESCE(p.title,'') LIKE ?)"
         args = [key.upper() + "%", key.upper(), flat, f"%{key}%", f"%{key}%"]
         if doc_type:
-            cond += " AND d.doc_type = ?"
+            cond += " AND COALESCE(d.doc_type, 'paper') = ?"
             args.append(doc_type)
         conn = self._conn()
         rows = conn.execute(
-            f"""SELECT d.doc_id FROM paper_details d
-                LEFT JOIN papers p ON p.id = d.doc_id WHERE {cond}""", args).fetchall()
+            f"""SELECT p.id FROM papers p
+                LEFT JOIN paper_details d ON d.doc_id = p.id WHERE {cond}""", args).fetchall()
         conn.close()
         return [r[0] for r in rows]
 
@@ -578,3 +598,142 @@ class VectorStore:
         return {"exported_docs": exported, "indexed_docs": indexed,
                 "pending_docs": len(self.docs_needing_index()),
                 "chunks": chunks, "embedded_chunks": embedded_chunks}
+
+    def clean_orphans(self) -> dict:
+        """清理无对应 review_chunks 的孤儿 review_index_meta 记录。"""
+        conn = self._conn()
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM review_index_meta
+            WHERE doc_id NOT IN (SELECT DISTINCT doc_id FROM review_chunks WHERE embedding IS NOT NULL)
+        """)
+        removed = c.rowcount
+        conn.commit()
+        conn.close()
+        return {"orphans_removed": removed}
+
+    def delete_doc(self, doc_id: str, settings=None, keep_source: bool = True,
+                   dry_run: bool = False) -> dict:
+        """安全级联删除一篇文献：
+        1. 解出 chunk_id 删 review_evidence_cache；
+        2. 删 6 张表：review_chunks, review_index_meta, paper_references, paper_assets, paper_details, papers;
+        3. 删 3 处物理文件：Obsidian 笔记 (*_<doc_id[:8]>.md), attachments/<doc_id>, mineru_output/book_output 中间产物目录;
+        4. 删 Excel 记录行;
+        5. (可选) keep_source=False 时同时删除 processed_pdfs 中的源文件。
+
+        返回包含被删除项数量和文件路径的 dict。
+        """
+        import glob
+        import shutil
+        from utils import remove_from_excel
+
+        report = {
+            "doc_id": doc_id,
+            "title": "",
+            "chunks_deleted": 0,
+            "evidence_cache_deleted": 0,
+            "meta_deleted": 0,
+            "assets_deleted": 0,
+            "refs_deleted": 0,
+            "details_deleted": 0,
+            "papers_deleted": 0,
+            "files_removed": [],
+            "excel_rows_removed": 0,
+            "dry_run": dry_run,
+        }
+
+        conn = self._conn()
+        row = conn.execute("SELECT title, pdf_path FROM papers WHERE id=?", (doc_id,)).fetchone()
+        title = row[0] if row else ""
+        pdf_path = row[1] if row else ""
+        report["title"] = title
+
+        chunk_rows = conn.execute("SELECT chunk_id FROM review_chunks WHERE doc_id=?", (doc_id,)).fetchall()
+        chunk_ids = [r[0] for r in chunk_rows]
+        report["chunks_deleted"] = len(chunk_ids)
+
+        if chunk_ids:
+            marks = ",".join("?" * len(chunk_ids))
+            ev_count = conn.execute(f"SELECT COUNT(*) FROM review_evidence_cache WHERE chunk_id IN ({marks})", chunk_ids).fetchone()[0]
+            report["evidence_cache_deleted"] = ev_count
+
+        meta_count = conn.execute("SELECT COUNT(*) FROM review_index_meta WHERE doc_id=?", (doc_id,)).fetchone()[0]
+        report["meta_deleted"] = meta_count
+        assets_count = conn.execute("SELECT COUNT(*) FROM paper_assets WHERE doc_id=?", (doc_id,)).fetchone()[0]
+        report["assets_deleted"] = assets_count
+        refs_count = conn.execute("SELECT COUNT(*) FROM paper_references WHERE doc_id=?", (doc_id,)).fetchone()[0]
+        report["refs_deleted"] = refs_count
+        details_count = conn.execute("SELECT COUNT(*) FROM paper_details WHERE doc_id=?", (doc_id,)).fetchone()[0]
+        report["details_deleted"] = details_count
+        report["papers_deleted"] = 1 if row else 0
+
+        files_to_remove = []
+        dirs_to_remove = []
+        if settings:
+            # 1. Obsidian notes & attachments
+            vault = getattr(settings, "OBSIDIAN_VAULT_DIR", "")
+            if vault and os.path.isdir(vault):
+                for f in glob.glob(os.path.join(vault, f"*_{doc_id[:8]}.md")):
+                    files_to_remove.append(f)
+                att_dir = os.path.join(vault, "attachments", doc_id)
+                if os.path.isdir(att_dir):
+                    dirs_to_remove.append(att_dir)
+
+            # 2. mineru_output
+            mineru_dir = getattr(settings, "MINERU_OUTPUT_DIR", "")
+            if mineru_dir and os.path.isdir(mineru_dir):
+                for d in glob.glob(os.path.join(mineru_dir, f"*_{doc_id[:8]}*")):
+                    if os.path.isdir(d):
+                        dirs_to_remove.append(d)
+
+            # 3. book_output
+            book_dir = getattr(settings, "BOOK_OUTPUT_DIR", "")
+            if book_dir and os.path.isdir(book_dir):
+                for d in glob.glob(os.path.join(book_dir, f"*_{doc_id[:8]}*")):
+                    if os.path.isdir(d):
+                        dirs_to_remove.append(d)
+
+            # 4. 源文件
+            if not keep_source and pdf_path and os.path.isfile(pdf_path):
+                files_to_remove.append(pdf_path)
+
+        report["files_removed"] = files_to_remove + dirs_to_remove
+
+        if not dry_run:
+            if chunk_ids:
+                marks = ",".join("?" * len(chunk_ids))
+                conn.execute(f"DELETE FROM review_evidence_cache WHERE chunk_id IN ({marks})", chunk_ids)
+            conn.execute("DELETE FROM review_chunks WHERE doc_id=?", (doc_id,))
+            conn.execute("DELETE FROM review_index_meta WHERE doc_id=?", (doc_id,))
+            conn.execute("DELETE FROM paper_references WHERE doc_id=?", (doc_id,))
+            conn.execute("DELETE FROM paper_assets WHERE doc_id=?", (doc_id,))
+            conn.execute("DELETE FROM paper_details WHERE doc_id=?", (doc_id,))
+            conn.execute("DELETE FROM papers WHERE id=?", (doc_id,))
+            conn.commit()
+
+            for f in files_to_remove:
+                try:
+                    if os.path.isfile(f):
+                        os.remove(f)
+                except Exception:
+                    pass
+            for d in dirs_to_remove:
+                try:
+                    if os.path.isdir(d):
+                        shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+
+            if settings and getattr(settings, "EXCEL_OUTPUT_PATH", ""):
+                try:
+                    report["excel_rows_removed"] = remove_from_excel([doc_id], settings.EXCEL_OUTPUT_PATH)
+                except Exception:
+                    pass
+
+            # 清除内存矩阵缓存
+            self._matrix = None
+            self._meta = None
+            self._fingerprint = None
+
+        conn.close()
+        return report

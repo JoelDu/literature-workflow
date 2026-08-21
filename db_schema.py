@@ -37,6 +37,49 @@ _HOT_COLS = (
     ("processed_at", "TEXT"),
 )
 
+LLM_USAGE_DAILY_DDL = """CREATE TABLE IF NOT EXISTS llm_usage_daily (
+    utc_date TEXT PRIMARY KEY,
+    reserved_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_input_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_output_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_total_tokens INTEGER NOT NULL DEFAULT 0,
+    submitted_batches INTEGER NOT NULL DEFAULT 0,
+    completed_batches INTEGER NOT NULL DEFAULT 0,
+    failed_batches INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+)"""
+
+LLM_BATCH_DDL = """CREATE TABLE IF NOT EXISTS llm_batches (
+    batch_id TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    utc_date TEXT NOT NULL,
+    reserved_tokens INTEGER NOT NULL,
+    actual_tokens INTEGER,
+    status TEXT NOT NULL,
+    usage_recorded INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)"""
+
+LLM_USAGE_MODEL_DAILY_DDL = """CREATE TABLE IF NOT EXISTS llm_usage_model_daily (
+    utc_date TEXT NOT NULL,
+    model TEXT NOT NULL,
+    reserved_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_input_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_output_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    actual_total_tokens INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (utc_date, model)
+)"""
+
+
+def ensure_llm_quota_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(LLM_USAGE_DAILY_DDL)
+    conn.execute(LLM_BATCH_DDL)
+    conn.execute(LLM_USAGE_MODEL_DAILY_DDL)
+
 
 def ensure_papers_table(conn: sqlite3.Connection, on_upgrade=None, on_error=None) -> list:
     """建表 + 按需补列。不 commit，由调用方决定事务边界。

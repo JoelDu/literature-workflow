@@ -43,7 +43,7 @@ def show_status():
             console.print("[yellow]数据库中目前没有任何文献记录。")
             conn.close()
             return
-            
+
         table = Table(title="文献处理状态分布统计")
         table.add_column("状态代码 (Status)", style="cyan")
         table.add_column("文献数量 (Count)", style="bold green", justify="right")
@@ -93,26 +93,20 @@ def run_doctor():
     """全面诊断当前部署配置，对网络、密钥、文件权限进行体检。"""
     console.rule("[bold cyan]🩺 Literature Analyzer 系统健康体检 (Doctor)")
     
-    # 1. 检验实际使用的凭据。DeepSeek 官方 Key 只是 SiliconFlow 未配置时的回退；
-    # Gemini 已不参与新任务，不再作为健康检查前置条件。
+    # 1. 检验三款 Key
     console.print("\n[bold]1. API 密钥合规性校验:[/bold]")
+    keys = {
+        "MINERU_API_KEY": settings.MINERU_API_KEY,
+        "OPENAI_API_KEY": settings.OPENAI_API_KEY,
+    }
     all_keys_ok = True
-    mineru_key = settings.MINERU_API_KEY
-    if not mineru_key or len(mineru_key) < 5:
-        console.print("  [-] [red]✖ MINERU_API_KEY 缺失或无效！[/red]")
-        all_keys_ok = False
-    else:
-        console.print("  [+] [green]✔ MINERU_API_KEY 已配置[/green] (****)")
-
-    sf_key = os.getenv("SILICONFLOW_API_KEY", "")
-    sf_base = os.getenv("SILICONFLOW_API_BASE", "")
-    if sf_key and sf_base:
-        console.print("  [+] [green]✔ SiliconFlow LLM 路由已配置[/green] (****)")
-    elif settings.DEEPSEEK_API_KEY:
-        console.print("  [+] [green]✔ 官方 DeepSeek 回退路由已配置[/green] (****)")
-    else:
-        console.print("  [-] [red]✖ 未配置 SiliconFlow 或官方 DeepSeek LLM 路由！[/red]")
-        all_keys_ok = False
+    for key_name, val in keys.items():
+        if not val or len(val) < 5:
+            console.print(f"  [-] [red]✖ {key_name} 缺失或无效！[/red]")
+            all_keys_ok = False
+        else:
+            masked = val[:4] + "*" * (len(val) - 8) + val[-4:] if len(val) > 8 else "****"
+            console.print(f"  [+] [green]✔ {key_name} 已配置[/green] ({masked})")
             
     # 2. 挂载目录读写权校验
     console.print("\n[bold]2. 存储及挂载目录校验:[/bold]")
@@ -159,13 +153,20 @@ def run_doctor():
         except Exception:
             console.print("  [dim]  [-] MinerU 云接口无心跳应答（非致命错误）[/dim]")
             
-        # 测试当前配置的 LLM 兼容接口连通性
-        llm_base = sf_base or os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
+        # 测试 DeepSeek 连通
         try:
-            resp = requests.get(llm_base, timeout=5, proxies=proxies)
-            console.print(f"  [+] [green]✔ LLM API 物理连通正常[/green] (Status: {resp.status_code})")
+            resp = requests.get("https://api.deepseek.com", timeout=5, proxies=proxies)
+            console.print(f"  [+] [green]✔ DeepSeek API 物理连通正常[/green] (Status: {resp.status_code})")
         except Exception as e:
-            console.print(f"  [-] [red]✖ 无法连接至 LLM API (请检查容器代理): {e}[/red]")
+            console.print(f"  [-] [red]✖ 无法连接至 DeepSeek API (请检查容器代理): {e}[/red]")
+            all_keys_ok = False
+            
+        # 测试 Gemini 连通
+        try:
+            resp = requests.get("https://generativelanguage.googleapis.com", timeout=5, proxies=proxies)
+            console.print(f"  [+] [green]✔ Gemini API 物理连通正常[/green] (Status: {resp.status_code})")
+        except Exception as e:
+            console.print(f"  [-] [red]✖ 无法连接至 Gemini API (请检查容器代理): {e}[/red]")
             all_keys_ok = False
             
     except Exception as e:
@@ -360,6 +361,21 @@ def show_history(days=7):
         console.print(f"[bold red]加载历史记录失败: {e}[/bold red]")
 
 
+def cmd_sync_excel():
+    from utils import sync_excel_with_db
+    console.rule("[bold cyan]🔄 重新对齐 Excel 总表与数据库")
+    count = sync_excel_with_db(settings.DB_PATH, settings.EXCEL_OUTPUT_PATH)
+    console.print(f"[bold green]✔ 对齐完成：已按数据库中实际 EXPORTED 状态的 {count} 篇文献全量重写 {settings.EXCEL_OUTPUT_PATH}[/bold green]")
+
+
+def cmd_clean_orphans():
+    from litreview.store import VectorStore
+    console.rule("[bold cyan]🧹 清理孤儿向量索引与残留元数据")
+    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    res = store.clean_orphans()
+    console.print(f"[bold green]✔ 清理完成：共移除 {res['orphans_removed']} 条无对应文本块的孤儿 review_index_meta 记录。[/bold green]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Literature Analyzer 运维及状态管理 CLI")
     subparsers = parser.add_subparsers(dest="command", help="运维指令集")
@@ -374,6 +390,12 @@ def main():
     # doctor 命令
     subparsers.add_parser("doctor", help="对系统网络、API 密钥、存储挂载做全方位系统健康度体检")
     
+    # sync-excel 命令
+    subparsers.add_parser("sync-excel", help="按数据库 EXPORTED 状态全量重建 Excel 总表，清除历史孤儿行")
+
+    # clean-orphans 命令
+    subparsers.add_parser("clean-orphans", help="清理无对应文本块的孤儿 review_index_meta 记录")
+
     # reset 命令
     reset_parser = subparsers.add_parser("reset", help="人工强制重置失败文献或指定任务以启动自动重试")
     reset_parser.add_argument("--failed", action="store_true", help="一键重置所有失败状态的任务 (SUBMIT_FAILED, BATCH_FAILED, RESULT_PARSE_FAILED)")
@@ -391,6 +413,10 @@ def main():
         show_history(days=args.days)
     elif args.command == "doctor":
         run_doctor()
+    elif args.command == "sync-excel":
+        cmd_sync_excel()
+    elif args.command == "clean-orphans":
+        cmd_clean_orphans()
     elif args.command == "reset":
         reset_tasks(failed_only=args.failed, doc_id=args.id)
     elif args.command == "run":

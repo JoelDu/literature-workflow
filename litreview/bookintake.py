@@ -111,7 +111,7 @@ def extract_book_meta(md_head: str, pdf_path: str, client, settings, use_llm: bo
             from .stages import _chat_json
             prompt = BOOK_META_PROMPT.format(
                 filename=os.path.basename(pdf_path), md_head=(md_head or "")[:2500])
-            data = _chat_json(client, settings.REVIEW_MODEL, prompt)
+            data = _chat_json(client, settings.ANALYSIS_MODEL, prompt)
             for k in ("authors", "publisher", "pub_place", "edition", "year"):
                 v = str(data.get(k, "") or "").strip()
                 if v and not meta.get(k):
@@ -394,7 +394,7 @@ def add_epub(epub_path: str, settings, console, client=None, use_llm: bool = Tru
     if use_llm and client is not None and not meta.get("authors"):
         try:
             from .stages import _chat_json
-            data = _chat_json(client, settings.REVIEW_MODEL, BOOK_META_PROMPT.format(
+            data = _chat_json(client, settings.ANALYSIS_MODEL, BOOK_META_PROMPT.format(
                 filename=os.path.basename(epub_path), md_head=md_text[:2500]))
             for k in ("authors", "publisher", "pub_place", "edition", "year"):
                 v = str(data.get(k, "") or "").strip()

@@ -22,6 +22,9 @@ class Settings(BaseModel):
     # 凭据在真正创建对应客户端时校验。status/history/types 等纯本地命令不应因为
     # 没有 API Key 而无法查看；DEEPSEEK_API_KEY 也只是 SiliconFlow 未配置时的回退。
     MINERU_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
+    OPENAI_API_BASE: str = "https://api.openai.com/v1"
+    ANALYSIS_MODEL: str = "gpt-5.4-mini"                # 论文分析、元数据、证据筛选
     DEEPSEEK_API_KEY: str = ""
     GEMINI_API_KEY: str = ""  # 仅兼容历史 Gemini Batch 任务，新任务不使用
     
@@ -51,15 +54,15 @@ class Settings(BaseModel):
     EMBEDDING_DIM: int = 4096
     EMBEDDING_BATCH_SIZE: int = 32
     EMBEDDING_QUERY_INSTRUCTION: str = "给定一个中文或英文的检索问题，找出能回答该问题的文献段落"
-    # remote=文档嵌入走在线 API；local=交给夜间任务 nightly_index.py 用本地权重跑。
-    # 查询侧（mcp_server/review.py）永远走在线：本地单条要 195 秒冷启动，做不了交互。
-    REVIEW_EMBED_BACKEND: str = "local"
+    # remote=文档嵌入走在线 API；local=交给 nightly_index.py 用本地权重跑。
+    # 默认使用在线 API，避免新部署意外加载大型本地模型。
+    REVIEW_EMBED_BACKEND: str = "remote"
     LOCAL_EMBEDDING_MODEL_PATH: str = ""
-    NIGHTLY_INDEX_DEADLINE: str = "08:00"     # 夜间嵌入任务的收工时间（HH:MM，到点存盘退出）
+    NIGHTLY_INDEX_DEADLINE: str = "08:00"     # 仅本地嵌入任务使用
     RERANK_MODEL: str = "Qwen/Qwen3-Reranker-8B"
     RERANK_ENABLE: bool = True
     RERANK_CANDIDATES: int = 50              # 向量召回候选数（rerank 后取 REVIEW_TOP_K）
-    REVIEW_MODEL: str = "deepseek-ai/DeepSeek-V4-Pro"   # 综述写作模型（SiliconFlow）
+    REVIEW_MODEL: str = "gpt-5.4"                       # 仅综述写作使用；论文分析固定 mini
     REVIEW_ENRICH_LLM: bool = True           # enrich 时是否用 LLM 补缺元数据
     REVIEW_CHUNK_SIZE: int = 1000
     REVIEW_CHUNK_OVERLAP: int = 150
@@ -67,10 +70,10 @@ class Settings(BaseModel):
     # 4800 原始字符≈3000 汉字（实测中文 1 汉字≈1.6 原始字符）；英文同口径。
     BOOK_CHUNK_SIZE: int = 4800
     BOOK_CHUNK_OVERLAP: int = 600
-    REVIEW_TOP_K: int = 24
+    REVIEW_TOP_K: int = 50                # 每章进入 GPT 评估前的重排候选数
     REVIEW_MAX_CHUNKS_PER_DOC: int = 4
     REVIEW_MIN_SCORE: int = 6
-    REVIEW_EVIDENCE_N: int = 10
+    REVIEW_EVIDENCE_N: int = 20            # 每章最终保留的高分证据数
     REVIEW_MAP_CONCURRENCY: int = 8
     REVIEW_OUTPUT_DIR: str = "./obsidian_vault/reviews"
     REVIEW_AUTO_INDEX: bool = True           # 导出后自动增量更新向量索引
@@ -84,6 +87,10 @@ class Settings(BaseModel):
     REVIEW_INSERT_FIGURES: bool = True       # 综述是否自动插入相关论文图表
     REVIEW_FIGURES_PER_SECTION: int = 2      # 每章节最多插图数
     REVIEW_FIGURE_MIN_SCORE: float = 0.2     # 图题 rerank 相关度阈值（低于不插）
+    LLM_DAILY_TOKEN_CAP: int = 2_000_000
+    LLM_BATCH_TOKEN_CAP: int = 600_000
+    LLM_MAX_INPUT_TOKENS: int = 200_000
+    REVIEW_DAILY_TOKEN_CAP: int = 200_000                # GPT-5.4 的 250k 日额度留出余量
 
 
 _settings = None
@@ -99,8 +106,9 @@ def get_settings() -> Settings:
         try:
             config_dict = {
                 "MINERU_API_KEY": os.getenv("MINERU_API_KEY", ""),
-                "DEEPSEEK_API_KEY": os.getenv("DEEPSEEK_API_KEY", ""),
-                "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+                "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+                "OPENAI_API_BASE": os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
+                "ANALYSIS_MODEL": "gpt-5.4-mini",
                 "INPUT_PDF_DIR": os.getenv("INPUT_PDF_DIR", "./input_pdfs"),
                 "MINERU_OUTPUT_DIR": os.getenv("MINERU_OUTPUT_DIR", "./mineru_output"),
                 "OBSIDIAN_VAULT_DIR": os.getenv("OBSIDIAN_VAULT_DIR", "./obsidian_vault"),
@@ -125,17 +133,18 @@ def get_settings() -> Settings:
                 "RERANK_MODEL": os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-8B"),
                 "RERANK_ENABLE": os.getenv("RERANK_ENABLE", "true").lower() == "true",
                 "RERANK_CANDIDATES": int(os.getenv("RERANK_CANDIDATES", "50")),
-                "REVIEW_MODEL": os.getenv("REVIEW_MODEL", "deepseek-ai/DeepSeek-V4-Pro"),
+                # 固定值，故意不读取环境变量，避免综述写作被意外换模型。
+                "REVIEW_MODEL": "gpt-5.4",
                 "REVIEW_ENRICH_LLM": os.getenv("REVIEW_ENRICH_LLM", "true").lower() == "true",
                 "REVIEW_CHUNK_SIZE": int(os.getenv("REVIEW_CHUNK_SIZE", "1000")),
                 "REVIEW_CHUNK_OVERLAP": int(os.getenv("REVIEW_CHUNK_OVERLAP", "150")),
                 "BOOK_CHUNK_SIZE": int(os.getenv("BOOK_CHUNK_SIZE", "4800")),
                 "BOOK_CHUNK_OVERLAP": int(os.getenv("BOOK_CHUNK_OVERLAP", "600")),
-                "REVIEW_TOP_K": int(os.getenv("REVIEW_TOP_K", "24")),
+                "REVIEW_TOP_K": int(os.getenv("REVIEW_TOP_K", "50")),
                 "REVIEW_MAX_CHUNKS_PER_DOC": int(os.getenv("REVIEW_MAX_CHUNKS_PER_DOC", "4")),
                 "REVIEW_MIN_SCORE": int(os.getenv("REVIEW_MIN_SCORE", "6")),
-                "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "10")),
-                "REVIEW_EMBED_BACKEND": os.getenv("REVIEW_EMBED_BACKEND", "local"),
+                "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "20")),
+                "REVIEW_EMBED_BACKEND": os.getenv("REVIEW_EMBED_BACKEND", "remote"),
                 "LOCAL_EMBEDDING_MODEL_PATH": os.getenv("LOCAL_EMBEDDING_MODEL_PATH", ""),
                 "NIGHTLY_INDEX_DEADLINE": os.getenv("NIGHTLY_INDEX_DEADLINE", "08:00"),
                 "REVIEW_MAP_CONCURRENCY": int(os.getenv("REVIEW_MAP_CONCURRENCY", "8")),
@@ -151,6 +160,11 @@ def get_settings() -> Settings:
                 "REVIEW_INSERT_FIGURES": os.getenv("REVIEW_INSERT_FIGURES", "true").lower() == "true",
                 "REVIEW_FIGURES_PER_SECTION": int(os.getenv("REVIEW_FIGURES_PER_SECTION", "2")),
                 "REVIEW_FIGURE_MIN_SCORE": float(os.getenv("REVIEW_FIGURE_MIN_SCORE", "0.2")),
+                # 项目免费额度硬阀：不读环境变量，避免部署配置误改后进入付费区间。
+                "LLM_DAILY_TOKEN_CAP": 2_000_000,
+                "LLM_BATCH_TOKEN_CAP": 600_000,
+                "LLM_MAX_INPUT_TOKENS": 200_000,
+                "REVIEW_DAILY_TOKEN_CAP": 200_000,
             }
             _settings = Settings(**config_dict)
         except ValidationError as e:
@@ -329,16 +343,18 @@ def generate_obsidian_note(
 
     from litreview import doctype as dt
 
-    doc_type = dt.normalize(paper_meta.get("doc_type", "")) or dt.DEFAULT_TYPE
+    doc_type = dt.normalize(
+        paper_meta.get("doc_type") or analysis.get("doc_type") or "paper"
+    ) or dt.DEFAULT_TYPE
     source_fields = {
-        "paper": ("期刊/会议", paper_meta.get("journal", "")),
-        "conf": ("会议", paper_meta.get("journal", "")),
-        "patent": ("专利号", paper_meta.get("patent_no", "")),
-        "standard": ("标准号", paper_meta.get("doc_no", "")),
-        "book": ("出版社", paper_meta.get("publisher", "")),
-        "report": ("发布机构", paper_meta.get("publisher", "")),
-        "thesis": ("授予单位", paper_meta.get("publisher", "")),
-        "web": ("网址", paper_meta.get("url", "")),
+        "paper": ("期刊/会议", paper_meta.get("journal") or analysis.get("journal", "")),
+        "conf": ("会议", paper_meta.get("journal") or analysis.get("journal", "")),
+        "patent": ("专利号", paper_meta.get("patent_no") or analysis.get("patent_no", "")),
+        "standard": ("标准号", paper_meta.get("doc_no") or analysis.get("doc_no", "")),
+        "book": ("出版社", paper_meta.get("publisher") or analysis.get("publisher", "")),
+        "report": ("发布机构", paper_meta.get("publisher") or analysis.get("publisher", "")),
+        "thesis": ("授予单位", paper_meta.get("publisher") or analysis.get("publisher", "")),
+        "web": ("网址", paper_meta.get("url") or analysis.get("url", "")),
     }
     source_label, detected_source = source_fields.get(doc_type, ("来源", ""))
 
@@ -375,8 +391,14 @@ def generate_obsidian_note(
         current_date=datetime.now().strftime("%Y-%m-%d"),
         title=paper_meta.get("title", "Unknown Title"),
         authors=analysis.get("authors") or paper_meta.get("authors") or "未提取",
-        year=analysis.get("year") or datetime.now().strftime("%Y"),
-        journal=analysis.get("journal") or paper_meta.get("journal") or "未提取",
+        year=analysis.get("year") or paper_meta.get("year") or datetime.now().strftime("%Y"),
+        journal=analysis.get("journal") or paper_meta.get("journal") or "",
+        doi=analysis.get("doi") or paper_meta.get("doi") or "",
+        patent_no=paper_meta.get("patent_no") or analysis.get("patent_no") or "",
+        doc_no=paper_meta.get("doc_no") or analysis.get("doc_no") or "",
+        filing_date=paper_meta.get("filing_date") or analysis.get("filing_date") or "",
+        effective_date=paper_meta.get("effective_date") or analysis.get("effective_date") or "",
+        publisher=paper_meta.get("publisher") or analysis.get("publisher") or "",
         tldr=analysis.get("tldr", ""),
         abstract=analysis.get("abstract", "") or paper_meta.get("abstract", ""),
         background=analysis.get("background", ""),
@@ -427,6 +449,74 @@ def export_to_excel(rows: list[dict], excel_path: str) -> None:
         combined.to_excel(excel_path, index=False, engine="openpyxl")
     else:
         new_df.to_excel(excel_path, index=False, engine="openpyxl")
+
+
+def remove_from_excel(doc_ids: list | set, excel_path: str) -> int:
+    """从 Excel 汇总表中删除指定文献 ID 对应的行，返回删除的行数。"""
+    if not os.path.exists(excel_path) or not doc_ids:
+        return 0
+    id_set = set(doc_ids)
+    try:
+        df = pd.read_excel(excel_path, engine="openpyxl")
+        if "文献ID" not in df.columns:
+            return 0
+        initial_len = len(df)
+        df = df[~df["文献ID"].isin(id_set)]
+        removed_count = initial_len - len(df)
+        if removed_count > 0:
+            df.to_excel(excel_path, index=False, engine="openpyxl")
+        return removed_count
+    except Exception as e:
+        print(f"[Warning] 更新 Excel 异常: {e}")
+        return 0
+
+
+def sync_excel_with_db(db_path: str, excel_path: str) -> int:
+    """按数据库中实际 EXPORTED 状态的文献全量重建/重对齐 Excel 总表，清除历史孤儿行。"""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT p.id, p.title, COALESCE(d.authors, ''), COALESCE(d.year, ''),
+               COALESCE(d.journal, ''), p.pdf_path, p.language, p.status,
+               p.batch_provider, p.batch_job_id, p.processed_at, p.result_json,
+               COALESCE(d.doc_type, 'paper')
+        FROM papers p
+        LEFT JOIN paper_details d ON d.doc_id = p.id
+        WHERE p.status = 'EXPORTED'
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    excel_rows = []
+    for (doc_id, title, authors, year, journal, pdf_path, lang, status,
+         provider, job_id, processed_at, result_json, doc_type) in rows:
+        tldr = ""
+        try:
+            if result_json:
+                tldr = json.loads(result_json).get("tldr", "")
+        except Exception:
+            pass
+        safe = "".join(c for c in title if c.isalnum() or c in " -_").strip() or "Untitled"
+        note_name = f"{safe}_{doc_id[:8]}"
+        excel_rows.append({
+            "文献ID": doc_id,
+            "标题": title,
+            "作者": authors,
+            "年份": year,
+            "期刊": journal,
+            "文件路径": pdf_path,
+            "Obsidian链接": f"[[{note_name}]]",
+            "TLDR": tldr,
+            "语言": lang or "zh",
+            "状态": status,
+            "服务商": provider or "",
+            "批量任务ID": job_id or "",
+            "解析时间": processed_at or "",
+        })
+    os.makedirs(os.path.dirname(excel_path), exist_ok=True)
+    df = pd.DataFrame(excel_rows)
+    df.to_excel(excel_path, index=False, engine="openpyxl")
+    return len(excel_rows)
 
 
 # ── 运行历史日志记录 ─────────────────────────────────────────────────────────
@@ -562,5 +652,3 @@ def _log_retention_days() -> int:
 _retention = _log_retention_days()
 sys.stdout = TeeLogger(_data_dir(), sys.stdout, retention_days=_retention)
 sys.stderr = TeeLogger(_data_dir(), sys.stderr, retention_days=_retention)
-
-
