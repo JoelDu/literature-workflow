@@ -82,13 +82,14 @@ class LLMRouter:
             },
         }
 
-    def analyze_paper(self, markdown_text: str) -> dict:
+    def analyze_paper(self, markdown_text: str):
         return self._call_openai(markdown_text)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-    def _call_openai(self, text: str) -> dict:
+    def _call_openai(self, text: str):
         # 实时模式同样消耗额度，必须和 Batch/元数据共用 UTC 账本。
         from litreview.quota import reconcile, reserve
+        from litreview.analysis_record import PaperAnalysisRecord
         from utils import get_settings
         req = self.build_request("realtime", text)["body"]
         prompt = req["messages"][0]["content"] + "\n" + req["messages"][1]["content"]
@@ -96,7 +97,4 @@ class LLMRouter:
         response = self.openai_client.chat.completions.create(**req)
         reconcile(get_settings(), self.openai_model, reservation, response.usage)
         content = response.choices[0].message.content
-        try:
-            return json.loads(content)
-        except Exception as exc:
-            return {"error": str(exc), "raw": content}
+        return PaperAnalysisRecord.from_llm_json(content, markdown_text=text)

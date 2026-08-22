@@ -131,22 +131,18 @@ def main():
             progress.update(main_task, description=f"[magenta]AI 分析: {filename}")
             try:
                 analysis = llm_router.analyze_paper(md_text)
-                if "error" in analysis:
-                    err_msg = str(analysis['error']).lower()
+                if analysis.error:
+                    err_msg = str(analysis.error).lower()
                     is_transient = any(kw in err_msg for kw in ["timeout", "network", "rate limit", "connection", "try again", "busy"])
                     if is_transient:
-                        console.print(f"[yellow]⚠️ LLM 分析出错 (临时失败) {filename}: {analysis['error']}")
-                        log_run_event(mode="realtime", event="paper_processed", title=title, doc_id=doc_id, status="failed", error=f"LLM 临时出错: {analysis['error']}", extra={"stage": "llm", "type": "transient"})
+                        console.print(f"[yellow]⚠️ LLM 分析出错 (临时失败) {filename}: {analysis.error}")
+                        log_run_event(mode="realtime", event="paper_processed", title=title, doc_id=doc_id, status="failed", error=f"LLM 临时出错: {analysis.error}", extra={"stage": "llm", "type": "transient"})
                     else:
-                        console.print(f"[red]LLM 分析出错 (永久失败) {filename}: {analysis['error']}")
+                        console.print(f"[red]LLM 分析出错 (永久失败) {filename}: {analysis.error}")
                         shutil.move(pdf_path, os.path.join(settings.FAILED_PDF_DIR, filename))
-                        log_run_event(mode="realtime", event="paper_processed", title=title, doc_id=doc_id, status="failed", error=f"LLM 永久出错: {analysis['error']}", extra={"stage": "llm", "type": "permanent"})
+                        log_run_event(mode="realtime", event="paper_processed", title=title, doc_id=doc_id, status="failed", error=f"LLM 永久出错: {analysis.error}", extra={"stage": "llm", "type": "permanent"})
                     progress.advance(main_task)
                     continue
-
-                # 提取原始摘要，并与 LLM 提取的做融合校验，确保 100% 正确保留原始摘要
-                orig_abstract = extract_original_abstract(md_text)
-                analysis["abstract"] = orig_abstract or analysis.get("abstract", "")
 
             except Exception as e:
                 import requests
@@ -184,21 +180,15 @@ def main():
                 console.print(f"[yellow]归档 PDF 失败 {filename}, 回退记录原路径: {e}")
                 dest_pdf_path = pdf_path
 
-            # Step 5: 收集 Excel 行（记录归档后的真实路径，绝不失效！）
-            excel_rows.append({
-                "文献ID": doc_id,
-                "标题": title,
-                "关键词": analysis.get("keywords", ""),
-                "肥料开发借鉴": analysis.get("fertilizer_implications", ""),
-                "TLDR": analysis.get("tldr", ""),
-                "作者": analysis.get("authors", ""),
-                "年份": analysis.get("year", ""),
-                "期刊": analysis.get("journal", ""),
-                "文件路径": dest_pdf_path,
-                "Obsidian链接": f"[[{obsidian_link_name}]]",
-                "语言": analysis.get("language", ""),
-                "解析时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
+            # Step 5: 收集 Excel 行（通过深模块自动格式化）
+            excel_rows.append(analysis.to_excel_row(
+                doc_id=doc_id,
+                title=title,
+                pdf_path=dest_pdf_path,
+                note_name=obsidian_link_name,
+                status="SUCCESS",
+                provider="openai",
+            ))
 
             # 保存已处理成功的文献哈希
             save_processed_hash(settings.EXCEL_OUTPUT_PATH, doc_id)

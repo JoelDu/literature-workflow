@@ -859,10 +859,13 @@ def _export_completed(c, conn) -> int:
 
     excel_rows = []
     for doc_id, title, pdf_path, lang, images_dir, result_json, provider, job_id, md_text in completed:
-        try:
-            analysis = json.loads(result_json)
-        except (json.JSONDecodeError, TypeError):
-            analysis = {"tldr": "结果解析 JSON 失败", "background": result_json or ""}
+        from litreview.analysis_record import PaperAnalysisRecord
+        note_meta = build_note_metadata(title, md_text or "", lang)
+        analysis = PaperAnalysisRecord.from_llm_json(
+            result_json,
+            markdown_text=md_text or "",
+            paper_meta=note_meta,
+        )
 
         images = []
         if images_dir and os.path.exists(images_dir):
@@ -871,35 +874,21 @@ def _export_completed(c, conn) -> int:
         images = [os.path.abspath(img) for img in images]
 
         # 导出 Obsidian，携带 doc_id 以确保生成带哈希的安全跨平台相对附件笔记
-        note_meta = build_note_metadata(title, md_text or "", lang)
         note_path = generate_obsidian_note(note_meta, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
         note_filename = os.path.basename(note_path)
         obsidian_link_name = os.path.splitext(note_filename)[0]
 
-        # 不清理 MinerU 中间文件（保留公式/表格切片图片及中间 Markdown 结果）
-        output_folder = os.path.dirname(images_dir) if images_dir else os.path.join(settings.MINERU_OUTPUT_DIR, f"{title}_{doc_id[:8]}")
-        # if os.path.exists(output_folder):
-        #     shutil.rmtree(output_folder, ignore_errors=True)
-        #     console.print(f"[dim]已清理 MinerU 中间文件: {output_folder}[/dim]")
-
-        # 收集 Excel，携带更加全面的状态、批量任务与文献 ID 字段
-        excel_rows.append({
-            "文献ID": doc_id,
-            "标题": title,
-            "关键词": analysis.get("keywords", ""),
-            "肥料开发借鉴": analysis.get("fertilizer_implications", ""),
-            "TLDR": analysis.get("tldr", ""),
-            "作者": analysis.get("authors", ""),
-            "年份": analysis.get("year", ""),
-            "期刊": analysis.get("journal", ""),
-            "文件路径": pdf_path,  # 已经处于归档 processed_pdfs/ 下的真实有效路径
-            "Obsidian链接": f"[[{obsidian_link_name}]]",
-            "语言": lang,
-            "状态": "EXPORTED",
-            "服务商": provider,
-            "批量任务ID": job_id,
-            "解析时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        })
+        # 收集 Excel，通过深模块自动格式化与列对齐
+        excel_rows.append(analysis.to_excel_row(
+            doc_id=doc_id,
+            title=title,
+            pdf_path=pdf_path,
+            note_name=obsidian_link_name,
+            status="EXPORTED",
+            provider=provider,
+            job_id=job_id,
+            processed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
 
         # 移至导出终态
         c.execute("UPDATE papers SET status=? WHERE id=?", (STATUS_EXPORTED, doc_id))

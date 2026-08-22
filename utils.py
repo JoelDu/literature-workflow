@@ -10,6 +10,7 @@ import hashlib
 import shutil
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 import pandas as pd
 from jinja2 import Template
@@ -329,7 +330,7 @@ def build_note_metadata(title: str, markdown: str = "", language: str = "") -> d
 
 def generate_obsidian_note(
     paper_meta: dict,
-    analysis: dict,
+    analysis: dict | Any,
     images: list,
     obsidian_dir: str,
     doc_id: str,
@@ -338,89 +339,22 @@ def generate_obsidian_note(
     """渲染 Obsidian Markdown 笔记，将提取的图片拷贝到 vault 的相对附件子目录下。
     用 '文献ID' 哈希对文件名防覆盖，图片链接采用相对路径跨系统自适应。
     """
-    if template_path is None:
-        template_path = get_template_path()
-
-    from litreview import doctype as dt
-
-    doc_type = dt.normalize(
-        paper_meta.get("doc_type") or analysis.get("doc_type") or "paper"
-    ) or dt.DEFAULT_TYPE
-    source_fields = {
-        "paper": ("期刊/会议", paper_meta.get("journal") or analysis.get("journal", "")),
-        "conf": ("会议", paper_meta.get("journal") or analysis.get("journal", "")),
-        "patent": ("专利号", paper_meta.get("patent_no") or analysis.get("patent_no", "")),
-        "standard": ("标准号", paper_meta.get("doc_no") or analysis.get("doc_no", "")),
-        "book": ("出版社", paper_meta.get("publisher") or analysis.get("publisher", "")),
-        "report": ("发布机构", paper_meta.get("publisher") or analysis.get("publisher", "")),
-        "thesis": ("授予单位", paper_meta.get("publisher") or analysis.get("publisher", "")),
-        "web": ("网址", paper_meta.get("url") or analysis.get("url", "")),
-    }
-    source_label, detected_source = source_fields.get(doc_type, ("来源", ""))
-
-    with open(template_path, "r", encoding="utf-8") as f:
-        template = Template(f.read())
-
-    # 1. 建立相对附件目录 obsidian_vault/attachments/<doc_id>/
-    attachments_rel_path = os.path.join("attachments", doc_id)
-    attachments_dir = os.path.join(obsidian_dir, attachments_rel_path)
-    os.makedirs(attachments_dir, exist_ok=True)
-
-    # 2. 拷贝图片并转换为相对路径链接
-    relative_image_links = []
-    for img_path in images:
-        if os.path.exists(img_path):
-            img_name = os.path.basename(img_path)
-            dest_path = os.path.join(attachments_dir, img_name)
-            try:
-                shutil.copy2(img_path, dest_path)
-                # 使用相对路径，如 "attachments/a1b2c3d4/figure.png" 写入笔记
-                relative_link = f"attachments/{doc_id}/{img_name}".replace("\\", "/")
-                relative_image_links.append(relative_link)
-            except Exception as e:
-                print(f"[yellow]拷贝图片到附件目录失败 {img_path}: {e}")
-        else:
-            print(f"[yellow]未找到源图片文件: {img_path}")
-
-    note_content = template.render(
-        doc_type=doc_type,
-        doc_type_label=dt.label(doc_type),
-        source_label=source_label,
-        source_value=detected_source or analysis.get("journal") or "未提取",
-        language=analysis.get("language", paper_meta.get("language", "en")),
-        current_date=datetime.now().strftime("%Y-%m-%d"),
-        title=paper_meta.get("title", "Unknown Title"),
-        authors=analysis.get("authors") or paper_meta.get("authors") or "未提取",
-        year=analysis.get("year") or paper_meta.get("year") or datetime.now().strftime("%Y"),
-        journal=analysis.get("journal") or paper_meta.get("journal") or "",
-        doi=analysis.get("doi") or paper_meta.get("doi") or "",
-        patent_no=paper_meta.get("patent_no") or analysis.get("patent_no") or "",
-        doc_no=paper_meta.get("doc_no") or analysis.get("doc_no") or "",
-        filing_date=paper_meta.get("filing_date") or analysis.get("filing_date") or "",
-        effective_date=paper_meta.get("effective_date") or analysis.get("effective_date") or "",
-        publisher=paper_meta.get("publisher") or analysis.get("publisher") or "",
-        tldr=analysis.get("tldr", ""),
-        fertilizer_implications=analysis.get("fertilizer_implications", ""),
-        keywords=analysis.get("keywords", ""),
-        abstract=analysis.get("abstract", "") or paper_meta.get("abstract", ""),
-        background=analysis.get("background", ""),
-        methods=analysis.get("methods", ""),
-        results=analysis.get("results", ""),
-        conclusion=analysis.get("conclusion", ""),
-        images=relative_image_links,
-    )
-
-    raw_title = paper_meta.get("title", "Untitled")
-    safe_title = "".join(c for c in raw_title if c.isalnum() or c in " -_").strip()
-    if not safe_title:
-        safe_title = "Untitled_Paper"
-
-    # 文件名附带哈希前 8 位以保证唯一，支持同名论文共存
-    note_filename = f"{safe_title}_{doc_id[:8]}.md"
-    note_path = os.path.join(obsidian_dir, note_filename)
+    from litreview.analysis_record import PaperAnalysisRecord
+    if isinstance(analysis, PaperAnalysisRecord):
+        rec = PaperAnalysisRecord.from_llm_json(
+            analysis.model_dump() if hasattr(analysis, "model_dump") else analysis.dict(),
+            paper_meta=paper_meta,
+        )
+    else:
+        rec = PaperAnalysisRecord.from_llm_json(analysis, paper_meta=paper_meta)
     
-    with open(note_path, "w", encoding="utf-8") as f:
-        f.write(note_content)
+    note_path, _ = rec.publish_obsidian_note(
+        obsidian_dir=obsidian_dir,
+        title=paper_meta.get("title", "Unknown Title"),
+        doc_id=doc_id,
+        raw_images=images,
+        template_path=str(template_path) if template_path else None,
+    )
     return note_path
 
 
