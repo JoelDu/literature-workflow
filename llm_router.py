@@ -27,7 +27,7 @@ def make_openai_client(api_key: str | None = None, quiet: bool = False):
     # OpenAI 客户端。嵌入/重排客户端独立创建，因此不会被这个代理配置牵连。
     proxy = os.getenv("LIT_HTTPS_PROXY") or os.getenv("LIT_HTTP_PROXY")
     if proxy:
-        kwargs["http_client"] = httpx.Client(proxy=proxy, timeout=180)
+        kwargs["http_client"] = httpx.Client(proxy=proxy, timeout=180, verify=False)
     client = OpenAI(**kwargs)
     if not quiet:
         print(f"[LLM Router] 使用模型 {model}。")
@@ -48,7 +48,7 @@ class LLMRouter:
         self.openai_client, self.openai_model = make_openai_client(_legacy_key)
         self.system_prompt = """你是一个精通化学工程、材料科学与磷化工/新型肥料研发的顶尖学术分析专家。请阅读以下由 PDF 转换而来的 Markdown 格式的论文内容，深入提取并总结出结构化信息。\n
 请输出严格合法的 JSON 对象，包含以下字段：
-1. tldr: 1~2 句话精炼概括论文核心贡献与一句话结论。
+1. tldr: 【核心简评】必须以 💡 开头（120~180字），严格采用四元组结构：【研究对象与改性方法】(写明具体物质名称与缩写) + 【微观机理/结构调控】(化学交联、界面润湿或孔隙演化机制) + 【核心量化实验数据】(必须包含具体包膜量%、配比、水接触角°、释放周期d、降解率%及相对对照组提升倍数) + 【短板与工业局限】(指出缺陷、适用边界或尚未解决的工业放大矛盾，拒绝报喜不报忧)。严禁任何泛泛空话。
 2. keywords: 3~5 个高概括度的中英文核心关键词/研究领域标签（分号隔开，如：包膜控释; 水性聚氨酯; 养分释放动力学; 膜孔隙率）。
 3. fertilizer_implications: 【重点】这篇论文的思路、方法、改性手段、反应机理或结论，对磷化工生产、新型肥料产品开发（如缓释/控释肥、水溶肥、功能性生物肥、磷石膏综合利用等）有哪些具体的借鉴价值和技术抓手？严禁假大空套话（如“提供了理论参考”），必须直击配方调控、机理借鉴、工艺降本或工业放大的具体技术点。
 4. abstract: 尽量逐字提取并保留作者原始摘要。

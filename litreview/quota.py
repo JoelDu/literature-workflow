@@ -5,6 +5,7 @@ Batch 由 batch_pipeline 单独登记；这里覆盖综述、元数据和教材�
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
