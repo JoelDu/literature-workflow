@@ -46,26 +46,16 @@ def make_legacy_siliconflow_client():
 class LLMRouter:
     def __init__(self, _legacy_key: str | None = None, _legacy_gemini_key: str | None = None):
         self.openai_client, self.openai_model = make_openai_client(_legacy_key)
-        self.system_prompt = """你是一个精通化学工程、材料科学与磷化工/新型肥料研发的顶尖学术分析专家。请阅读以下由 PDF 转换而来的 Markdown 格式的论文内容，深入提取并总结出结构化信息。\n
-请输出严格合法的 JSON 对象，包含以下字段：
-1. tldr: 【核心简评】必须以 💡 开头（120~180字），严格采用四元组结构：【研究对象与改性方法】(写明具体物质名称与缩写) + 【微观机理/结构调控】(化学交联、界面润湿或孔隙演化机制) + 【核心量化实验数据】(必须包含具体包膜量%、配比、水接触角°、释放周期d、降解率%及相对对照组提升倍数) + 【短板与工业局限】(指出缺陷、适用边界或尚未解决的工业放大矛盾，拒绝报喜不报忧)。严禁任何泛泛空话。
-2. keywords: 3~5 个高概括度的中英文核心关键词/研究领域标签（分号隔开，如：包膜控释; 水性聚氨酯; 养分释放动力学; 膜孔隙率）。
-3. fertilizer_implications: 【重点】这篇论文的思路、方法、改性手段、反应机理或结论，对磷化工生产、新型肥料产品开发（如缓释/控释肥、水溶肥、功能性生物肥、磷石膏综合利用等）有哪些具体的借鉴价值和技术抓手？严禁假大空套话（如“提供了理论参考”），必须直击配方调控、机理借鉴、工艺降本或工业放大的具体技术点。
-4. abstract: 尽量逐字提取并保留作者原始摘要。
-5. background: 研究背景、行业痛点与研究动机。
-6. methods: 核心实验路线、反应方程式、表征手段与工艺参数。
-7. results: 关键量化数据、对照实验结果与对比性能。
-8. conclusion: 主要结论、实际应用价值与作者启示。
-9. language / authors / journal / year: 基础学术著录元数据。无法提取则使用空字符串。"""
+        self.system_prompt = build_adaptive_analysis_prompt("", doc_type="paper")
 
     def detect_language(self, text: str) -> str:
-        try:
-            return detect(text[:2000])
-        except Exception:
-            return "en"
+        from litreview.analysis_prompt import detect_language as _detect
+        return _detect(text)
 
-    def build_request(self, doc_id: str, markdown_text: str) -> dict:
+    def build_request(self, doc_id: str, markdown_text: str, doc_type: str = "paper") -> dict:
+        from litreview.analysis_prompt import build_adaptive_analysis_prompt
         text = truncate_to_input_budget(markdown_text)
+        sys_prompt = build_adaptive_analysis_prompt(text, doc_type=doc_type)
         return {
             "custom_id": doc_id,
             "method": "POST",
@@ -73,7 +63,7 @@ class LLMRouter:
             "body": {
                 "model": self.openai_model,
                 "messages": [
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": f"请分析以下论文内容：\n\n{text}"},
                 ],
                 "response_format": {"type": "json_object"},
@@ -82,11 +72,11 @@ class LLMRouter:
             },
         }
 
-    def analyze_paper(self, markdown_text: str):
-        return self._call_openai(markdown_text)
+    def analyze_paper(self, markdown_text: str, doc_type: str = "paper"):
+        return self._call_openai(markdown_text, doc_type=doc_type)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-    def _call_openai(self, text: str):
+    def _call_openai(self, text: str, doc_type: str = "paper"):
         import time
         # 实时模式同样消耗额度，必须和 Batch/元数据共用 UTC 账本。
         from litreview.quota import reconcile, reserve, record_llm_call

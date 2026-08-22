@@ -475,6 +475,13 @@ def main():
     # clean-orphans 命令
     subparsers.add_parser("clean-orphans", help="清理无对应文本块的孤儿 review_index_meta 记录")
 
+    # refresh-tldr 命令 (方案 B)
+    refresh_parser = subparsers.add_parser("refresh-tldr", help="轻量级重炼存量文献的 TLDR 简评与工程借鉴 (方案 B，低 Token 消耗)")
+    refresh_parser.add_argument("--limit", type=int, help="限制重炼文献篇数 (如用于小批量预览测试)")
+    refresh_parser.add_argument("--id", type=str, help="仅重炼指定 doc_id 的单篇文献")
+    refresh_parser.add_argument("--topic", type=str, help="仅重炼匹配指定关键词的主题文献")
+    refresh_parser.add_argument("--force", action="store_true", help="强制全量刷新")
+
     # reset 命令
     reset_parser = subparsers.add_parser("reset", help="人工强制重置失败文献或指定任务以启动自动重试")
     reset_parser.add_argument("--failed", action="store_true", help="一键重置所有失败状态的任务 (SUBMIT_FAILED, BATCH_FAILED, RESULT_PARSE_FAILED)")
@@ -492,6 +499,9 @@ def main():
         show_history(days=args.days)
     elif args.command == "llm-calls":
         cmd_show_llm_calls(limit=args.limit, call_type=args.type, detail_id=args.id)
+    elif args.command == "refresh-tldr":
+        from litreview.refresh import run_refresh_library
+        run_refresh_library(limit=args.limit, doc_id=args.id, topic=args.topic, force=args.force)
     elif args.command == "doctor":
         run_doctor()
     elif args.command == "sync-excel":
