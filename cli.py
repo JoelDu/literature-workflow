@@ -482,6 +482,14 @@ def main():
     refresh_parser.add_argument("--topic", type=str, help="仅重炼匹配指定关键词的主题文献")
     refresh_parser.add_argument("--force", action="store_true", help="强制全量刷新")
 
+    # reanalyze 命令 (方案 A 全文深度重分析)
+    reanalyze_parser = subparsers.add_parser("reanalyze", help="方案 A：全量精读文献全文 Markdown 并重构全部 9 个结构化字段与深度 TLDR")
+    reanalyze_parser.add_argument("--topic", action="append", help="按主题/关键词过滤 (可多次指定，如 --topic 尿素 --topic 磷酸)")
+    reanalyze_parser.add_argument("--limit", type=int, help="限制重分析篇数")
+    reanalyze_parser.add_argument("--id", type=str, help="仅分析指定 doc_id 的单篇文献")
+    reanalyze_parser.add_argument("--max-tokens", type=int, default=2_500_000, help="单日最大 Token 熔断上限，默认 2,500,000")
+    reanalyze_parser.add_argument("--offset", type=int, default=0, help="偏移量 (用于多日分批滚动)")
+
     # reset 命令
     reset_parser = subparsers.add_parser("reset", help="人工强制重置失败文献或指定任务以启动自动重试")
     reset_parser.add_argument("--failed", action="store_true", help="一键重置所有失败状态的任务 (SUBMIT_FAILED, BATCH_FAILED, RESULT_PARSE_FAILED)")
@@ -502,6 +510,10 @@ def main():
     elif args.command == "refresh-tldr":
         from litreview.refresh import run_refresh_library
         run_refresh_library(limit=args.limit, doc_id=args.id, topic=args.topic, force=args.force)
+    elif args.command == "reanalyze":
+        from litreview.full_reanalysis import run_full_reanalysis
+        run_full_reanalysis(limit=args.limit, doc_id=args.id, topics=args.topic,
+                            max_daily_tokens=args.max_tokens, offset=args.offset)
     elif args.command == "doctor":
         run_doctor()
     elif args.command == "sync-excel":
