@@ -52,6 +52,7 @@ from litreview.citation_network import (
     get_full_citation_graph,
     get_seed_subgraph
 )
+from litreview.guard import RemoteAccessGuardMiddleware
 
 # ── 日志配置 ──
 logging.basicConfig(
@@ -1896,7 +1897,8 @@ middleware = [
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
-    )
+    ),
+    Middleware(RemoteAccessGuardMiddleware)
 ]
 
 app = Starlette(routes=routes, middleware=middleware)
