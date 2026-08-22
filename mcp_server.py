@@ -1621,6 +1621,10 @@ class McpServerHost:
         if args.transport in ("sse", "streamable-http"):
             mcp.settings.host = args.host
             mcp.settings.port = args.port
+            if hasattr(mcp.settings, "transport_security") and mcp.settings.transport_security:
+                mcp.settings.transport_security.enable_dns_rebinding_protection = False
+                mcp.settings.transport_security.allowed_hosts = ["*"]
+                mcp.settings.transport_security.allowed_origins = ["*"]
             logger.info(f"🌐 MCP Server 启动 [{args.transport.upper()}] 模式: http://{args.host}:{args.port}/sse")
             print(f"🌐 MCP Server 监听: http://{args.host}:{args.port}/sse", file=sys.stderr)
             try:
