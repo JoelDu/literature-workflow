@@ -445,3 +445,21 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
     * **语义化学术编号与横向对比矩阵**：全面支持 `[@U-J25-001]` 国标编号引用与双向正则解析，3 篇以上多文献对比章节自动嵌入 Markdown 横向性能对比表格；
     * **引言「承-转-合」与结论「一问一策」闭环**：引言【转】精准打击作者指定的 Research Gap，结论逐条呼应正文技术抓手；
     * **双端对齐与全绿测试**：MCP 与 `review.py` CLI 工具参数 100% 镜像对称，`tests/test_mcp_server.py` 11/11 测试全部通过。
+
+44. **Remote-Access 远程接入架构与虚拟化资源定位 (2026-08-22)**：
+    * **`McpServerHost` 统一多传输宿主 (`mcp_server.py`)**：支持 `--transport [stdio|sse|streamable-http]`、`--host`、`--port` 与环境变量注入；
+    * **`DocumentLocator` 资源定位与虚拟化 (`litreview/locator.py`)**：对宿主机敏感绝对物理路径（`/mnt/ripe/...`）进行安全脱敏，统一输出 `asset://pdf/{work_id}`、`vault://reviews/{job_id}.md` 虚拟 URI 及流式代理下载 URL；
+    * **`RemoteAccessGuard` 安全守卫中间件 (`litreview/guard.py`)**：精准区分 localhost、Tailscale (CGNAT)、LAN (RFC1918) 与 WAN，公网请求强制校验 Bearer Token 鉴权。
+
+45. **LLM 论文分析维度增强与 PaperAnalysisRecord 架构深化 (2026-08-22)**：
+    * **提示词工业级技术抓手升级 (`llm_router.py`)**：Prompt 强制提取 `keywords`（核心领域/关键词）与 `fertilizer_implications`（磷化工生产、控释包膜、养分释放动力学、磷石膏综合利用的具体工程借鉴，拒绝假大空套话）；
+    * **`PaperAnalysisRecord` 强类型深模块 (`litreview/analysis_record.py`)**：收敛 LLM JSON 解析、物理摘要正则去幻觉双向融合、Obsidian 相对路径渲染与 Excel 行格式化，彻底消除 5 文件联动的霰弹式修改；
+    * **Excel 黄金列重排与双链笔记升级**：`knowledge_base.xlsx` 首屏重排为【标题 ➔ 关键词 ➔ 肥料开发借鉴 ➔ TLDR ➔ 著录信息 ➔ 双链】，`obsidian_template.md` 增加专属高亮专节；
+    * **纯内存单元测试 (`tests/test_analysis_record.py`)**：4 项测试 0.62s 通过。
+
+46. **双传输融合网关 (Dual-Transport Fusion) 与 OpenAI Codex 远程兼容 (2026-08-22)**：
+    * **8002 端口双协议融合 (`mcp_server.py`)**：同一端口同时挂载 FastMCP `streamable_http_app` (`/mcp`) 与 `sse_app` (`/sse`)；
+    * **Codex Desktop 握手兼容**：彻底解决 Codex Desktop 向 `/sse` 发送 POST `initialize` 导致的 HTTP 405 Method Not Allowed 阻断，Codex 可直接配置 `url = "http://100.83.137.43:8002/mcp"`；
+    * **systemd 7x24 常驻服务 (`literature-review-mcp.service`)**：配置 `Restart=always` 与 `transport_security.allowed_hosts = ["*"]`，跨机访问 100% 稳定运行；
+    * **全局记忆中心同步**：全套排查规则已持久化至 `/mnt/ripe/global_memory_service`。
+

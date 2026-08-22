@@ -296,41 +296,48 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 
 ## 🔌 MCP Server（在大模型对话中直接调用）
 
-`mcp_server.py` 把文献库检索与综述撰写打包成标准 MCP server（stdio），可被 Claude Code / Claude Desktop / Cherry Studio 等任意 MCP 客户端调用。
+`mcp_server.py` 把文献库检索、引文网络探索与顶级综述撰写打包成标准 MCP server，全面支持 **Streamable HTTP (`/mcp`)**、**SSE (`/sse`)** 与 **STDIO (SSH 管道)** 三种传输模式，可被 OpenAI Codex Desktop / Claude Code / Claude Desktop / Cursor / Cherry Studio 等全平台客户端调用。
 
-**提供 7 个工具**：
+**提供全量 16 个工具**：
 
-| 工具 | 说明 |
-|---|---|
-| `library_status` | 文献库概况（篇数/索引/元数据覆盖，按 8 种文献类型分列） |
-| `search_literature(query, top_k, corpus)` | 语义检索文献片段（向量召回 + 重排序，跨中英）；`corpus` 可限定为词表里的任一类型（`paper`/`book`/`patent`/`standard`/`report`/…） |
-| `get_paper_info(keyword, limit)` | 按标题/关键词/专利号/标准号查结构化元数据（DOI/作者/期刊/TLDR，专利给出阶段与保护期，标准给出实施日期与现行状态） |
-| `doc_status(doc_type, keyword)` | 专利/标准台账：出版阶段、保护期至、实施日期、人工核实状态（**只读**，状态只能用 CLI 人工录入） |
-| `generate_outline(topic, focus, sections)` | 生成综述大纲 JSON（同步，约 1 分钟） |
-| `start_review(topic, focus, words, sections, outline_json)` | 后台启动完整综述生成，立即返回 job_id |
-| `review_status(job_id)` | 查询生成进度/日志尾部/产出文件路径（markdown + Word 各一份） |
+| 分类 | 工具名称 | 核心功能说明 |
+|---|---|---|
+| **文献库与审计** | `library_status` | 文献库概况（馆藏篇数/向量索引/元数据覆盖，按 8 种文献类型分列） |
+| | `list_documents` | 多维检索、分类过滤与馆藏文献分页浏览 |
+| | `library_reconcile` | 四层数据对齐审计（生产库 vs 拓扑库 vs 候选库一致性检测） |
+| | `get_paper_info` | 查单篇结构化元数据（DOI/作者/期刊/TLDR/关键词/肥料借鉴，专利保护期，标准实施状态） |
+| | `doc_status` | 专利/标准台账：法律状态、保护期至、实施日期与人工核实记录（只读） |
+| **引文图谱与发现** | `get_citation_network` | 获取力导向引文图谱数据（支持全局骨干网与单篇局部子图） |
+| | `citation_expand` | OpenAlex 双轨滚雪球：自选种子文献挖掘基石文献 (Foundational) 与前沿文献 (Emerging) |
+| | `list_discovery_candidates` | 外部候选文献池多维筛选与分页浏览 |
+| | `approve_candidates` | 候选文献状态机审批流（进入可下载待入库池） |
+| | `acquire_fulltext` | 自动下载合法 Open Access PDF 全文并进行物理魔数验真 |
+| | `ingest_acquired_candidates` | 执行标准入库生命周期（正文切块 ➔ Qwen3 向量化 ➔ 图谱拓扑回填） |
+| **顶刊综述引擎** | `propose_review_angles` | **大纲前置人机对齐**：基于本地馆藏提炼 3 套顶刊级立论方案（Thesis + Research Gap） |
+| | `generate_outline` | 约束作者 Thesis 与 Research Gap，按机制/数据/缺陷三元组输出大纲（含文献门槛诊断） |
+| | `start_review` | 后台异步生成完整综述（秒回 job_id，单消费者 FIFO 调度，段落微观逻辑链推进） |
+| | `review_status` | 轮询综述进度、章节检查点与产出路径（返回虚拟化 URI 与下载链接） |
 
-> `doc_status` 刻意**不提供写入能力**——专利的法律状态、标准的现行与否都是要对外负责的结论，不能由模型自行判断后写进生产库；工具返回「未核实」时也明确要求调用方不要拿出版阶段或实施日期替代作答。
->
-> 检索结果会带类型标签：看到 `[标准 GB 38400-2019]` 才知道这段限量值出自强制性文件而非某篇论文的实验结论，两者的可引用分量完全不同。
->
-> **`patent_status` 已更名为 `doc_status`**（多了个 `doc_type` 参数，专利和标准共用）。其他设备只需重启一次 MCP client——工具是动态发现的，配置文件不用改。
+---
 
-综述生成耗时 7-30 分钟（取决于模型），远超 MCP 工具调用超时，所以采用**后台任务模式**：`start_review` 秒回 job_id，之后随时用 `review_status` 轮询，完成后返回 Obsidian 笔记路径。
+### 🌐 跨设备远程连接配置指南 (Remote Access)
 
-**注册（Claude Code）**：
+服务端已通过 **双传输融合网关（Dual-Transport Fusion）** 常驻监听 `0.0.0.0:8002`（由 systemd `literature-review-mcp.service` 守护），各客户端配置如下：
 
-```bash
-claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_server.sh
+#### 1. OpenAI Codex Desktop（推荐：Streamable HTTP 模式）
+Codex Desktop 遵循 MCP 2025 Streamable HTTP 规范，向 `/mcp` 端点发起连接：
+```toml
+[mcp_servers.literature-review]
+url = "http://100.83.137.43:8002/mcp"
 ```
 
-**其他客户端（Claude Desktop / Cherry Studio 等）** 的 `mcpServers` 配置：
-
+#### 2. Cursor / VS Code / 传统客户端（SSE 模式）
+在客户端 `mcpServers` 设置中填入 `/sse` 端点：
 ```json
 {
   "mcpServers": {
     "literature-review": {
-      "command": "/path/to/literature-workflow/mcp_server.sh"
+      "url": "http://100.83.137.43:8002/sse"
     }
   }
 }
@@ -350,10 +357,8 @@ OpenAI key/base 和 `LIT_HTTP_PROXY`/`LIT_HTTPS_PROXY` 具有最高优先级；�
 | `MCP_UNSET_PROXY` | 设为 `true` 时清理 HTTP/HTTPS/ALL_PROXY |
 | `DB_PATH` / `REVIEW_OUTPUT_DIR` | 指向已有文献库和综述输出目录 |
 
-可选环境变量 `MCP_OUTLINE_MODEL` 控制大纲生成模型（默认 Qwen2.5-72B-Instruct）。
-
-**远程接入（别的设备连回跑着文献库的那台机器）**：MCP 走 stdio，所以直接用 SSH 把命令跑在对端即可。以 Windows 上 Git 自带的 `ssh.exe` 为例：
-
+#### 3. Claude Code / 命令行 SSH 管道（STDIO 保底模式）
+通过 SSH 隧道直接把 STDIO 管道转发至服务端（以 Windows Git `ssh.exe` 为例）：
 ```json
 {
   "mcpServers": {
@@ -364,8 +369,8 @@ OpenAI key/base 和 `LIT_HTTP_PROXY`/`LIT_HTTPS_PROXY` 具有最高优先级；�
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "BatchMode=yes",
         "-o", "ServerAliveInterval=30",
-        "-p", "<端口>", "<用户>@<主机>",
-        "/path/to/literature-workflow/mcp_server.sh"
+        "-p", "22", "dudu@100.83.137.43",
+        "/home/dudu/literature_analyzer/.venv/bin/python /home/dudu/literature_analyzer/mcp_server.py"
       ]
     }
   }

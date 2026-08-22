@@ -8,9 +8,9 @@
 
 ## 一、入库流水线
 
-**处理链路**：`input_pdfs/*.pdf` → MinerU（OCR 解析，提取正文/公式/表格/图片）→ 大模型分析（摘要/关键词/结构化字段提取）→ 输出两份产物：
-- Obsidian 笔记（带 frontmatter、原始摘要、配图，直接扔进 Obsidian vault 就能用双链检索）
-- Excel 知识库（汇总表，方便筛选/统计）
+**处理链路**：`input_pdfs/*.pdf` → MinerU（OCR 解析，提取正文/公式/表格/图片）→ 大模型分析（提取摘要、核心关键词/领域、以及面向磷化工/新型肥料开发的工程借鉴与技术抓手）→ 通过 `PaperAnalysisRecord` 强类型深模块输出两份产物：
+- Obsidian 笔记（带 frontmatter、领域标签、肥料借鉴专节、原始摘要、配图，直接扔进 Obsidian vault 就能用双链检索）
+- Excel 知识库（黄金决策列重排，标题/关键词/肥料借鉴排在首屏，方便跨文献快速筛选对比）
 
 **两种运行模式**，由 `daemon.py` 常驻进程调度：
 - **实时模式**：每 10 分钟扫一次 `input_pdfs/`，来了新文件立刻处理
@@ -53,7 +53,7 @@
 
 ## 三、MCP Server：在对话里直接用 (v3.1)
 
-`mcp_server.py` 把整个文献库检索、引文图谱发现与高水平综述撰写能力包装成标准 MCP 协议 server，Claude Code / Claude Desktop / Cherry Studio / Antigravity 这些客户端配置一下就能在对话里直接调用。全量开放 **16 个工具**：
+`mcp_server.py` 把整个文献库检索、引文图谱发现与高水平综述撰写能力包装成标准 MCP 协议 server。通过 **双传输融合网关（Dual-Transport Fusion）** 常驻监听 `0.0.0.0:8002`（由 systemd `literature-review-mcp.service` 守护），同时原生支持 **OpenAI Codex Desktop (Streamable HTTP `/mcp`)**、**Cursor / VS Code (SSE `/sse`)** 以及 **Claude Code / 终端 (SSH STDIO)**。全量开放 **16 个工具**：
 - **文献库与审计**：`library_status`（馆藏指标）、`list_documents`（多维检索与过滤）、`library_reconcile`（四层数据对齐审计）、`get_paper_info`（单篇详情）、`doc_status`（法律/现行状态查阅）；
 - **前沿引文与滚雪球发现**：`get_citation_network`（图谱与局部子网）、`citation_expand`（OpenAlex 双轨滚雪球）、`list_discovery_candidates`（候选池管理）、`approve_candidates`（状态机审批）、`acquire_fulltext`（合法 OA PDF 暂存）、`ingest_acquired_candidates`（解析索引入库）；
 - **顶刊级综述引擎 (Thesis-Driven v3.1)**：
@@ -67,7 +67,7 @@
   - 启动自愈机制（Boot Self-Healing）：进程重启时自动将历史残留的 `running` 僵尸任务修复为 `interrupted`；
   - 章节级检查点（Section Checkpointing）：每完成一章立即存入 `checkpoint_json` 并更新 `heartbeat_at`，单章节网络异常自动重试 3 次；
   - 证据 Token 预算安全截断（上限 18,000 字符，彻底避免 400 Context Limit）；
-  - `@_logged_tool()` 防崩溃异常边界，确保 stdio JSON-RPC 管道永不断连。
+  - `@_logged_tool()` 防崩溃异常边界，确保 stdio / SSE / HTTP JSON-RPC 管道永不断连。
 
 
 ## 四、Web UI 工作台与引文网络图谱 (v2.5)
