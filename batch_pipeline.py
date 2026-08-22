@@ -886,12 +886,14 @@ def _export_completed(c, conn) -> int:
         excel_rows.append({
             "文献ID": doc_id,
             "标题": title,
+            "关键词": analysis.get("keywords", ""),
+            "肥料开发借鉴": analysis.get("fertilizer_implications", ""),
+            "TLDR": analysis.get("tldr", ""),
             "作者": analysis.get("authors", ""),
             "年份": analysis.get("year", ""),
             "期刊": analysis.get("journal", ""),
             "文件路径": pdf_path,  # 已经处于归档 processed_pdfs/ 下的真实有效路径
             "Obsidian链接": f"[[{obsidian_link_name}]]",
-            "TLDR": analysis.get("tldr", ""),
             "语言": lang,
             "状态": "EXPORTED",
             "服务商": provider,

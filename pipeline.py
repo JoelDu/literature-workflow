@@ -188,12 +188,14 @@ def main():
             excel_rows.append({
                 "文献ID": doc_id,
                 "标题": title,
+                "关键词": analysis.get("keywords", ""),
+                "肥料开发借鉴": analysis.get("fertilizer_implications", ""),
+                "TLDR": analysis.get("tldr", ""),
                 "作者": analysis.get("authors", ""),
                 "年份": analysis.get("year", ""),
                 "期刊": analysis.get("journal", ""),
                 "文件路径": dest_pdf_path,
                 "Obsidian链接": f"[[{obsidian_link_name}]]",
-                "TLDR": analysis.get("tldr", ""),
                 "语言": analysis.get("language", ""),
                 "解析时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })

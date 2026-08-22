@@ -19,6 +19,16 @@ source: "{{ source_value }}"
 ## 💡 核心摘要 / TL;DR
 {{ tldr }}
 
+{% if fertilizer_implications %}
+## 🌾 肥料开发借鉴与工程启示 / Fertilizer Implications
+{{ fertilizer_implications }}
+{% endif %}
+
+{% if keywords %}
+## 🏷️ 核心领域与关键词 / Keywords
+{{ keywords }}
+{% endif %}
+
 ## 📄 原始摘要 / Original Abstract
 {{ abstract }}
 

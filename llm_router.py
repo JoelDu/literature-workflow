@@ -46,8 +46,17 @@ def make_legacy_siliconflow_client():
 class LLMRouter:
     def __init__(self, _legacy_key: str | None = None, _legacy_gemini_key: str | None = None):
         self.openai_client, self.openai_model = make_openai_client(_legacy_key)
-        self.system_prompt = """你是一个极其专业、细致的学术论文分析助手。请阅读以下由 PDF 转换而来的 Markdown 格式的论文内容，提取并总结出结构化信息。\n
-请输出严格合法的 JSON，包含：tldr、abstract、background、methods、results、conclusion、language、authors、journal、year。abstract 必须尽量逐字提取原始摘要；其余字段应详尽、基于原文，无法提取则使用空字符串。"""
+        self.system_prompt = """你是一个精通化学工程、材料科学与磷化工/新型肥料研发的顶尖学术分析专家。请阅读以下由 PDF 转换而来的 Markdown 格式的论文内容，深入提取并总结出结构化信息。\n
+请输出严格合法的 JSON 对象，包含以下字段：
+1. tldr: 1~2 句话精炼概括论文核心贡献与一句话结论。
+2. keywords: 3~5 个高概括度的中英文核心关键词/研究领域标签（分号隔开，如：包膜控释; 水性聚氨酯; 养分释放动力学; 膜孔隙率）。
+3. fertilizer_implications: 【重点】这篇论文的思路、方法、改性手段、反应机理或结论，对磷化工生产、新型肥料产品开发（如缓释/控释肥、水溶肥、功能性生物肥、磷石膏综合利用等）有哪些具体的借鉴价值和技术抓手？严禁假大空套话（如“提供了理论参考”），必须直击配方调控、机理借鉴、工艺降本或工业放大的具体技术点。
+4. abstract: 尽量逐字提取并保留作者原始摘要。
+5. background: 研究背景、行业痛点与研究动机。
+6. methods: 核心实验路线、反应方程式、表征手段与工艺参数。
+7. results: 关键量化数据、对照实验结果与对比性能。
+8. conclusion: 主要结论、实际应用价值与作者启示。
+9. language / authors / journal / year: 基础学术著录元数据。无法提取则使用空字符串。"""
 
     def detect_language(self, text: str) -> str:
         try:

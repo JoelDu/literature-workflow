@@ -400,6 +400,8 @@ def generate_obsidian_note(
         effective_date=paper_meta.get("effective_date") or analysis.get("effective_date") or "",
         publisher=paper_meta.get("publisher") or analysis.get("publisher") or "",
         tldr=analysis.get("tldr", ""),
+        fertilizer_implications=analysis.get("fertilizer_implications", ""),
+        keywords=analysis.get("keywords", ""),
         abstract=analysis.get("abstract", "") or paper_meta.get("abstract", ""),
         background=analysis.get("background", ""),
         methods=analysis.get("methods", ""),
@@ -491,9 +493,14 @@ def sync_excel_with_db(db_path: str, excel_path: str) -> int:
     for (doc_id, title, authors, year, journal, pdf_path, lang, status,
          provider, job_id, processed_at, result_json, doc_type) in rows:
         tldr = ""
+        fertilizer_implications = ""
+        keywords = ""
         try:
             if result_json:
-                tldr = json.loads(result_json).get("tldr", "")
+                data = json.loads(result_json)
+                tldr = data.get("tldr", "")
+                fertilizer_implications = data.get("fertilizer_implications", "")
+                keywords = data.get("keywords", "")
         except Exception:
             pass
         safe = "".join(c for c in title if c.isalnum() or c in " -_").strip() or "Untitled"
@@ -501,12 +508,14 @@ def sync_excel_with_db(db_path: str, excel_path: str) -> int:
         excel_rows.append({
             "文献ID": doc_id,
             "标题": title,
+            "关键词": keywords,
+            "肥料开发借鉴": fertilizer_implications,
+            "TLDR": tldr,
             "作者": authors,
             "年份": year,
             "期刊": journal,
             "文件路径": pdf_path,
             "Obsidian链接": f"[[{note_name}]]",
-            "TLDR": tldr,
             "语言": lang or "zh",
             "状态": status,
             "服务商": provider or "",
