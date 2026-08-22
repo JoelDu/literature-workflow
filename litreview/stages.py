@@ -20,9 +20,11 @@ from . import doctype as dt
 # ── LLM 调用与 JSON 解析 ──────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=60))
-def _chat_once(client, model: str, prompt: str, json_mode: bool) -> str:
+def _chat_once(client, model: str, prompt: str, json_mode: bool,
+               call_type: str = "review_llm", stage: str = "", meta: dict = None) -> str:
+    import time
     from utils import get_settings
-    from .quota import reserve, reconcile
+    from .quota import reserve, reconcile, record_llm_call
     settings = get_settings()
     max_tokens = 12_000 if model == "gpt-5.4" else 4_000
     reservation = reserve(settings, model, prompt, max_tokens)
@@ -32,13 +34,29 @@ def _chat_once(client, model: str, prompt: str, json_mode: bool) -> str:
               "max_completion_tokens": max_tokens}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-    resp = client.chat.completions.create(**kwargs)
-    reconcile(settings, model, reservation, resp.usage)
-    return resp.choices[0].message.content
+    
+    t0 = time.time()
+    resp = None
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        reconcile(settings, model, reservation, resp.usage)
+        content = resp.choices[0].message.content
+        cost_sec = time.time() - t0
+        record_llm_call(settings, call_type=call_type, model=model, prompt=prompt,
+                        response_text=content, stage=stage, usage=resp.usage,
+                        cost_seconds=cost_sec, status="SUCCESS", meta=meta)
+        return content
+    except Exception as e:
+        cost_sec = time.time() - t0
+        record_llm_call(settings, call_type=call_type, model=model, prompt=prompt,
+                        response_text="", stage=stage, usage=None,
+                        cost_seconds=cost_sec, status="FAILED", error_message=str(e), meta=meta)
+        raise
 
 
-def _chat(client, model: str, prompt: str, json_mode: bool = True) -> str:
-    return _chat_once(client, model, prompt, json_mode)
+def _chat(client, model: str, prompt: str, json_mode: bool = True,
+          call_type: str = "review_llm", stage: str = "", meta: dict = None) -> str:
+    return _chat_once(client, model, prompt, json_mode, call_type=call_type, stage=stage, meta=meta)
 
 
 def parse_llm_json(text: str) -> dict:
@@ -74,15 +92,15 @@ def parse_llm_json(text: str) -> dict:
     raise ValueError(f"JSON 括号不闭合: {text[:200]}")
 
 
-def _chat_json(client, model: str, prompt: str) -> dict:
+def _chat_json(client, model: str, prompt: str, call_type: str = "review_llm", stage: str = "", meta: dict = None) -> dict:
     """带一次纠错重试的 JSON 调用。"""
-    text = _chat(client, model, prompt, json_mode=True)
+    text = _chat(client, model, prompt, json_mode=True, call_type=call_type, stage=stage, meta=meta)
     try:
         return parse_llm_json(text)
     except Exception:
         text2 = _chat(client, model,
                       prompt + "\n\n你上次输出的 JSON 无法解析，请严格只输出合法 JSON，不要输出任何其它文字。",
-                      json_mode=True)
+                      json_mode=True, call_type=call_type, stage=f"{stage}_retry" if stage else "retry", meta=meta)
         return parse_llm_json(text2)
 
 
@@ -179,7 +197,9 @@ def propose_review_angles(topic: str, store, embedder, client, model, settings, 
 
     prompt = prompts.PROPOSE_ANGLES_PROMPT.format(n=len(digest_lines), topic=topic,
                                                  paper_digest="\n".join(digest_lines))
-    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt)
+    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt,
+                      call_type="propose_angles", stage="stage_0_angles",
+                      meta={"topic": topic, "words": words, "papers_count": len(digest_lines)})
     angles = data.get("angles", [])
     if not angles:
         raise RuntimeError(f"未能提炼出有效综述方案: {data}")
@@ -239,7 +259,9 @@ def generate_outline(topic: str, store, embedder, client, model, settings, conso
                                            mainline_block=mainline_block,
                                            section_rule=section_rule, focus_line=focus_line,
                                            paper_digest="\n".join(digest_lines))
-    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt)
+    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt,
+                      call_type="generate_outline", stage="stage_A_outline",
+                      meta={"topic": topic, "focus": focus, "words": words, "sections": n_sections, "papers_count": len(digest_lines)})
     outline = Outline.from_dict(data, topic=topic)
     if not outline.sections:
         raise RuntimeError(f"大纲生成失败，未产出任何章节: {data}")
@@ -280,7 +302,8 @@ def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) ->
         cite_key=cite_key,
         chunk_content=chunk.content[:5000],
     )
-    data = _chat_json(client, model, prompt)
+    data = _chat_json(client, model, prompt, call_type="map_chunk", stage="stage_B_map",
+                      meta={"heading": heading, "doc_id": chunk.doc_id, "chunk_id": chunk.chunk_id})
     score = int(data.get("score", 0))
     return {"chunk": chunk, "score": max(1, min(10, score)), "summary": str(data.get("summary", ""))}
 
@@ -476,7 +499,9 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         evidence_blocks="\n".join(blocks),
         sample_cite_1=sample_1, sample_cite_2=sample_2,
         words_min=words[0], words_max=words[1], focus_line=focus_line)
-    text = _chat(client, model, prompt, json_mode=False).strip()
+    text = _chat(client, model, prompt, json_mode=False,
+                 call_type="write_section", stage="stage_C_write_section",
+                 meta={"review_title": review_title, "heading": section.heading, "evidence_count": len(evidence)}).strip()
 
     # 丢弃不在证据集中的引用标记（幻觉引用）
     def _filter_cite(m):
@@ -510,7 +535,9 @@ def write_intro_conclusion(outline: Outline, drafts: list, client, model,
         review_title=outline.title, topic=outline.topic, section_summaries=summaries,
         intro_min=intro_words[0], intro_max=intro_words[1],
         concl_min=concl_words[0], concl_max=concl_words[1], focus_line=focus_line)
-    data = _chat_json(client, model, prompt)
+    data = _chat_json(client, model, prompt,
+                      call_type="write_intro_conclusion", stage="stage_C_intro_conclusion",
+                      meta={"review_title": outline.title, "topic": outline.topic, "sections_count": len(drafts)})
     return str(data.get("intro", "")), str(data.get("conclusion", ""))
 
 

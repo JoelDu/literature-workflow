@@ -63,3 +63,27 @@ def reconcile(settings, model: str, reservation: tuple[str, int], usage) -> None
         conn.commit()
     finally:
         conn.close()
+
+
+def record_llm_call(settings, call_type: str, model: str, prompt: str,
+                    response_text: str = "", stage: str = "", usage=None,
+                    cost_seconds: float = 0.0, status: str = "SUCCESS",
+                    error_message: str = "", meta: dict = None) -> None:
+    """持久化记录每一次 LLM 调用的完整 Prompt、响应、Token 消耗与元数据至 SQLite 数据库。"""
+    inp, out, reasoning, total = usage_totals(usage) if usage else (0, 0, 0, 0)
+    meta_str = json.dumps(meta, ensure_ascii=False) if meta else "{}"
+    conn = sqlite3.connect(settings.DB_PATH)
+    try:
+        ensure_llm_quota_tables(conn)
+        conn.execute("""
+            INSERT INTO llm_call_history 
+            (call_type, model, stage, prompt, response_text, prompt_tokens, completion_tokens, total_tokens, cost_seconds, status, error_message, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (call_type, model, stage, prompt, response_text, inp, out, total, cost_seconds, status, error_message, meta_str))
+        conn.commit()
+    except Exception as e:
+        # 日志写入失败绝不阻断业务执行
+        pass
+    finally:
+        conn.close()
+

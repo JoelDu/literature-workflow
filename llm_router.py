@@ -87,14 +87,28 @@ class LLMRouter:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def _call_openai(self, text: str):
+        import time
         # 实时模式同样消耗额度，必须和 Batch/元数据共用 UTC 账本。
-        from litreview.quota import reconcile, reserve
+        from litreview.quota import reconcile, reserve, record_llm_call
         from litreview.analysis_record import PaperAnalysisRecord
         from utils import get_settings
+        settings = get_settings()
         req = self.build_request("realtime", text)["body"]
         prompt = req["messages"][0]["content"] + "\n" + req["messages"][1]["content"]
-        reservation = reserve(get_settings(), self.openai_model, prompt, req["max_completion_tokens"])
-        response = self.openai_client.chat.completions.create(**req)
-        reconcile(get_settings(), self.openai_model, reservation, response.usage)
-        content = response.choices[0].message.content
-        return PaperAnalysisRecord.from_llm_json(content, markdown_text=text)
+        reservation = reserve(settings, self.openai_model, prompt, req["max_completion_tokens"])
+        t0 = time.time()
+        try:
+            response = self.openai_client.chat.completions.create(**req)
+            reconcile(settings, self.openai_model, reservation, response.usage)
+            content = response.choices[0].message.content
+            cost_sec = time.time() - t0
+            record_llm_call(settings, call_type="analyze_paper", model=self.openai_model,
+                            prompt=prompt, response_text=content, stage="realtime_analysis",
+                            usage=response.usage, cost_seconds=cost_sec, status="SUCCESS")
+            return PaperAnalysisRecord.from_llm_json(content, markdown_text=text)
+        except Exception as e:
+            cost_sec = time.time() - t0
+            record_llm_call(settings, call_type="analyze_paper", model=self.openai_model,
+                            prompt=prompt, response_text="", stage="realtime_analysis",
+                            usage=None, cost_seconds=cost_sec, status="FAILED", error_message=str(e))
+            raise

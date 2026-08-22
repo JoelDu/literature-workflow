@@ -376,6 +376,79 @@ def cmd_clean_orphans():
     console.print(f"[bold green]✔ 清理完成：共移除 {res['orphans_removed']} 条无对应文本块的孤儿 review_index_meta 记录。[/bold green]")
 
 
+def cmd_show_llm_calls(limit: int = 10, call_type: str = "", detail_id: int = None):
+    """查看 LLM 历史调用记录及完整 Prompt / Response 详情。"""
+    console.rule("[bold cyan]🤖 LLM 接口调用审计日志")
+    conn = sqlite3.connect(settings.DB_PATH)
+    c = conn.cursor()
+    
+    if detail_id:
+        c.execute("""
+            SELECT id, call_type, model, stage, prompt, response_text, prompt_tokens, completion_tokens,
+                   total_tokens, cost_seconds, status, error_message, meta_json, created_at
+            FROM llm_call_history WHERE id=?
+        """, (detail_id,))
+        row = c.fetchone()
+        if not row:
+            console.print(f"[red]未找到 ID 为 {detail_id} 的调用记录。[/red]")
+            conn.close()
+            return
+        (call_id, ctype, model, stage, prompt, resp_text, inp_tok, out_tok,
+         tot_tok, cost_s, status, err_msg, meta_json, ts) = row
+        
+        console.print(f"[bold green]调用 ID:[/bold green] {call_id} | [bold green]时间:[/bold green] {ts}")
+        console.print(f"[bold]类型:[/bold] {ctype} | [bold]阶段:[/bold] {stage} | [bold]模型:[/bold] {model}")
+        console.print(f"[bold]耗时:[/bold] {cost_s:.2f}s | [bold]状态:[/bold] {status} | [bold]Tokens:[/bold] 输入 {inp_tok} + 输出 {out_tok} = 总计 {tot_tok}")
+        if err_msg:
+            console.print(f"[bold red]错误信息:[/bold red] {err_msg}")
+        if meta_json and meta_json != "{}":
+            console.print(f"[bold cyan]元数据:[/bold cyan] {meta_json}")
+            
+        console.rule("[bold yellow]📤 发送给大模型的完整 Prompt")
+        console.print(prompt)
+        console.rule("[bold green]📥 大模型返回的原始响应 Response")
+        console.print(resp_text or "[dim]（无响应内容）[/dim]")
+        conn.close()
+        return
+
+    query = "SELECT id, created_at, call_type, model, stage, total_tokens, cost_seconds, status FROM llm_call_history"
+    params = []
+    if call_type:
+        query += " WHERE call_type LIKE ?"
+        params.append(f"%{call_type}%")
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    
+    try:
+        c.execute(query, params)
+        rows = c.fetchall()
+        if not rows:
+            console.print("[yellow]目前尚未捕获到任何 LLM 调用记录。[/yellow]")
+            conn.close()
+            return
+            
+        table = Table(title=f"最近 {len(rows)} 次大模型调用明细 (使用 `python cli.py llm-calls --id <ID>` 查看完整上下文)")
+        table.add_column("ID", style="dim", justify="right")
+        table.add_column("时间 (Timestamp)", style="cyan")
+        table.add_column("调用类型 (Call Type)", style="magenta")
+        table.add_column("阶段 (Stage)", style="blue")
+        table.add_column("模型 (Model)", style="green")
+        table.add_column("Tokens", justify="right", style="yellow")
+        table.add_column("耗时 (s)", justify="right")
+        table.add_column("状态", style="bold")
+        
+        for r in rows:
+            cid, ts, ctype, model, stage, tokens, cost_s, status = r
+            st_color = "[green]SUCCESS[/green]" if status == "SUCCESS" else "[red]FAILED[/red]"
+            table.add_row(str(cid), ts, ctype, stage or "-", model, str(tokens), f"{cost_s:.1f}s", st_color)
+            
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]查询 LLM 调用日志失败: {e}[/red]")
+    finally:
+        conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Literature Analyzer 运维及状态管理 CLI")
     subparsers = parser.add_subparsers(dest="command", help="运维指令集")
@@ -387,6 +460,12 @@ def main():
     history_parser = subparsers.add_parser("history", help="查看最近数天的文献处理运行历史与成功/失败统计")
     history_parser.add_argument("--days", type=int, default=7, help="查看天数，默认 7 天")
     
+    # llm-calls 命令
+    llm_parser = subparsers.add_parser("llm-calls", help="查看所有大模型（LLM）调用的历史记录、完整 Prompt、返回结果与 Token 耗时")
+    llm_parser.add_argument("--limit", type=int, default=15, help="展示条数，默认 15 条")
+    llm_parser.add_argument("--type", type=str, default="", help="按调用类型过滤 (如 generate_outline, propose_angles, write_section, map_chunk)")
+    llm_parser.add_argument("--id", type=int, help="查看指定调用 ID 的全部完整 Prompt 与 Response 原始内容")
+
     # doctor 命令
     subparsers.add_parser("doctor", help="对系统网络、API 密钥、存储挂载做全方位系统健康度体检")
     
@@ -411,6 +490,8 @@ def main():
         show_status()
     elif args.command == "history":
         show_history(days=args.days)
+    elif args.command == "llm-calls":
+        cmd_show_llm_calls(limit=args.limit, call_type=args.type, detail_id=args.id)
     elif args.command == "doctor":
         run_doctor()
     elif args.command == "sync-excel":

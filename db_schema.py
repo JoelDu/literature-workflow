@@ -75,10 +75,31 @@ LLM_USAGE_MODEL_DAILY_DDL = """CREATE TABLE IF NOT EXISTS llm_usage_model_daily 
 )"""
 
 
+LLM_CALL_HISTORY_DDL = """CREATE TABLE IF NOT EXISTS llm_call_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_type TEXT NOT NULL,
+    model TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '',
+    prompt TEXT NOT NULL,
+    response_text TEXT,
+    prompt_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    cost_seconds REAL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'SUCCESS',
+    error_message TEXT,
+    meta_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+)"""
+
+
 def ensure_llm_quota_tables(conn: sqlite3.Connection) -> None:
     conn.execute(LLM_USAGE_DAILY_DDL)
     conn.execute(LLM_BATCH_DDL)
     conn.execute(LLM_USAGE_MODEL_DAILY_DDL)
+    conn.execute(LLM_CALL_HISTORY_DDL)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_call_created ON llm_call_history(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_call_type ON llm_call_history(call_type)")
 
 
 def ensure_papers_table(conn: sqlite3.Connection, on_upgrade=None, on_error=None) -> list:
