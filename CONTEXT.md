@@ -39,6 +39,8 @@ $$\sum = 341 + 3 + 3 + 1 + 8,766 = 9,114 	ext{ Works (100\% 严格闭合)}$$
 
 ## 3. 核心架构接缝与深模块 (Architectural Seams & Deep Modules)
 
+* **`litreview.analysis_record` (`PaperAnalysisRecord`)**：
+  * 论文深度分析结构化领域实体与产物发布深模块，统一封装 LLM 响应解析、物理摘要双向去幻觉融合、Obsidian 双链笔记与附件转存、Excel 黄金列序列化与持久化载荷构建，彻底消除跨流水线的散装字典霰弹式修改。
 * **`litreview.library_store` (`LibraryStore`)**：
   * 负责多数据库（生产只读库、拓扑库、候选审计库）的联合查询、5 级分区严格统计、文献目录分页搜索与详情抽屉聚合。
 * **`litreview.citation_network` (`CitationNetwork`)**：
