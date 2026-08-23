@@ -107,11 +107,12 @@ def run_full_reanalysis(limit: Optional[int] = None, doc_id: Optional[str] = Non
             params.extend([f"%{t}%", f"%{t}%", f"%{t}%", f"%{t}%"])
         query += f" AND ({' OR '.join(topic_conds)})"
 
-    query += " ORDER BY p.id ASC"
     if limit:
         query += f" LIMIT {int(limit)}"
-    if offset > 0:
-        query += f" OFFSET {int(offset)}"
+        if offset > 0:
+            query += f" OFFSET {int(offset)}"
+    elif offset > 0:
+        query += f" LIMIT -1 OFFSET {int(offset)}"
 
     c.execute(query, params)
     targets = c.fetchall()
