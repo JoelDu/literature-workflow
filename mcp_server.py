@@ -975,15 +975,15 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             log(f"大纲完成：{outline.title}（{len(outline.sections)} 章节）")
 
         if words:
-            intro_target = max(300, min(900, int(words * 0.12)))
-            concl_target = max(350, min(1100, int(words * 0.15)))
-            per = max(400, (words - intro_target - concl_target)
+            intro_target = max(600, min(1200, int(words * 0.08)))
+            concl_target = max(800, min(1500, int(words * 0.10)))
+            per = max(1800, (words - intro_target - concl_target)
                       // max(1, len(outline.sections)))
-            section_words = (int(per * 0.85), int(per * 1.15))
-            intro_words = (int(intro_target * 0.8), int(intro_target * 1.2))
-            concl_words = (int(concl_target * 0.8), int(concl_target * 1.2))
+            section_words = (int(per * 0.9), int(per * 1.2))
+            intro_words = (int(intro_target * 0.85), int(intro_target * 1.15))
+            concl_words = (int(concl_target * 0.85), int(concl_target * 1.15))
         else:
-            section_words, intro_words, concl_words = (600, 1000), (300, 500), (400, 700)
+            section_words, intro_words, concl_words = (1800, 2600), (600, 1000), (800, 1200)
 
         section_evidence = []
         for i, sec in enumerate(outline.sections, 1):

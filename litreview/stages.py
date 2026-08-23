@@ -355,10 +355,30 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
             except Exception as e:
                 console.print(f"[yellow]⚠️ 证据评估失败 chunk {c.chunk_id}: {e}")
 
-    # 3) 门槛过滤 + 排序保留 top-N
-    kept = [r for r in results if r["score"] >= settings.REVIEW_MIN_SCORE and r["summary"].strip()]
-    kept.sort(key=lambda r: -r["score"])
-    kept = kept[: settings.REVIEW_EVIDENCE_N]
+    # 3) 门槛过滤 + 排序 + 文献多样性优选保留 top-N
+    valid_results = [r for r in results if r["score"] >= settings.REVIEW_MIN_SCORE and r["summary"].strip()]
+    valid_results.sort(key=lambda r: -r["score"])
+
+    # 强制多样性：单篇文献在最终证据集中最多占 2 条，确保单章覆盖 12-18 篇独立文献
+    diverse_kept = []
+    doc_counts = {}
+    for r in valid_results:
+        d_id = r["chunk"].doc_id
+        if doc_counts.get(d_id, 0) < 2:
+            diverse_kept.append(r)
+            doc_counts[d_id] = doc_counts.get(d_id, 0) + 1
+            if len(diverse_kept) >= settings.REVIEW_EVIDENCE_N:
+                break
+
+    # 若多样性过滤后数量未满，再放宽从其余高分条目中补充
+    if len(diverse_kept) < settings.REVIEW_EVIDENCE_N:
+        for r in valid_results:
+            if r not in diverse_kept:
+                diverse_kept.append(r)
+                if len(diverse_kept) >= settings.REVIEW_EVIDENCE_N:
+                    break
+    kept = diverse_kept
+
     if len(kept) < 3:
         console.print(f"[yellow]⚠️ 章节「{section.heading}」证据不足（仅 {len(kept)} 条），生成内容可能较薄。")
     return [Evidence(chunk_id=r["chunk"].chunk_id, doc_id=r["chunk"].doc_id,

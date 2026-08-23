@@ -63,7 +63,7 @@ class Settings(BaseModel):
     NIGHTLY_INDEX_DEADLINE: str = "08:00"     # 仅本地嵌入任务使用
     RERANK_MODEL: str = "Qwen/Qwen3-Reranker-8B"
     RERANK_ENABLE: bool = True
-    RERANK_CANDIDATES: int = 50              # 向量召回候选数（rerank 后取 REVIEW_TOP_K）
+    RERANK_CANDIDATES: int = 80              # 向量召回候选数（rerank 后取 REVIEW_TOP_K）
     REVIEW_MODEL: str = "gpt-5.4"                       # 仅综述写作使用；论文分析固定 mini
     REVIEW_ENRICH_LLM: bool = True           # enrich 时是否用 LLM 补缺元数据
     REVIEW_CHUNK_SIZE: int = 1000
@@ -72,10 +72,10 @@ class Settings(BaseModel):
     # 4800 原始字符≈3000 汉字（实测中文 1 汉字≈1.6 原始字符）；英文同口径。
     BOOK_CHUNK_SIZE: int = 4800
     BOOK_CHUNK_OVERLAP: int = 600
-    REVIEW_TOP_K: int = 50                # 每章进入 GPT 评估前的重排候选数
-    REVIEW_MAX_CHUNKS_PER_DOC: int = 4
+    REVIEW_TOP_K: int = 60                # 每章进入 GPT 评估前的重排候选数
+    REVIEW_MAX_CHUNKS_PER_DOC: int = 2     # 单篇文献在初筛中最多保留 2 块，强制文献多样性
     REVIEW_MIN_SCORE: int = 6
-    REVIEW_EVIDENCE_N: int = 20            # 每章最终保留的高分证据数
+    REVIEW_EVIDENCE_N: int = 32            # 每章最终保留的高分多样化证据数（覆盖 12-18 篇独立文献）
     REVIEW_MAP_CONCURRENCY: int = 8
     REVIEW_OUTPUT_DIR: str = "./obsidian_vault/reviews"
     REVIEW_AUTO_INDEX: bool = True           # 导出后自动增量更新向量索引
@@ -92,7 +92,7 @@ class Settings(BaseModel):
     LLM_DAILY_TOKEN_CAP: int = 2_000_000
     LLM_BATCH_TOKEN_CAP: int = 600_000
     LLM_MAX_INPUT_TOKENS: int = 200_000
-    REVIEW_DAILY_TOKEN_CAP: int = 200_000                # GPT-5.4 的 250k 日额度留出余量
+    REVIEW_DAILY_TOKEN_CAP: int = 400_000                # GPT-5.4 独立日额度 (400k Tokens)
 
 
 _settings = None
@@ -134,7 +134,7 @@ def get_settings() -> Settings:
                                                          "给定一个中文或英文的检索问题，找出能回答该问题的文献段落"),
                 "RERANK_MODEL": os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-8B"),
                 "RERANK_ENABLE": os.getenv("RERANK_ENABLE", "true").lower() == "true",
-                "RERANK_CANDIDATES": int(os.getenv("RERANK_CANDIDATES", "50")),
+                "RERANK_CANDIDATES": int(os.getenv("RERANK_CANDIDATES", "80")),
                 # 固定值，故意不读取环境变量，避免综述写作被意外换模型。
                 "REVIEW_MODEL": "gpt-5.4",
                 "REVIEW_ENRICH_LLM": os.getenv("REVIEW_ENRICH_LLM", "true").lower() == "true",
@@ -142,10 +142,10 @@ def get_settings() -> Settings:
                 "REVIEW_CHUNK_OVERLAP": int(os.getenv("REVIEW_CHUNK_OVERLAP", "150")),
                 "BOOK_CHUNK_SIZE": int(os.getenv("BOOK_CHUNK_SIZE", "4800")),
                 "BOOK_CHUNK_OVERLAP": int(os.getenv("BOOK_CHUNK_OVERLAP", "600")),
-                "REVIEW_TOP_K": int(os.getenv("REVIEW_TOP_K", "50")),
-                "REVIEW_MAX_CHUNKS_PER_DOC": int(os.getenv("REVIEW_MAX_CHUNKS_PER_DOC", "4")),
+                "REVIEW_TOP_K": int(os.getenv("REVIEW_TOP_K", "60")),
+                "REVIEW_MAX_CHUNKS_PER_DOC": int(os.getenv("REVIEW_MAX_CHUNKS_PER_DOC", "2")),
                 "REVIEW_MIN_SCORE": int(os.getenv("REVIEW_MIN_SCORE", "6")),
-                "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "20")),
+                "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "32")),
                 "REVIEW_EMBED_BACKEND": os.getenv("REVIEW_EMBED_BACKEND", "remote"),
                 "LOCAL_EMBEDDING_MODEL_PATH": os.getenv("LOCAL_EMBEDDING_MODEL_PATH", ""),
                 "NIGHTLY_INDEX_DEADLINE": os.getenv("NIGHTLY_INDEX_DEADLINE", "08:00"),
