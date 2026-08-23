@@ -62,8 +62,8 @@ class Reranker:
                 )
                 tot_chars = sum(len(d) for d in documents) + len(query)
                 tot_tok = int(tot_chars / 3.5)
-                # 使用 Mock Usage 对象记录 Token
-                usage_obj = type("Usage", (), {"prompt_tokens": tot_tok, "completion_tokens": 0, "total_tokens": tot_tok})()
+                import types
+                usage_obj = types.SimpleNamespace(prompt_tokens=tot_tok, completion_tokens=0, total_tokens=tot_tok)
                 record_llm_call(
                     settings, call_type="rerank", model=self.model,
                     prompt=prompt_text, response_text=resp_text, stage=stage,

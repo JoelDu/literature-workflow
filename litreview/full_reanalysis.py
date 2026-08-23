@@ -156,7 +156,11 @@ def run_full_reanalysis(limit: Optional[int] = None, doc_id: Optional[str] = Non
                 total_tokens_consumed += res.get("tokens_est", 2000)
             else:
                 fail_count += 1
-                console.print(f"[red]✗ 失败: {title[:20]} - {res.get('error')}[/red]")
+                err_msg = str(res.get('error', ''))
+                console.print(f"[red]✗ 失败: {title[:20]} - {err_msg}[/red]")
+                if "当日额度不足" in err_msg or "quota" in err_msg.lower():
+                    console.print(f"\n[bold yellow]⚠️ 触碰 UTC 当日额度上限保护，安全终止本批任务，明日 08:00 (UTC 00:00) 自动恢复后再续跑！[/bold yellow]")
+                    break
             progress.advance(task)
 
     conn.close()

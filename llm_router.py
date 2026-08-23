@@ -11,6 +11,7 @@ from langdetect import detect, DetectorFactory
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from litreview.analysis_prompt import build_adaptive_analysis_prompt
 from litreview.token_budget import truncate_to_input_budget
 
 DetectorFactory.seed = 0
@@ -83,7 +84,7 @@ class LLMRouter:
         from litreview.analysis_record import PaperAnalysisRecord
         from utils import get_settings
         settings = get_settings()
-        req = self.build_request("realtime", text)["body"]
+        req = self.build_request("realtime", text, doc_type=doc_type)["body"]
         prompt = req["messages"][0]["content"] + "\n" + req["messages"][1]["content"]
         reservation = reserve(settings, self.openai_model, prompt, req["max_completion_tokens"])
         t0 = time.time()
