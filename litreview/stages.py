@@ -15,6 +15,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from .models import Outline, OutlineSection, Evidence, SectionDraft, ReviewDoc
 from . import prompts
 from . import doctype as dt
+from .review_quality import (
+    EvidenceContext,
+    _best_title,
+    _short_authors,
+    audit_and_clean_review,
+    format_reference,
+)
 
 
 # ── LLM 调用与 JSON 解析 ──────────────────────────────────────────────────────
@@ -509,100 +516,6 @@ def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_me
 _CITE_RE = re.compile(r"\[@([A-Za-z0-9_\-]+)\]")
 
 
-# 标题尾缀 "_张三" 模式（文件名习惯：标题_第一作者）
-_TITLE_AUTHOR_RE = re.compile(r"_([一-龥]{2,4})$")
-
-
-def _short_authors(authors: str, language: str, title: str = "") -> str:
-    parts = [a.strip() for a in re.split(r"[,，;；]", authors or "") if a.strip()]
-    if not parts:
-        # 回退：从标题尾缀提取第一作者（如 "复混肥…测试_史亚龙" → 史亚龙）
-        m = _TITLE_AUTHOR_RE.search(title or "")
-        if m:
-            return f"{m.group(1)}, 等"
-        return "作者不详" if language == "zh" else "Unknown"
-    suffix = ", 等" if language == "zh" else ", et al"  # 句点由引用行统一添加
-    return ", ".join(parts[:3]) + (suffix if len(parts) > 3 else "")
-
-
-def _display_title(title: str) -> str:
-    """去掉标题尾部的 "_作者名" 文件名尾缀，用于参考文献显示。"""
-    return _TITLE_AUTHOR_RE.sub("", title or "")
-
-
-def _best_title(meta: dict) -> str:
-    """优先用 enrich 提取的结构化标题（中文文献用 title_zh，其余用 title_en），回退文件名标题。"""
-    lang = meta.get("language", "zh")
-    if lang == "zh" and meta.get("title_zh"):
-        return meta["title_zh"]
-    if lang != "zh" and meta.get("title_en"):
-        return meta["title_en"]
-    return _display_title(meta.get("title", "未知文献"))
-
-
-def _imprint(place: str, publisher: str, year: str) -> str:
-    """GB/T 7714 出版项：' 出版地: 出版者, 出版年.'。缺哪项就少哪项，不留占位符。"""
-    head = f"{place}: {publisher}" if (place and publisher) else (publisher or place)
-    if head:
-        return f" {head}, {year}." if year else f" {head}."
-    return f" {year}." if year else ""
-
-
-def format_reference(n: int, doc_id: str, m: dict) -> str:
-    """按文献类型排一条 GB/T 7714-2015 参考文献。
-
-    ⚠️ 必须按类型分发。早先这里写成 "if 书籍 … else 一律按 [J]"，结果专利、标准这些
-    非论文类型全被印成了期刊论文（`…[J].` 后面还跟个空的期刊名）。新增 doc_type 时，
-    doctype.DOC_TYPES 里加一行的同时，**这里也要补上对应的一支**，否则又会掉回 [J]。
-    """
-    doc_type = m.get("doc_type") or dt.DEFAULT_TYPE
-    code = dt.gb_code(doc_type)
-    raw_title = m.get("title", "未知文献")
-    title = _best_title(m)
-    year = m.get("year", "")
-    place, publisher = m.get("pub_place", ""), m.get("publisher", "")
-
-    # 标准和网络资源通常不署个人责任者，硬填"作者不详"反而是噪声——没有就整段省掉。
-    if doc_type in ("standard", "web") and not m.get("authors"):
-        authors = ""
-    else:
-        authors = _short_authors(m.get("authors", ""), m.get("language", "zh"), raw_title)
-    lead = f"{authors}. " if authors else ""
-
-    # 书籍不进 Obsidian、网络资源不走流水线，都没有笔记可链；其余类型链回单篇笔记
-    # （命名规则同 utils.generate_obsidian_note）。
-    if doc_type in ("book", "web"):
-        link = ""
-    else:
-        safe = "".join(c for c in raw_title if c.isalnum() or c in " -_").strip() or "Untitled_Paper"
-        link = f" [[{safe}_{doc_id[:8]}]]"
-
-    if code == "M":                     # 专著：作者. 书名[M]. 版本. 出版地: 出版者, 出版年.
-        edition = m.get("edition", "")
-        body = (f"[{n}] {lead}{title}[M]." + (f" {edition}." if edition else "")
-                + _imprint(place, publisher, year))
-    elif code == "P":                   # 专利：申请人. 专利名称: 专利号[P]. 申请日.
-        no = m.get("patent_no", "")
-        d = m.get("filing_date", "") or year
-        body = f"[{n}] {lead}{title}" + (f": {no}" if no else "") + "[P]." + (f" {d}." if d else "")
-    elif code == "S":                   # 标准：发布机构. 标准名称: 标准号[S]. 出版地: 出版者, 出版年.
-        no = m.get("doc_no", "")
-        body = (f"[{n}] {lead}{title}" + (f": {no}" if no else "") + "[S]."
-                + _imprint(place, publisher, year))
-    elif code == "EB/OL":               # 电子资源：责任者. 题名[EB/OL]. 出版年. 网址.
-        url = m.get("url", "")
-        body = f"[{n}] {lead}{title}[EB/OL]." + (f" {year}." if year else "") + (f" {url}." if url else "")
-    elif code in ("R", "D", "C"):       # 报告/学位论文/会议论文：责任者. 题名[X]. 出版项.
-        body = f"[{n}] {lead}{title}[{code}]." + _imprint(place, publisher, year)
-    else:                               # 期刊论文：作者. 题名[J]. 期刊, 年. DOI: xxx.
-        journal = m.get("journal", "")
-        tail = f" {journal}, {year}." if (journal and year) else \
-               (f" {journal}." if journal else (f" {year}." if year else ""))
-        doi = m.get("doi", "")
-        body = f"[{n}] {lead}{title}[J].{tail}" + (f" DOI: {doi}." if doi else "")
-    return body.rstrip() + link
-
-
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
                   words: tuple = (1800, 2600), focus: str = "",
@@ -747,19 +660,26 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
     new_sections = [SectionDraft(heading=d.heading, markdown=_renumber(d.markdown),
                                  cited_doc_ids=d.cited_doc_ids) for d in drafts]
 
-    references = [format_reference(numbering[d], d, paper_meta.get(d, {})) for d in ordered_docs]
-
-    return ReviewDoc(
+    raw_review = ReviewDoc(
         title=outline.title, topic=outline.topic,
         intro=intro, sections=new_sections, conclusion=conclusion,
-        references=references,
+        references=[],
         doc_count=len(ordered_docs), evidence_count=evidence_total,
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
+    context = EvidenceContext(number_to_doc_id={numbering[d]: d for d in ordered_docs})
+    return audit_and_clean_review(raw_review, context, paper_meta).review
 
 
 def render_review_note(review: ReviewDoc, paper_meta: dict, settings,
                        template_path: str, model: str) -> str:
+    if review.quality_blocking:
+        details = "；".join(
+            str(issue.get("message", issue)) if isinstance(issue, dict) else str(issue)
+            for issue in review.quality_issues
+            if not isinstance(issue, dict) or issue.get("severity") == "blocking"
+        )
+        raise RuntimeError(f"综述质量门禁未通过，已保留章节检查点但停止导出：{details}")
     with open(template_path, "r", encoding="utf-8") as f:
         template = Template(f.read())
 

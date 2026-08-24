@@ -44,3 +44,5 @@ class ReviewDoc(BaseModel):
     doc_count: int = 0
     evidence_count: int = 0
     generated_at: str = ""
+    quality_issues: list = Field(default_factory=list)
+    quality_blocking: bool = False
