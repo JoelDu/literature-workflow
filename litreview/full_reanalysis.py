@@ -79,8 +79,8 @@ def reanalyze_single_paper(conn: sqlite3.Connection, doc_id: str, router: LLMRou
 
 def run_full_reanalysis(limit: Optional[int] = None, doc_id: Optional[str] = None,
                         topics: Optional[List[str]] = None, max_daily_tokens: int = 2_500_000,
-                        offset: int = 0) -> dict:
-    """运行全量文献全文分析管道 (方案 A)，带严格的单日 Token 熔断保护。"""
+                        offset: int = 0, force: bool = False) -> dict:
+    """运行全量文献全文分析管道 (方案 A)，带严格的单日 Token 熔断保护与智能跳过已完成项。"""
     settings = get_settings()
     router = LLMRouter()
     conn = sqlite3.connect(settings.DB_PATH)
@@ -88,7 +88,7 @@ def run_full_reanalysis(limit: Optional[int] = None, doc_id: Optional[str] = Non
     c = conn.cursor()
 
     query = """
-        SELECT p.id, p.title, COALESCE(d.doc_type, 'paper'), LENGTH(p.mineru_md)
+        SELECT p.id, p.title, COALESCE(d.doc_type, 'paper'), LENGTH(p.mineru_md), p.result_json
         FROM papers p
         LEFT JOIN paper_details d ON p.id = d.doc_id
         WHERE p.status='EXPORTED' 
@@ -115,15 +115,32 @@ def run_full_reanalysis(limit: Optional[int] = None, doc_id: Optional[str] = Non
         query += f" LIMIT -1 OFFSET {int(offset)}"
 
     c.execute(query, params)
-    targets = c.fetchall()
+    raw_targets = c.fetchall()
+
+    targets = []
+    skipped_count = 0
+    for tid, title, dtype, m_len, res_json in raw_targets:
+        if not force and res_json:
+            try:
+                data = json.loads(res_json)
+                tldr = data.get("tldr", "")
+                if len(tldr) >= 180:
+                    skipped_count += 1
+                    continue
+            except Exception:
+                pass
+        targets.append((tid, title, dtype, m_len))
+
+    if skipped_count > 0:
+        console.print(f"[dim green]💡 自动跳过已完成高质量四元组重炼文献: {skipped_count} 篇 (使用 --force 可强制重跑)[/dim green]")
 
     if not targets:
-        console.print("[yellow]未找到符合重分析条件的 EXPORTED 文献。[/yellow]")
+        console.print("[green]🎉 当前范围内所有文献均已完成高质量四元组重分析！[/green]")
         conn.close()
         return {"processed": 0, "tokens": 0}
 
     topic_label = f" (主题过滤: {', '.join(topics)})" if topics else ""
-    console.rule(f"[bold cyan]🚀 启动全量文献全文深度重分析 (方案 A) - 共 {len(targets)} 篇{topic_label}")
+    console.rule(f"[bold cyan]🚀 启动全量文献全文深度重分析 (方案 A) - 待处理 {len(targets)} 篇{topic_label}")
     console.print(f"[bold yellow]🛡️ 单日 Token 保护上限: {max_daily_tokens:,} Tokens[/bold yellow]")
 
     total_tokens_consumed = 0

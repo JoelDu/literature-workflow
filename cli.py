@@ -489,6 +489,7 @@ def main():
     reanalyze_parser.add_argument("--id", type=str, help="仅分析指定 doc_id 的单篇文献")
     reanalyze_parser.add_argument("--max-tokens", type=int, default=2_500_000, help="单日最大 Token 熔断上限，默认 2,500,000")
     reanalyze_parser.add_argument("--offset", type=int, default=0, help="偏移量 (用于多日分批滚动)")
+    reanalyze_parser.add_argument("--force", action="store_true", help="强制重新分析，即使已有高质量 TLDR")
 
     # reset 命令
     reset_parser = subparsers.add_parser("reset", help="人工强制重置失败文献或指定任务以启动自动重试")
@@ -513,7 +514,7 @@ def main():
     elif args.command == "reanalyze":
         from litreview.full_reanalysis import run_full_reanalysis
         run_full_reanalysis(limit=args.limit, doc_id=args.id, topics=args.topic,
-                            max_daily_tokens=args.max_tokens, offset=args.offset)
+                            max_daily_tokens=args.max_tokens, offset=args.offset, force=args.force)
     elif args.command == "doctor":
         run_doctor()
     elif args.command == "sync-excel":
