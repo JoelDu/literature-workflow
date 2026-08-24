@@ -4,9 +4,26 @@ import os
 import time
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 _MAX_DOC_CHARS = 5000  # 每条候选文档送入 reranker 的截断长度（放宽以容纳更大的书籍块）
+
+
+class RerankResults(list):
+    """保持 list 兼容，同时显式标记本次是否因服务异常降级。"""
+
+    def __init__(self, values=(), degraded: bool = False):
+        super().__init__(values)
+        self.degraded = degraded
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else 0
+        return status in (408, 409, 425, 429) or status >= 500
+    return False
 
 
 class Reranker:
@@ -15,7 +32,8 @@ class Reranker:
         self.api_key = api_key or os.getenv("SILICONFLOW_API_KEY", "")
         self.base_url = (base_url or os.getenv("SILICONFLOW_API_BASE", "")).rstrip("/")
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=15))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=15),
+           retry=retry_if_exception(_is_retryable_error), reraise=True)
     def _call(self, query: str, documents: list, top_n: int) -> list:
         resp = requests.post(
             f"{self.base_url}/rerank",
@@ -70,7 +88,7 @@ class Reranker:
                     usage=usage_obj, cost_seconds=cost_sec, status="SUCCESS",
                     meta={"query": query, "total_docs": len(documents), "top_n": top_n, "top_score": results[0][1] if results else 0.0}
                 )
-            return results
+            return RerankResults(results)
         except Exception as e:
             cost_sec = time.time() - t0
             if settings:
@@ -81,4 +99,7 @@ class Reranker:
                     usage=None, cost_seconds=cost_sec, status="FAILED",
                     error_message=str(e), meta={"query": query, "total_docs": len(documents)}
                 )
-            return [(i, 0.0) for i in range(min(top_n, len(documents)))]
+            return RerankResults(
+                [(i, 0.0) for i in range(min(top_n, len(documents)))],
+                degraded=True,
+            )

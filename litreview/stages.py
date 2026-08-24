@@ -19,7 +19,7 @@ from . import doctype as dt
 
 # ── LLM 调用与 JSON 解析 ──────────────────────────────────────────────────────
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=60))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=60), reraise=True)
 def _chat_once(client, model: str, prompt: str, json_mode: bool,
                call_type: str = "review_llm", stage: str = "", meta: dict = None) -> str:
     import time
@@ -208,6 +208,27 @@ def propose_review_angles(topic: str, store, embedder, client, model, settings, 
 
 # ── Stage A：大纲（结合立论与痛点精准构建）───────────────────────────────────
 
+
+def _outline_validation_errors(outline: Outline, scaling: dict, n_sections: int = 0) -> list:
+    """校验可执行的大纲结构；语义内容仍由馆藏上下文和 Prompt 约束。"""
+    errors = []
+    section_count = len(outline.sections)
+    if n_sections and section_count != n_sections:
+        errors.append(f"要求恰好 {n_sections} 章，实际 {section_count} 章")
+    elif not n_sections:
+        bounds = {1: (3, 4), 2: (5, 6), 3: (7, 9)}
+        lower, upper = bounds[scaling["tier"]]
+        if not lower <= section_count <= upper:
+            errors.append(f"当前档位要求 {lower}-{upper} 章，实际 {section_count} 章")
+    for index, section in enumerate(outline.sections, 1):
+        if not section.heading.strip():
+            errors.append(f"第 {index} 章标题为空")
+        questions = [str(question).strip() for question in section.questions if str(question).strip()]
+        if not 2 <= len(questions) <= 4:
+            errors.append(f"第 {index} 章必须有 2-4 个非空检索问题，实际 {len(questions)} 个")
+    return errors
+
+
 def generate_outline(topic: str, store, embedder, client, model, settings, console,
                      focus: str = "", n_sections: int = 0, words: int = 0, target_lang: str = "zh",
                      research_gap: str = "", thesis: str = "", mainline_logic: str = "") -> Outline:
@@ -259,12 +280,23 @@ def generate_outline(topic: str, store, embedder, client, model, settings, conso
                                            mainline_block=mainline_block,
                                            section_rule=section_rule, focus_line=focus_line,
                                            paper_digest="\n".join(digest_lines))
-    data = _chat_json(client, settings.ANALYSIS_MODEL, prompt,
+    data = _chat_json(client, model, prompt,
                       call_type="generate_outline", stage="stage_A_outline",
                       meta={"topic": topic, "focus": focus, "words": words, "sections": n_sections, "papers_count": len(digest_lines)})
     outline = Outline.from_dict(data, topic=topic)
-    if not outline.sections:
-        raise RuntimeError(f"大纲生成失败，未产出任何章节: {data}")
+    validation_errors = _outline_validation_errors(outline, scaling, n_sections)
+    if validation_errors:
+        repair_prompt = (
+            prompt + "\n\n上次大纲结构校验失败：\n- " + "\n- ".join(validation_errors)
+            + "\n请修正所有问题，并重新严格只输出合法 JSON。"
+        )
+        data = _chat_json(client, model, repair_prompt,
+                          call_type="generate_outline", stage="stage_A_outline_validation_retry",
+                          meta={"topic": topic, "validation_errors": validation_errors})
+        outline = Outline.from_dict(data, topic=topic)
+        validation_errors = _outline_validation_errors(outline, scaling, n_sections)
+    if validation_errors:
+        raise RuntimeError(f"大纲结构校验失败: {'；'.join(validation_errors)}")
     return outline
 
 
@@ -310,8 +342,11 @@ def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) ->
 
 def gather_evidence(section: OutlineSection, store, embedder, client, model,
                     settings, console, paper_meta: dict, reranker=None,
-                    doc_usage_history: dict = None) -> list:
+                    doc_usage_history: dict = None, review_top_k: int = None,
+                    evidence_n: int = None) -> list:
     # 1) 每个问题分别向量召回，按 chunk_id 并集去重，保留最高检索分
+    review_top_k = review_top_k or settings.REVIEW_TOP_K
+    evidence_n = evidence_n or settings.REVIEW_EVIDENCE_N
     recall_k = settings.RERANK_CANDIDATES if reranker else settings.REVIEW_TOP_K
     pool = {}
     for q in section.questions:
@@ -323,30 +358,44 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
     if not pool:
         return []
 
+    def _cross_chapter_score(item, score):
+        usage_count = (doc_usage_history or {}).get(item.doc_id, 0)
+        return score * max(0.55, 1.0 - 0.25 * usage_count)
+
     # 1.5) 重排序：每个问题分别 rerank，按 chunk 取各问题最高分，重排后取 top-k
     if reranker is not None:
         pooled = list(pool.values())
         docs = [sc.content for sc in pooled]
         best = {}
+        successful_rerank = False
         for q in section.questions:
-            for idx, score in reranker.rerank(q, docs):
-                doc_id = pooled[idx].doc_id
+            reranked = reranker.rerank(q, docs)
+            if not getattr(reranked, "degraded", False):
+                successful_rerank = True
+            for idx, score in reranked:
                 # 跨章节长尾文献探索机制：前置章节已被多次引用的文献施加适当降权，让未曝光的优质文献浮现
-                penalty = 1.0
-                if doc_usage_history and doc_id in doc_usage_history:
-                    usage_cnt = doc_usage_history[doc_id]
-                    penalty = max(0.55, 1.0 - 0.25 * usage_cnt)
-                adj_score = score * penalty
+                adj_score = _cross_chapter_score(pooled[idx], score)
                 if idx not in best or adj_score > best[idx]:
                     best[idx] = adj_score
-        ranked = sorted(best.items(), key=lambda kv: -kv[1])[: settings.REVIEW_TOP_K]
+        if not successful_rerank:
+            # 服务故障与真实低相关不能混为一谈；故障时确定性回退到原向量分。
+            ranked = [
+                (index, _cross_chapter_score(item, item.score))
+                for index, item in sorted(
+                    enumerate(pooled), key=lambda pair: -pair[1].score
+                )[:review_top_k]
+            ]
+        else:
+            ranked = sorted(best.items(), key=lambda kv: -kv[1])[:review_top_k]
         candidates = []
         for idx, score in ranked:
             sc = pooled[idx]
             sc.score = score  # 用 rerank 分覆盖向量分（写入 Evidence.retrieval_score）
             candidates.append(sc)
     else:
-        candidates = sorted(pool.values(), key=lambda s: -s.score)[: int(settings.REVIEW_TOP_K * 1.5)]
+        candidates = sorted(
+            pool.values(), key=lambda item: -_cross_chapter_score(item, item.score)
+        )[:int(review_top_k * 1.5)]
     if not candidates:
         return []
 
@@ -375,15 +424,15 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
         if doc_counts.get(d_id, 0) < 2:
             diverse_kept.append(r)
             doc_counts[d_id] = doc_counts.get(d_id, 0) + 1
-            if len(diverse_kept) >= settings.REVIEW_EVIDENCE_N:
+            if len(diverse_kept) >= evidence_n:
                 break
 
     # 若多样性过滤后数量未满，再放宽从其余高分条目中补充
-    if len(diverse_kept) < settings.REVIEW_EVIDENCE_N:
+    if len(diverse_kept) < evidence_n:
         for r in valid_results:
             if r not in diverse_kept:
                 diverse_kept.append(r)
-                if len(diverse_kept) >= settings.REVIEW_EVIDENCE_N:
+            if len(diverse_kept) >= evidence_n:
                     break
     kept = diverse_kept
 
@@ -396,7 +445,9 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
 
 
 def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_meta: dict,
-                             exclude_doc_ids: set = None, top_n: int = 25) -> list:
+                             exclude_doc_ids: set = None, top_n: int = 25,
+                             doc_usage_history: dict = None, reranker=None,
+                             char_budget: int = 6000) -> list:
     """第二轨道：为本章节检索 20~25 篇外围/支撑性背景文献清单（排除 Track A 深度证据文献），用于宏观归纳与分类铺垫。"""
     exclude_set = exclude_doc_ids or set()
     scored_docs = {}
@@ -405,26 +456,50 @@ def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_me
         for sc in store.search(qvec, top_k=60, max_per_doc=1):
             if sc.doc_id in exclude_set:
                 continue
-            if sc.doc_id not in scored_docs or sc.score > scored_docs[sc.doc_id]:
-                scored_docs[sc.doc_id] = sc.score
+            penalty = max(0.55, 1.0 - 0.25 * (doc_usage_history or {}).get(sc.doc_id, 0))
+            adjusted_score = sc.score * penalty
+            if sc.doc_id not in scored_docs or adjusted_score > scored_docs[sc.doc_id]:
+                scored_docs[sc.doc_id] = adjusted_score
 
-    sorted_doc_ids = sorted(scored_docs.keys(), key=lambda d: -scored_docs[d])[:top_n]
-    bib_items = []
+    # 先保留更宽的向量候选，再用章节全部问题统一重排；重排服务降级为全零时回退向量顺序。
+    sorted_doc_ids = sorted(scored_docs.keys(), key=lambda d: -scored_docs[d])[:max(top_n * 3, top_n)]
+    candidates = []
     for d_id in sorted_doc_ids:
         m = paper_meta.get(d_id, {})
         if not m:
             continue
-        # 获取简短四元组或摘要
-        tldr_text = m.get("tldr") or m.get("abstract") or m.get("summary") or "缓控释肥料材料与养分释放相关研究"
-        bib_items.append({
+        # 第二轨只能使用已有元数据摘要；没有内容时跳过，禁止用通用占位句冒充证据。
+        tldr_text = m.get("tldr") or m.get("abstract") or m.get("summary")
+        if not str(tldr_text or "").strip():
+            continue
+        candidates.append({
             "doc_id": d_id,
             "title": _best_title(m),
             "authors": _short_authors(m.get("authors", ""), m.get("language", "zh"), m.get("title", "")),
             "year": m.get("year") or "年份不详",
             "doc_type": m.get("doc_type", "paper"),
             "cite_key": m.get("cite_key") or d_id[:8],
-            "tldr": tldr_text[:200]
+            "tldr": str(tldr_text)[:200],
+            "retrieval_score": scored_docs[d_id],
         })
+
+    if reranker is not None and candidates:
+        query = f"{section.heading}\n" + "\n".join(section.questions)
+        docs = [f"{item['title']}\n{item['tldr']}" for item in candidates]
+        ranked = reranker.rerank(query, docs, top_n=len(docs), stage="stage_B_broad_rerank")
+        if ranked and any(score > 0 for _, score in ranked):
+            candidates = [candidates[idx] for idx, _score in ranked]
+
+    bib_items = []
+    used_chars = 0
+    for item in candidates:
+        item_chars = len(item["tldr"])
+        if used_chars + item_chars > max(0, char_budget):
+            continue
+        bib_items.append(item)
+        used_chars += item_chars
+        if len(bib_items) >= top_n:
+            break
     return bib_items
 
 
@@ -531,7 +606,7 @@ def format_reference(n: int, doc_id: str, m: dict) -> str:
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
                   words: tuple = (1800, 2600), focus: str = "",
-                  broad_bib: list = None) -> SectionDraft:
+                  broad_bib: list = None, validation_feedback: str = "") -> SectionDraft:
     blocks = []
     valid_cite_marks = set()
     cite_to_doc = {}
@@ -569,7 +644,15 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
             f"     核心论点/背景：{b.get('tldr', '')}"
         )
 
+    available_doc_count = len({ev.doc_id for ev in evidence} | {b["doc_id"] for b in (broad_bib or [])})
+    if available_doc_count >= 3:
+        table_requirement = (
+            "本章有至少 3 篇可比较文献，必须在正文合适位置嵌入一张 Markdown 横向对比表。"
+        )
+    else:
+        table_requirement = "可比较文献不足 3 篇，不得为了凑表格虚构数据。"
     focus_line = f"\n8. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
+    repair_line = f"\n9. 上次输出校验未通过：{validation_feedback}。本次必须逐项修复。" if validation_feedback else ""
     sample_1 = list(cite_to_doc.keys())[0] if cite_to_doc else "U-J25-001"
     sample_2 = list(cite_to_doc.keys())[1] if len(cite_to_doc) > 1 else sample_1
 
@@ -578,7 +661,8 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         evidence_blocks="\n".join(blocks) if blocks else "暂无第一轨深度证据",
         broad_bib_blocks="\n".join(broad_blocks) if broad_blocks else "暂无第二轨背景文献",
         sample_cite_1=sample_1, sample_cite_2=sample_2,
-        words_min=words[0], words_max=words[1], focus_line=focus_line)
+        words_min=words[0], words_max=words[1], table_requirement=table_requirement,
+        focus_line=focus_line, repair_line=repair_line)
     text = _chat(client, model, prompt, json_mode=False,
                  call_type="write_section", stage="stage_C_write_section",
                  meta={"review_title": review_title, "heading": section.heading,
@@ -599,7 +683,8 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
 
 def write_intro_conclusion(outline: Outline, drafts: list, client, model,
                            intro_words: tuple = (300, 500),
-                           concl_words: tuple = (400, 700), focus: str = "") -> tuple:
+                           concl_words: tuple = (400, 700), focus: str = "",
+                           thesis: str = "", research_gap: str = "") -> tuple:
     # 提取各章节核心论点与关键发现矩阵（前 400 字符 + 结尾上位评述）
     summary_blocks = []
     for d in drafts:
@@ -612,10 +697,17 @@ def write_intro_conclusion(outline: Outline, drafts: list, client, model,
 
     summaries = "\n\n".join(summary_blocks)
     focus_line = f"\n3. 本综述整体侧重方向：{focus}，引言的意义阐述与结论的展望均围绕它展开。" if focus else ""
+    alignment_lines = []
+    if thesis:
+        alignment_lines.append(f"- 核心立论：{thesis}")
+    if research_gap:
+        alignment_lines.append(f"- 作者确认的 Research Gap：{research_gap}")
+    alignment_block = "\n".join(alignment_lines) or "- 未额外指定，依据正文提炼核心立论与缺口"
     prompt = prompts.INTRO_CONCLUSION_PROMPT.format(
         review_title=outline.title, topic=outline.topic, section_summaries=summaries,
         intro_min=intro_words[0], intro_max=intro_words[1],
-        concl_min=concl_words[0], concl_max=concl_words[1], focus_line=focus_line)
+        concl_min=concl_words[0], concl_max=concl_words[1], focus_line=focus_line,
+        alignment_block=alignment_block)
     data = _chat_json(client, model, prompt,
                       call_type="write_intro_conclusion", stage="stage_C_intro_conclusion",
                       meta={"review_title": outline.title, "topic": outline.topic, "sections_count": len(drafts)})

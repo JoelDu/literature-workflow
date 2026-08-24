@@ -92,7 +92,7 @@ ${DATA_ROOT}/                # 默认 ./data；作者机器 = /mnt/ripe/literatu
 - ⚠️ `mark_doc_type` 每列都是 `COALESCE(NULLIF(?,''), 旧值)`：一次退化的重新识别**永远不会**把已经正确的值抹成空。列名是拼进 SQL 的，所以有 `_MARKABLE_COLS` 白名单，改的时候别绕过它。
 
 **MCP Server（`mcp_server.py`）**
-- stdio 协议，7 个工具：`library_status`、`search_literature`（`corpus` 可限定词表里任一类型）、`get_paper_info`（标题/关键词/专利号/标准号）、`doc_status(doc_type, keyword)`（**只读**，专利法律状态与标准现行状态都不允许模型写库）、`generate_outline`、`start_review`（异步，秒回 job_id）、`review_status`（轮询）。
+- stdio / SSE / Streamable HTTP 三种传输共开放 17 个工具；综述相关为 `propose_review_angles`、`generate_outline`、`start_review`、`resume_review`、`review_status`，其中 `resume_review` 可从持久化章节检查点续跑。
 - ⚠️ `patent_status` **已更名为 `doc_status`**（多一个 `doc_type` 参数，专利与标准共用）。其他设备只需重启一次 MCP client，工具是动态发现的、配置不用改。
 - 检索结果带类型标签（`[标准 GB 38400-2019]`）：调用方模型据此判断这段话出自强制性文件还是某篇论文的实验结论，两者可引用分量完全不同。
 - 由 `mcp_server.sh` 负责加载密钥、清理代理变量、指向生产库后启动。
@@ -463,3 +463,10 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
     * **systemd 7x24 常驻服务 (`literature-review-mcp.service`)**：配置 `Restart=always` 与 `transport_security.allowed_hosts = ["*"]`，跨机访问 100% 稳定运行；
     * **全局记忆中心同步**：全套排查规则已持久化至 `/mnt/ripe/global_memory_service`。
 
+47. **综述生成可靠性 v3.2：共享逐章编排、双轨一致性与可恢复检查点 (2026-08-24)**：
+    * **共享深模块 (`litreview/review_orchestrator.py`)**：MCP 与 `review.py generate` 共用同一 Stage B→C 逐章执行路径，消除两端在双轨检索、字数分配、重试与输出校验上的行为漂移；
+    * **跨章多样性真正生效**：每章正文实际引用的 `doc_id` 立即进入使用历史，后续章节按次数降权；关闭 Reranker 或重排服务降级时仍使用相同规则；
+    * **双轨证据一致性**：Track A 与 Track B 共享 18,000 字符预算；Track B 只接纳具有真实 TLDR/摘要/summary 的文献，并限制为背景与学术脉络用途，检索异常自动降级为 Track A；
+    * **Stage A/C 程序化质量闸门**：大纲校验章节规模及每章 2-4 个非空检索问题，失败后定向纠错一次；正文校验有效引用覆盖与 3 篇以上文献的 Markdown 横向表格，Thesis/Research Gap 显式传入引言结论；
+    * **检查点可恢复**：SQLite `locked/busy` 异常不再被内部吞掉，五次指数退避实际生效；启动恢复只运行一次，`running/queued` 僵尸任务转为 `interrupted`；新增 `resume_review(job_id)` 复用规范化大纲、章节正文、引用与证据计数续跑；
+    * **验证结果**：综述相关测试 38 项通过；全量回归 215 项通过，剩余 8 项为动态生产数据数量基线及既有代理配置断言，与本轮综述修改无关。

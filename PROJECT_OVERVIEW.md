@@ -51,22 +51,23 @@
 
 **教材每日定时入库**：不用手动逐本跑 `add-book`——`daemon.py` 固定每天 `BOOK_INTAKE_TIME`（默认 03:00）扫一次 `BOOK_INPUT_DIR`，按文件名排序、PDF 累计页数不超过 `BOOK_DAILY_PAGE_BUDGET`（默认 2000）逐本入库，超预算的留到下一晚（排在最前的第一本例外，哪怕单本就超预算也会处理完，避免超大部头永远排不上）；EPUB 走 pandoc 不占用这个页数预算。成功入库后自动增量建索引（`REVIEW_AUTO_INDEX`）。想不等到凌晨立即跑一次，可执行 `python -c "import daemon; daemon.book_intake_job()"`。
 
-## 三、MCP Server：在对话里直接用 (v3.1)
+## 三、MCP Server：在对话里直接用 (v3.2)
 
-`mcp_server.py` 把整个文献库检索、引文图谱发现与高水平综述撰写能力包装成标准 MCP 协议 server。通过 **双传输融合网关（Dual-Transport Fusion）** 常驻监听 `0.0.0.0:8002`（由 systemd `literature-review-mcp.service` 守护），同时原生支持 **OpenAI Codex Desktop (Streamable HTTP `/mcp`)**、**Cursor / VS Code (SSE `/sse`)** 以及 **Claude Code / 终端 (SSH STDIO)**。全量开放 **16 个工具**：
-- **文献库与审计**：`library_status`（馆藏指标）、`list_documents`（多维检索与过滤）、`library_reconcile`（四层数据对齐审计）、`get_paper_info`（单篇详情）、`doc_status`（法律/现行状态查阅）；
+`mcp_server.py` 把整个文献库检索、引文图谱发现与高水平综述撰写能力包装成标准 MCP 协议 server。通过 **双传输融合网关（Dual-Transport Fusion）** 常驻监听 `0.0.0.0:8002`（由 systemd `literature-review-mcp.service` 守护），同时原生支持 **OpenAI Codex Desktop (Streamable HTTP `/mcp`)**、**Cursor / VS Code (SSE `/sse`)** 以及 **Claude Code / 终端 (SSH STDIO)**。全量开放 **17 个工具**：
+- **文献库与审计**：`library_status`（馆藏指标）、`search_literature`（向量召回与重排）、`list_documents`（多维检索与过滤）、`library_reconcile`（四层数据对齐审计）、`get_paper_info`（单篇详情）、`doc_status`（法律/现行状态查阅）；
 - **前沿引文与滚雪球发现**：`get_citation_network`（图谱与局部子网）、`citation_expand`（OpenAlex 双轨滚雪球）、`list_discovery_candidates`（候选池管理）、`approve_candidates`（状态机审批）、`acquire_fulltext`（合法 OA PDF 暂存）、`ingest_acquired_candidates`（解析索引入库）；
-- **顶刊级综述引擎 (Thesis-Driven v3.1)**：
+- **顶刊级综述引擎 (Thesis-Driven v3.2)**：
   - `propose_review_angles`：**大纲前置人机对齐**，基于本地馆藏真实文献提炼 3 套顶刊级立论方案（Thesis + Research Gap + 6 类主线逻辑）；
   - `generate_outline`：支持注入作者 Thesis 与 Research Gap 强约束，检索问题强制按【机理/工艺机制】+【量化参数/对照数据】+【现存缺陷/工业瓶颈】三元组输出，并执行 3 档字数动力学伸缩与文献门槛诊断；
-  - `start_review`：后台异步生成完整综述（秒回 job_id，单消费者 FIFO 调度），段落微观逻辑链推进、Markdown 横向对比矩阵表格与“一问一策”闭环展望；
+  - `start_review`：后台异步生成完整综述（秒回 job_id，单消费者 FIFO 调度）；正文按章节交错执行检索→写作，双轨文献共享 18,000 字符预算，并依据已引用文献对后续章节实施跨章降权；
+  - `resume_review`：显式恢复中断或部分完成任务，复用已持久化大纲与章节检查点续跑；
   - `review_status`：查询综述任务进度、心跳与章节检查点（支持跨重启持久化自愈）。
 - **生产级可靠性设计**：
   - SQLite 默认启用 `WAL` 并发读写模式与 30s 超时；
   - 增加 `@retry_on_db_locked(max_retries=5)` 指数退避重试装饰器；
-  - 启动自愈机制（Boot Self-Healing）：进程重启时自动将历史残留的 `running` 僵尸任务修复为 `interrupted`；
-  - 章节级检查点（Section Checkpointing）：每完成一章立即存入 `checkpoint_json` 并更新 `heartbeat_at`，单章节网络异常自动重试 3 次；
-  - 证据 Token 预算安全截断（上限 18,000 字符，彻底避免 400 Context Limit）；
+  - 启动自愈机制（Boot Self-Healing）：仅在进程启动时执行一次，将历史残留的 `running`/`queued` 僵尸任务修复为 `interrupted`，正常持久化不会误伤活跃任务；
+  - 章节级检查点（Section Checkpointing）：每完成一章立即保存规范化大纲、章节正文、引用与证据计数并更新 `heartbeat_at`；可用 `resume_review` 显式续跑；
+  - 双轨证据共享 18,000 字符安全预算，第二轨缺少真实摘要时不会注入占位内容；
   - `@_logged_tool()` 防崩溃异常边界，确保 stdio / SSE / HTTP JSON-RPC 管道永不断连。
 
 

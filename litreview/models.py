@@ -31,6 +31,7 @@ class SectionDraft(BaseModel):
     heading: str
     markdown: str
     cited_doc_ids: list = Field(default_factory=list)
+    source_evidence_count: int = 0  # 支持检查点续跑后准确恢复全文证据计数
 
 
 class ReviewDoc(BaseModel):

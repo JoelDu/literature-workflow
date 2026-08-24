@@ -65,3 +65,4 @@ def test_reranker_degrades_gracefully():
     r = Reranker("dummy-model", api_key="x", base_url="http://127.0.0.1:9")  # 不可达端口
     result = r.rerank("query", ["doc1", "doc2"], top_n=2)
     assert result == [(0, 0.0), (1, 0.0)]
+    assert result.degraded is True

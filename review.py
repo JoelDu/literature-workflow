@@ -493,9 +493,8 @@ def cmd_generate(args):
     import time
     from litreview.store import VectorStore
     from litreview.stages import (generate_outline, load_outline_file, gather_evidence,
-                                  write_section, write_intro_conclusion,
+                                  write_intro_conclusion,
                                   assemble_review, render_review_note, export_docx)
-    from litreview.figures import select_section_figures
 
     client, model = _make_client()
     store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
@@ -524,32 +523,22 @@ def cmd_generate(args):
                                    mainline_logic=getattr(args, 'logic', '') or '')
         console.print(f"[green]✔ 大纲: {outline.title}（{len(outline.sections)} 章节）")
 
-    # 字数分配：--words 指定全文目标总字数时，按写作指南篇幅权重摊分
-    # （引言约 12%、结论与展望约 15%——展望需容纳"一问一策"逐条对应，其余归主体章节）
+    from litreview.review_orchestrator import allocate_review_words
+    word_plan = allocate_review_words(args.words or 0, len(outline.sections))
+    section_words = word_plan.section_words
+    intro_words = word_plan.intro_words
+    concl_words = word_plan.conclusion_words
     if args.words:
-        intro_target = max(300, min(900, int(args.words * 0.12)))
-        concl_target = max(350, min(1100, int(args.words * 0.15)))
-        body_per_section = max(400, (args.words - intro_target - concl_target)
-                               // max(1, len(outline.sections)))
-        section_words = (int(body_per_section * 0.85), int(body_per_section * 1.15))
-        intro_words = (int(intro_target * 0.8), int(intro_target * 1.2))
-        concl_words = (int(concl_target * 0.8), int(concl_target * 1.2))
         console.print(f"[dim]目标总字数 {args.words}：每章节 {section_words[0]}-{section_words[1]} 字，"
                       f"引言 {intro_words[0]}-{intro_words[1]} 字，结论 {concl_words[0]}-{concl_words[1]} 字")
-    else:
-        section_words, intro_words, concl_words = (600, 1000), (300, 500), (400, 700)
-
-    # Stage B
-    section_evidence = []
-    for i, sec in enumerate(outline.sections, 1):
-        console.print(f"[cyan]阶段 B：收集证据 [{i}/{len(outline.sections)}] {sec.heading} ...")
-        ev = gather_evidence(sec, store, embedder, client, settings.ANALYSIS_MODEL,
-                             settings, console, paper_meta,
-                             reranker=reranker)
-        console.print(f"  [green]✔ 保留 {len(ev)} 条证据")
-        section_evidence.append(ev)
 
     if args.dry_run:
+        section_evidence = []
+        for i, sec in enumerate(outline.sections, 1):
+            console.print(f"[cyan]阶段 B：收集证据 [{i}/{len(outline.sections)}] {sec.heading} ...")
+            ev = gather_evidence(sec, store, embedder, client, settings.ANALYSIS_MODEL,
+                                 settings, console, paper_meta, reranker=reranker)
+            section_evidence.append(ev)
         for sec, evs in zip(outline.sections, section_evidence):
             table = Table(title=f"证据表: {sec.heading}", show_lines=True)
             table.add_column("分", justify="right", width=4)
@@ -562,26 +551,25 @@ def cmd_generate(args):
         console.print("[yellow]--dry-run 模式：已停在证据阶段，未生成正文。")
         return
 
-    # Stage C（单章节失败不终止全篇，跳过并在结尾提示）
-    drafts = []
-    failed_sections = []
-    used_figures = set()   # 跨章节图片去重
-    for i, (sec, evs) in enumerate(zip(outline.sections, section_evidence), 1):
-        console.print(f"[cyan]阶段 C：撰写章节 [{i}/{len(outline.sections)}] {sec.heading} ...")
-        if not evs:
-            console.print(f"  [yellow]⚠️ 无证据，跳过该章节。")
-            continue
-        try:
-            draft = write_section(sec, evs, paper_meta, outline.title, client, model,
-                                  words=section_words, focus=focus)
-            n_figs = select_section_figures(store, reranker, sec, draft, settings,
-                                            console, used_figures)
-            if n_figs:
-                console.print(f"  [dim]插入相关图表 {n_figs} 幅")
-            drafts.append(draft)
-        except Exception as e:
-            failed_sections.append(sec.heading)
-            console.print(f"  [red]✖ 章节撰写失败（跳过）: {e}")
+    # Stage B/C 共享深模块：逐章检索→写作，确保跨章降权对 MCP/CLI 同时生效。
+    from litreview.review_orchestrator import (
+        ReviewDependencies, ReviewHooks, SectionGenerationConfig,
+        generate_review_sections,
+    )
+    from litreview.stages import get_scaling_config
+    scaling = get_scaling_config(args.words or 0, args.lang or "zh")
+    section_result = generate_review_sections(
+        outline,
+        ReviewDependencies(store, embedder, client, reranker, settings, console),
+        SectionGenerationConfig(
+            section_words=section_words, focus=focus,
+            review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"],
+        ),
+        ReviewHooks(on_progress=lambda message: console.print(message)),
+    )
+    drafts = section_result.drafts
+    failed_sections = section_result.failed_sections
+    section_evidence = section_result.section_evidence
     if not drafts:
         console.print("[bold red]❌ 所有章节均无内容，综述生成中止。请检查主题与文献库是否匹配，或稍后重试。")
         sys.exit(1)
@@ -589,13 +577,15 @@ def cmd_generate(args):
     try:
         intro, conclusion = write_intro_conclusion(outline, drafts, client, model,
                                                    intro_words=intro_words,
-                                                   concl_words=concl_words, focus=focus)
+                                                   concl_words=concl_words, focus=focus,
+                                                   thesis=getattr(args, 'thesis', '') or '',
+                                                   research_gap=getattr(args, 'gap', '') or '')
     except Exception as e:
         console.print(f"[yellow]⚠️ 引言/结论生成失败（正文保留）: {e}")
         intro, conclusion = "", ""
 
     # Stage D
-    evidence_total = sum(len(e) for e in section_evidence)
+    evidence_total = section_result.evidence_count
     review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total)
     template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
     out_path = render_review_note(review, paper_meta, settings, template_path, model)

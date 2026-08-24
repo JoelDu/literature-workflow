@@ -126,7 +126,7 @@ def test_review_pipeline_uses_mini_for_evidence_and_review_model_for_writing(
     monkeypatch.setattr(stages, "write_section",
                         lambda sec, _ev, _meta, _title, _client, model, **_kwargs:
                         models["section"].append(model) or SectionDraft(
-                            heading=sec.heading, markdown="正文", cited_doc_ids=[]))
+                            heading=sec.heading, markdown="正文 [@doc1]", cited_doc_ids=["doc1"]))
     monkeypatch.setattr(stages, "write_intro_conclusion",
                         lambda _outline, _drafts, _client, model, **_kwargs:
                         models["intro"].append(model) or ("引言", "结论"))
@@ -147,6 +147,71 @@ def test_review_pipeline_uses_mini_for_evidence_and_review_model_for_writing(
         "section": [server.settings.REVIEW_MODEL],
         "intro": [server.settings.REVIEW_MODEL],
     }
+    assert server._jobs["job"]["checkpoint_json"]
+    assert server._jobs["job"]["heartbeat_at"]
+    assert server._jobs["job"]["outline_json"]
+
+
+def test_review_job_persistence_retries_locked_database(monkeypatch, tmp_path):
+    """持久化不能吞掉 locked；必须让五次退避装饰器接管重试。"""
+    server = _fresh_mcp(monkeypatch, tmp_path)
+    attempts = []
+
+    class FakeConnection:
+        def execute(self, *_args, **_kwargs):
+            import sqlite3
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise sqlite3.OperationalError("database is locked")
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_init_review_jobs_db", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db_conn", lambda *a, **k: FakeConnection())
+
+    server._persist_review_job({"job_id": "job-retry"})
+
+    assert len(attempts) == 3
+
+
+def test_normal_persistence_does_not_interrupt_running_job(monkeypatch, tmp_path):
+    """启动恢复只能执行一次；正常心跳持久化不能把当前任务改成 interrupted。"""
+    server = _fresh_mcp(monkeypatch, tmp_path)
+    job = {
+        "job_id": "running-job", "topic": "测试", "status": "running",
+        "log": [], "heartbeat_at": "2026-08-24 12:00:00",
+    }
+    server._persist_review_job(job)
+    server._init_review_jobs_db()
+
+    persisted = server._get_persistent_review_job("running-job")
+    assert persisted["status"] == "running"
+
+
+def test_resume_review_requeues_persisted_checkpoint(monkeypatch, tmp_path):
+    """中断任务应携带规范化大纲和章节检查点重新入队。"""
+    import queue
+    server = _fresh_mcp(monkeypatch, tmp_path)
+    checkpoint = '[{"heading":"第一章","markdown":"正文","cited_doc_ids":["doc1"]}]'
+    outline = '{"title":"测试综述","sections":[{"heading":"第一章","questions":["问题"]},{"heading":"第二章","questions":["问题"]}]}'
+    server._persist_review_job({
+        "job_id": "resume-job", "topic": "测试", "status": "interrupted",
+        "outline_json": outline, "checkpoint_json": checkpoint, "log": [],
+        "research_gap": "缺口", "thesis": "立论", "target_lang": "zh",
+    })
+    queued = queue.Queue()
+    monkeypatch.setattr(server, "_review_queue", queued)
+    monkeypatch.setattr(server, "_ensure_review_worker", lambda: None)
+
+    message = server.resume_review.__wrapped__("resume-job")
+
+    assert "重新入队" in message
+    assert queued.get_nowait()[0] == "resume-job"
+    assert server._get_persistent_review_job("resume-job")["status"] == "queued"
 
 
 def test_review_cli_uses_review_model_for_body_writing(monkeypatch):
@@ -425,4 +490,3 @@ def test_mcp_propose_review_angles(monkeypatch, tmp_path):
     assert data["proposed_angles"][0]["angle_id"] == "A"
     assert "植物油改性" in data["proposed_angles"][0]["thesis"]
     assert "alignment_guidance" in data
-

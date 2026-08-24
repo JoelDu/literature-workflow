@@ -192,10 +192,12 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
 - `--focus`：侧重方向（如"侧重环保型材料与降解机理"），贯穿大纲设计、每章写作和引言结论；
 - `--words`：目标总字数，自动激活 **3 档字数动力学伸缩矩阵**（精简<8k/标准8-12k/深度>12k）及文献门槛诊断；
 - `--lang`：目标语言，可选 `zh`（中文综述）或 `en`（英文综述，按 1.6x 单词当量自动换算）；
-- `--sections`：主体章节数；不指定时由模型自定 3-6 个；
+- `--sections`：主体章节数；不指定时按目标字数档位由模型生成 3-9 个，并执行章节数与每章 2-4 个检索问题的结构校验；
 - `--outline`：外部大纲文件（JSON 或 `## 章节标题` + `- 检索问题` 格式的 markdown），完全手工控制章节与检索方向，指定后跳过大纲生成。
 
-- **检索链路**：硅基流动 Qwen3-Embedding-8B（4096 维，跨中英）向量召回候选 → Qwen3-Reranker-8B 精排 → `gpt-5.4-mini` 逐条打分提炼证据 → 固定 `gpt-5.4` 只依据证据写作并使用规范学术编号（如 `[@U-J25-001]`）强制引用 → 3 篇以上文献章节自动生成 Markdown 横向对比矩阵表格 → 全局顺序编号与 GB/T 7714-2015 规范参考文献列表。
+- **双轨逐章链路**：每章按 Stage B→C 顺序执行。Track A 经 Qwen3 向量召回、Reranker 精排与 `gpt-5.4-mini` 证据评分，负责机理和实测数据；Track B 只装载有真实摘要的外围文献，负责背景与学术脉络。两轨共同受 18,000 字符预算约束，正文由固定 `gpt-5.4` 撰写并使用规范学术编号（如 `[@U-J25-001]`）。
+- **跨章覆盖与降级**：每章实际引用的文献会进入使用历史，后续章节对重复文献按次数降权；该机制在关闭 Reranker 或重排服务故障时仍生效。重排故障会显式降级至确定性的向量排序，Track B 故障则保留 Track A 继续生成。
+- **正文质量闸门**：单章可用文献达到 3 篇时必须输出 Markdown 横向对比表；系统校验有效引用覆盖、18-28 篇上限及表格结构，校验失败会携带具体原因定向重写。Thesis 与 Research Gap 会贯穿大纲、正文视角及引言「承-转-合」。
 - **结构化元数据**（`batch_tracking.db` 新表）：`paper_details`（中英标题/DOI/作者/期刊/年份/关键词）、`paper_assets`（图/表/图题/页码）、`paper_references`（每篇论文自己引用的文献逐条）。提取以免费的 content_list.json 本地解析为主，LLM 仅补缺。
 - **自动插图**：写完每章后，从本章已引用文献（论文或教材）的 `paper_assets` 里按图题与本章主题的重排相关度挑图（过阈值），把真实图片复制进 `reviews/assets/` 并插入正文，图注随全文统一编号。图片会一并嵌入导出的 Word（pandoc `--resource-path` 指向 .md 目录解析相对图路径）。
 - **输出格式**：标准论文式章节编号（`1 引言` → `2..N` 正文各章 → `N+1 结论与展望`），末尾 `参考文献` 不编号；不含摘要/关键字块。生成 Markdown（写入 Obsidian `reviews` 目录）的同时，用 pandoc 自动导出同名 `.docx`（导出前去掉 Obsidian wikilink 后缀，参考文献逐条独立成段），Word 导出失败不影响 markdown 主流程。参考文献按 GB/T 7714-2015 的**文献类型标识码**区分，8 种类型各走各的著录格式（见下文「文献类型」一节）。
@@ -298,11 +300,12 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 
 `mcp_server.py` 把文献库检索、引文网络探索与顶级综述撰写打包成标准 MCP server，全面支持 **Streamable HTTP (`/mcp`)**、**SSE (`/sse`)** 与 **STDIO (SSH 管道)** 三种传输模式，可被 OpenAI Codex Desktop / Claude Code / Claude Desktop / Cursor / Cherry Studio 等全平台客户端调用。
 
-**提供全量 16 个工具**：
+**提供全量 17 个工具**：
 
 | 分类 | 工具名称 | 核心功能说明 |
 |---|---|---|
 | **文献库与审计** | `library_status` | 文献库概况（馆藏篇数/向量索引/元数据覆盖，按 8 种文献类型分列） |
+| | `search_literature` | Qwen3 向量召回与重排检索，可按文献类型限定语料 |
 | | `list_documents` | 多维检索、分类过滤与馆藏文献分页浏览 |
 | | `library_reconcile` | 四层数据对齐审计（生产库 vs 拓扑库 vs 候选库一致性检测） |
 | | `get_paper_info` | 查单篇结构化元数据（DOI/作者/期刊/TLDR/关键词/肥料借鉴，专利保护期，标准实施状态） |
@@ -316,6 +319,7 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 | **顶刊综述引擎** | `propose_review_angles` | **大纲前置人机对齐**：基于本地馆藏提炼 3 套顶刊级立论方案（Thesis + Research Gap） |
 | | `generate_outline` | 约束作者 Thesis 与 Research Gap，按机制/数据/缺陷三元组输出大纲（含文献门槛诊断） |
 | | `start_review` | 后台异步生成完整综述（秒回 job_id，单消费者 FIFO 调度，段落微观逻辑链推进） |
+| | `resume_review` | 从中断/部分完成任务的持久化章节检查点继续生成 |
 | | `review_status` | 轮询综述进度、章节检查点与产出路径（返回虚拟化 URI 与下载链接） |
 
 ---
@@ -487,7 +491,7 @@ flowchart LR
 
 ## 🛠️ 五、MCP Server 扩展工具集
 
-`mcp_server.py` 现已升级至 15 个工具，支持在 LLM 对话中直接调用全套文献管理、语义检索、引文图谱与综述写作能力：
+`mcp_server.py` 现已升级至 17 个工具，支持在 LLM 对话中直接调用全套文献管理、语义检索、引文图谱与综述写作能力：
 
 | 工具名 | 类别 | 描述 |
 | :--- | :--- | :--- |
@@ -499,6 +503,7 @@ flowchart LR
 | `doc_status` | 状态台账 | 查询专利法律状态与标准现行状态（只读） |
 | `generate_outline` | 综述大纲 | 依据检索主题生成综述大纲结构 JSON |
 | `start_review` | 综述生成 | 异步启动学术综述撰写，返回 job_id |
+| `resume_review` | 检查点恢复 | 将 interrupted、failed 或 partial 任务从已持久化大纲和章节检查点重新入队 |
 | `review_status` | 综述进度 | 轮询综述生成进度与导出文件路径 |
 | `get_citation_network`| 引文图谱 | 查询单篇文献出入向引用、候选引用、共同参考文献与消歧统计 |
 | `citation_expand` | 滚雪球发现 | 启动基于 OpenAlex 的双轨引文滚雪球发现 |
@@ -518,7 +523,7 @@ flowchart LR
    * 针对未完成完整流水线的孤儿文献（如 `work_oa_w4391143884`），标记为 `QUARANTINED_INCOMPLETE` 并在 `eligible_for_citation_graph = 0` 下从默认图谱与向量检索中完全排除；
    * 保留其资产及审计链，后续补齐完整解析与向量化后可平滑恢复。
 3. **自动化测试覆盖**：
-   * 全套测试套件（`pytest`）包含 **189 个用例**，覆盖 doctype 码表、chunker 切块、bookintake 教材、citation network 引文消歧、snowball 滚雪球、isolation 隔离回归、web API 及 MCP server，全量 100% 通过。
+   * 全套测试套件（`pytest`）包含 **200+ 个用例**，覆盖 doctype 码表、chunker 切块、bookintake 教材、citation network 引文消歧、snowball 滚雪球、isolation 隔离回归、web API、MCP server 与综述检查点恢复。
 
 
 ---

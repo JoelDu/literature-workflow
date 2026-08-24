@@ -6,6 +6,7 @@
 - get_paper_info      按关键词查论文元数据（中英标题/DOI/作者/期刊/关键词/TLDR）
 - generate_outline    生成综述大纲 JSON（调用方可修改后传给 start_review）
 - start_review        后台启动完整综述生成（7-30 分钟），立即返回 job_id
+- resume_review       从持久化章节检查点恢复中断/部分完成任务
 - review_status       查询综述生成进度/结果路径
 
 启动方式见 mcp_server.sh（负责注入 API key、清理代理变量、设置数据路径）。
@@ -133,6 +134,9 @@ _jobs_lock = threading.Lock()
 _review_queue = queue.Queue()
 _review_worker = None
 _review_worker_lock = threading.Lock()
+_review_jobs_db_init_lock = threading.Lock()
+_review_jobs_db_initialized = set()
+_review_jobs_db_recovered = set()
 
 
 def _client():
@@ -791,7 +795,7 @@ def generate_outline(topic: str, focus: str = "", words: int = 0, sections: int 
     check = _check_literature_sufficiency(topic, words=words, target_lang=target_lang)
     
     console = Console(file=io.StringIO(), no_color=True, width=100)
-    outline = _gen(topic, _store(), _embedder(), _client(), settings.ANALYSIS_MODEL,
+    outline = _gen(topic, _store(), _embedder(), _client(), settings.REVIEW_MODEL,
                    settings, console, focus=focus, n_sections=sections,
                    words=words, target_lang=target_lang,
                    research_gap=research_gap, thesis=thesis, mainline_logic=mainline_logic)
@@ -806,64 +810,84 @@ def generate_outline(topic: str, focus: str = "", words: int = 0, sections: int 
 
 # ── 综述生成（后台任务模式 + SQLite 状态持久化 + 故障自愈） ────────────────────────────
 
-def _init_review_jobs_db():
-    try:
+@retry_on_db_locked(max_retries=5)
+def _init_review_jobs_db(recover_interrupted: bool = False):
+    """建表/迁移；进程启动恢复只执行一次，普通读写不会改动任务状态。"""
+    db_key = os.path.abspath(settings.DB_PATH)
+    with _review_jobs_db_init_lock:
+        if db_key in _review_jobs_db_initialized and (
+            not recover_interrupted or db_key in _review_jobs_db_recovered
+        ):
+            return
         conn = _get_db_conn()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS review_jobs (
-                job_id TEXT PRIMARY KEY,
-                topic TEXT NOT NULL,
-                focus TEXT,
-                words INTEGER DEFAULT 0,
-                sections INTEGER DEFAULT 0,
-                outline_json TEXT,
-                status TEXT NOT NULL,
-                progress_log TEXT,
-                output_path TEXT,
-                docx_path TEXT,
-                summary TEXT,
-                error TEXT,
-                queued_at TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                heartbeat_at TEXT,
-                checkpoint_json TEXT
-            )
-        """)
-        # 兼容旧表升级：检查并补充新增列
-        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(review_jobs)").fetchall()]
-        if "heartbeat_at" not in existing_cols:
-            conn.execute("ALTER TABLE review_jobs ADD COLUMN heartbeat_at TEXT")
-        if "checkpoint_json" not in existing_cols:
-            conn.execute("ALTER TABLE review_jobs ADD COLUMN checkpoint_json TEXT")
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS review_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    topic TEXT NOT NULL,
+                    focus TEXT,
+                    words INTEGER DEFAULT 0,
+                    sections INTEGER DEFAULT 0,
+                    outline_json TEXT,
+                    status TEXT NOT NULL,
+                    progress_log TEXT,
+                    output_path TEXT,
+                    docx_path TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    queued_at TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    heartbeat_at TEXT,
+                    checkpoint_json TEXT,
+                    research_gap TEXT,
+                    thesis TEXT,
+                    mainline_logic TEXT,
+                    target_lang TEXT DEFAULT 'zh'
+                )
+            """)
+            existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(review_jobs)").fetchall()]
+            if "heartbeat_at" not in existing_cols:
+                conn.execute("ALTER TABLE review_jobs ADD COLUMN heartbeat_at TEXT")
+            if "checkpoint_json" not in existing_cols:
+                conn.execute("ALTER TABLE review_jobs ADD COLUMN checkpoint_json TEXT")
+            for column, ddl in (
+                ("research_gap", "TEXT"),
+                ("thesis", "TEXT"),
+                ("mainline_logic", "TEXT"),
+                ("target_lang", "TEXT DEFAULT 'zh'"),
+            ):
+                if column not in existing_cols:
+                    conn.execute(f"ALTER TABLE review_jobs ADD COLUMN {column} {ddl}")
 
-        # 启动自愈机制：将上次进程异常退出残留的 'running' 僵尸任务自动修复为 'interrupted'
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cur = conn.execute("""
-            UPDATE review_jobs 
-            SET status = 'interrupted',
-                error = '服务重启导致任务中断（历史断点已保留，可重新提交）',
-                completed_at = ?
-            WHERE status = 'running'
-        """, (now_str,))
-        if cur.rowcount > 0:
-            logger.info(f"启动自愈：已将 {cur.rowcount} 个异常中断的 running 任务恢复为 interrupted 状态。")
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning(f"Init review_jobs table error: {e}")
+            if recover_interrupted and db_key not in _review_jobs_db_recovered:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur = conn.execute("""
+                    UPDATE review_jobs
+                    SET status = 'interrupted',
+                        error = '服务重启导致任务中断（历史断点已保留，可重新提交）',
+                        completed_at = ?
+                    WHERE status IN ('running', 'queued')
+                """, (now_str,))
+                if cur.rowcount > 0:
+                    logger.info(f"启动自愈：已中断 {cur.rowcount} 个未完成后台任务并保留检查点。")
+                _review_jobs_db_recovered.add(db_key)
+            conn.commit()
+            _review_jobs_db_initialized.add(db_key)
+        finally:
+            conn.close()
 
 
 @retry_on_db_locked(max_retries=5)
 def _persist_review_job(job_dict: dict):
+    _init_review_jobs_db()
+    conn = _get_db_conn()
     try:
-        _init_review_jobs_db()
-        conn = _get_db_conn()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""
             INSERT OR REPLACE INTO review_jobs
-            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job_dict["job_id"],
             job_dict.get("topic", ""),
@@ -881,26 +905,28 @@ def _persist_review_job(job_dict: dict):
             job_dict.get("started_at", ""),
             job_dict.get("completed_at", ""),
             job_dict.get("heartbeat_at", now_str),
-            job_dict.get("checkpoint_json", "")
+            job_dict.get("checkpoint_json", ""),
+            job_dict.get("research_gap", ""),
+            job_dict.get("thesis", ""),
+            job_dict.get("mainline_logic", ""),
+            job_dict.get("target_lang", "zh"),
         ))
         conn.commit()
+    finally:
         conn.close()
-    except Exception as e:
-        logger.warning(f"Persist review job {job_dict.get('job_id')} error: {e}")
 
 
 @retry_on_db_locked(max_retries=5)
 def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
+    _init_review_jobs_db()
+    conn = _get_db_conn(readonly=True)
     try:
-        _init_review_jobs_db()
-        conn = _get_db_conn(readonly=True)
         c = conn.cursor()
         if job_id:
-            c.execute("SELECT job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json FROM review_jobs WHERE job_id = ?", (job_id,))
+            c.execute("SELECT job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang FROM review_jobs WHERE job_id = ?", (job_id,))
         else:
-            c.execute("SELECT job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json FROM review_jobs ORDER BY queued_at DESC LIMIT 1")
+            c.execute("SELECT job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang FROM review_jobs ORDER BY queued_at DESC LIMIT 1")
         row = c.fetchone()
-        conn.close()
         if row:
             return {
                 "job_id": row[0],
@@ -919,11 +945,19 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
                 "started_at": row[13] or "",
                 "completed_at": row[14] or "",
                 "heartbeat_at": row[15] or "",
-                "checkpoint_json": row[16] or ""
+                "checkpoint_json": row[16] or "",
+                "research_gap": row[17] or "",
+                "thesis": row[18] or "",
+                "mainline_logic": row[19] or "",
+                "target_lang": row[20] or "zh",
             }
-    except Exception as e:
-        logger.warning(f"Query persistent review job error: {e}")
+    finally:
+        conn.close()
     return None
+
+
+# 只在模块启动时执行一次中断恢复；后续读写只确保表结构存在。
+_init_review_jobs_db(recover_interrupted=True)
 
 
 def _run_review_job(job_id: str, topic: str, focus: str, words: int,
@@ -931,10 +965,8 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                     research_gap: str = "", thesis: str = "", mainline_logic: str = "",
                     target_lang: str = "zh"):
     from litreview.models import Outline
-    from litreview.stages import (generate_outline as _gen, gather_evidence, write_section,
-                                  write_intro_conclusion, assemble_review, render_review_note,
-                                  export_docx)
-    from litreview.figures import select_section_figures
+    from litreview.stages import (generate_outline as _gen, write_intro_conclusion,
+                                  assemble_review, render_review_note, export_docx)
     
     now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _jobs_lock:
@@ -948,6 +980,18 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             "heartbeat_at": now_iso,
             "checkpoint_json": ""
         })
+        job.setdefault("job_id", job_id)
+        job.setdefault("topic", topic)
+        job.setdefault("focus", focus)
+        job.setdefault("words", words)
+        job.setdefault("sections", n_sections)
+        job.setdefault("outline_json", outline_json)
+        job.setdefault("checkpoint_json", "")
+        job.setdefault("heartbeat_at", now_iso)
+        job.setdefault("research_gap", research_gap)
+        job.setdefault("thesis", thesis)
+        job.setdefault("mainline_logic", mainline_logic)
+        job.setdefault("target_lang", target_lang)
         _jobs[job_id] = job
     buf = io.StringIO()
     console = Console(file=buf, no_color=True, width=100)
@@ -974,80 +1018,59 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                            research_gap=research_gap, thesis=thesis, mainline_logic=mainline_logic)
             log(f"大纲完成：{outline.title}（{len(outline.sections)} 章节）")
 
-        if words:
-            intro_target = max(600, min(1200, int(words * 0.08)))
-            concl_target = max(800, min(1500, int(words * 0.10)))
-            per = max(1800, (words - intro_target - concl_target)
-                      // max(1, len(outline.sections)))
-            section_words = (int(per * 0.9), int(per * 1.2))
-            intro_words = (int(intro_target * 0.85), int(intro_target * 1.15))
-            concl_words = (int(concl_target * 0.85), int(concl_target * 1.15))
-        else:
-            section_words, intro_words, concl_words = (1800, 2600), (600, 1000), (800, 1200)
+        # 无论大纲来自调用方还是模型，都持久化规范化结果，供检查点恢复使用。
+        with _jobs_lock:
+            job["outline_json"] = json.dumps(outline.model_dump(), ensure_ascii=False)
+            job["heartbeat_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _persist_review_job(job)
 
-        from litreview.stages import gather_broad_bibliography
-        section_evidence = []
-        section_broad_bibs = []
-        doc_usage_history = {}
-        for i, sec in enumerate(outline.sections, 1):
-            log(f"阶段 B：收集证据 [{i}/{len(outline.sections)}] {sec.heading}")
-            ev = gather_evidence(sec, store, embedder, client, settings.ANALYSIS_MODEL, settings,
-                                 console, paper_meta, reranker=reranker, doc_usage_history=doc_usage_history)
-            # Token 预算保护：单章节证据严格限长，避免大模型 API 报 context_length_exceeded
-            ev_budget = []
-            total_chars = 0
-            for e in ev:
-                c_len = len(getattr(e, 'summary', '') or getattr(e, 'content', '') or '')
-                if total_chars + c_len > 18000:
-                    break
-                ev_budget.append(e)
-                total_chars += c_len
-            section_evidence.append(ev_budget)
+        from litreview.review_orchestrator import allocate_review_words
+        word_plan = allocate_review_words(words, len(outline.sections))
+        section_words = word_plan.section_words
+        intro_words = word_plan.intro_words
+        concl_words = word_plan.conclusion_words
 
-            # 检索第二轨道：广泛背景与对比支撑文献池 (25 篇)
-            ev_doc_ids = {e.doc_id for e in ev_budget}
-            broad_bib = gather_broad_bibliography(sec, store, embedder, paper_meta,
-                                                 exclude_doc_ids=ev_doc_ids, top_n=25)
-            section_broad_bibs.append(broad_bib)
-            log(f"  保留 {len(ev_budget)} 条第一轨深度证据，装载 {len(broad_bib)} 篇第二轨背景文献")
+        from litreview.models import SectionDraft
+        from litreview.review_orchestrator import (
+            ReviewDependencies, ReviewHooks, SectionGenerationConfig,
+            generate_review_sections,
+        )
+        from litreview.stages import get_scaling_config
+        scaling = get_scaling_config(words, target_lang)
 
-        drafts = []
-        used_figures = set()
-        for i, (sec, evs, b_bib) in enumerate(zip(outline.sections, section_evidence, section_broad_bibs), 1):
-            if not evs and not b_bib:
-                log(f"阶段 C：章节 [{i}] {sec.heading} 无文献支持，跳过")
-                continue
-            log(f"阶段 C：撰写章节 [{i}/{len(outline.sections)}] {sec.heading}")
-            
-            # 单章节容错重试机制
-            sec_draft = None
-            for sec_attempt in range(3):
-                try:
-                    sec_draft = write_section(sec, evs, paper_meta, outline.title, client, model,
-                                              words=section_words, focus=focus, broad_bib=b_bib)
-                    break
-                except Exception as sec_err:
-                    if sec_attempt == 2:
-                        log(f"⚠️ 章节 [{i}] 撰写失败，跳过该节以保全整体综述: {sec_err}")
-                    else:
-                        time.sleep(2 * (sec_attempt + 1))
-            
-            if sec_draft:
-                # 记录本章实际引用的 doc_id，供后续章节探索性降权与去重分析
-                for d_id in sec_draft.cited_doc_ids:
-                    doc_usage_history[d_id] = doc_usage_history.get(d_id, 0) + 1
+        initial_drafts = []
+        if job.get("checkpoint_json"):
+            try:
+                initial_drafts = [SectionDraft(**item) for item in json.loads(job["checkpoint_json"])]
+                if initial_drafts:
+                    log(f"恢复章节检查点：已载入 {len(initial_drafts)} 节")
+            except Exception as checkpoint_err:
+                log(f"⚠️ 检查点解析失败，将从头生成正文：{checkpoint_err}")
 
-                n_figs = select_section_figures(store, reranker, sec, sec_draft, settings,
-                                                console, used_figures)
-                if n_figs:
-                    log(f"  插入相关图表 {n_figs} 幅")
-                drafts.append(sec_draft)
-                
-                # Checkpoint 检查点分步保存：每完成一节立即持久化
-                with _jobs_lock:
-                    job["summary"] = f"已完成 {len(drafts)}/{len(outline.sections)} 章节撰写"
-                    job["checkpoint_json"] = json.dumps([{"heading": d.heading, "markdown": d.markdown, "cited_doc_ids": d.cited_doc_ids} for d in drafts], ensure_ascii=False)
-                    _persist_review_job(job)
+        def persist_checkpoint(completed_drafts):
+            with _jobs_lock:
+                job["summary"] = f"已完成 {len(completed_drafts)}/{len(outline.sections)} 章节撰写"
+                job["checkpoint_json"] = json.dumps(
+                    [draft.model_dump() for draft in completed_drafts], ensure_ascii=False
+                )
+                job["heartbeat_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _persist_review_job(job)
+
+        section_result = generate_review_sections(
+            outline,
+            ReviewDependencies(
+                store=store, embedder=embedder, client=client, reranker=reranker,
+                settings=settings, console=console,
+            ),
+            SectionGenerationConfig(
+                section_words=section_words, focus=focus, source_char_budget=18_000,
+                initial_drafts=initial_drafts,
+                review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"],
+            ),
+            ReviewHooks(on_progress=log, on_checkpoint=persist_checkpoint),
+        )
+        drafts = section_result.drafts
+        section_evidence = section_result.section_evidence
 
         if not drafts:
             raise RuntimeError("所有章节均无有效内容生成，请检查大纲或模型状态。")
@@ -1056,12 +1079,13 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
         try:
             intro, conclusion = write_intro_conclusion(outline, drafts, client, model,
                                                        intro_words=intro_words,
-                                                       concl_words=concl_words, focus=focus)
+                                                       concl_words=concl_words, focus=focus,
+                                                       thesis=thesis, research_gap=research_gap)
         except Exception as e:
             log(f"引言/结论生成异常（已安全降级，保留正文）: {e}")
             intro, conclusion = "", ""
 
-        evidence_total = sum(len(e) for e in section_evidence)
+        evidence_total = section_result.evidence_count
         review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total)
         template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
         out_path = render_review_note(review, paper_meta, settings, template_path, model)
@@ -1073,12 +1097,14 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             log(f"⚠️ Word 导出失败（markdown 已正常生成）: {e}")
 
         with _jobs_lock:
-            job["status"] = "done"
+            job["status"] = "partial" if section_result.failed_sections else "done"
             job["output"] = out_path
             job["docx"] = docx_path
             job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             job["summary"] = (f"《{review.title}》：{len(review.sections)} 章节、"
                               f"引用 {review.doc_count} 篇、证据 {review.evidence_count} 条")
+            if section_result.failed_sections:
+                job["summary"] += f"；未完成章节：{', '.join(section_result.failed_sections)}"
             _persist_review_job(job)
         log(f"✅ 完成，输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else ""))
         log_run_event(mode="review", event="review_generated", title=review.title,
@@ -1104,8 +1130,8 @@ def start_review(topic: str, focus: str = "", words: int = 0,
     Args:
         topic: 综述主题（必填）
         focus: 侧重方向（可选），贯穿大纲、写作与结论
-        words: 目标总字数（可选，0=默认每章 600-1000 字）
-        sections: 主体章节数（可选，0=模型自定 3-6 个）
+        words: 目标总字数（可选，0=默认每章 1800-2600 字）
+        sections: 主体章节数（可选，0=按字数档位模型自定 3-9 个）
         outline_json: 大纲 JSON（可选，格式同 generate_outline 的输出；提供则跳过大纲生成）
         target_lang: 综述目标语言，'zh'(中文综述) 或 'en'(英文综述)
         research_gap: 一句话学术缺口/痛点（可选，如"现有研究集中于单一涂层，忽略了残膜在土壤中的微塑料降解分歧"）
@@ -1123,7 +1149,9 @@ def start_review(topic: str, focus: str = "", words: int = 0,
         "sections": sections, "outline_json": outline_json, "status": "queued",
         "log": [f"[{datetime.now().strftime('%H:%M:%S')}] {check_msg}"], "output": "", "docx": "", "error": "", "summary": "",
         "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "started_at": "", "completed_at": ""
+        "started_at": "", "completed_at": "", "heartbeat_at": "", "checkpoint_json": "",
+        "research_gap": research_gap, "thesis": thesis,
+        "mainline_logic": mainline_logic, "target_lang": target_lang,
     }
     with _jobs_lock:
         ahead = sum(j["status"] in ("queued", "running") for j in _jobs.values())
@@ -1136,6 +1164,38 @@ def start_review(topic: str, focus: str = "", words: int = 0,
             f"主题：{topic}" + (f"｜侧重：{focus}" if focus else "") +
             f"\n{check_msg}\n"
             f"\n预计 7-30 分钟完成，请稍后调用 review_status(\"{job_id}\") 查询进度。")
+
+
+@_logged_tool()
+def resume_review(job_id: str) -> str:
+    """从 interrupted/failed 任务已持久化的章节检查点继续生成。"""
+    job = _get_persistent_review_job(job_id)
+    if not job:
+        return f"未找到可恢复任务 {job_id}。"
+    if job["status"] not in ("interrupted", "failed", "partial"):
+        return f"任务 {job_id} 当前状态为 {job['status']}，无需或不能恢复。"
+    if not job.get("outline_json"):
+        return "该历史任务没有持久化大纲，无法安全续跑；请重新调用 start_review。"
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job["status"] = "queued"
+    job["error"] = ""
+    job["completed_at"] = ""
+    job["started_at"] = ""
+    job["heartbeat_at"] = now_str
+    job.setdefault("log", []).append(f"[{datetime.now().strftime('%H:%M:%S')}] 从章节检查点重新入队")
+    with _jobs_lock:
+        ahead = sum(item.get("status") in ("queued", "running") for item in _jobs.values())
+        _jobs[job_id] = job
+        _persist_review_job(job)
+    _ensure_review_worker()
+    _review_queue.put((
+        job_id, job["topic"], job.get("focus", ""), job.get("words", 0),
+        job.get("sections", 0), job["outline_json"], job.get("research_gap", ""),
+        job.get("thesis", ""), job.get("mainline_logic", ""), job.get("target_lang", "zh"),
+    ))
+    note = f"，前面还有 {ahead} 个任务" if ahead else ""
+    return f"任务 {job_id} 已从检查点重新入队{note}。"
 
 
 @_logged_tool()
@@ -1160,7 +1220,7 @@ def review_status(job_id: str = "") -> str:
     logs = job.get("log", [])
     if logs:
         lines += logs[-8:]
-    if job["status"] == "done":
+    if job["status"] in ("done", "partial"):
         lines.append(f"结果: {job.get('summary', '-')}")
         loc = get_locator()
         raw_out = job.get('output', '')
@@ -1168,8 +1228,14 @@ def review_status(job_id: str = "") -> str:
         lines.append(f"Markdown URI: {loc.sanitize_path_for_remote(raw_out)} (文件: {raw_out})")
         if raw_docx:
             lines.append(f"Word docx URI: {loc.sanitize_path_for_remote(raw_docx)} (文件: {raw_docx})")
-    elif job["status"] == "failed":
+    elif job["status"] in ("failed", "interrupted"):
         lines.append(f"错误: {job.get('error', '-')[:400]}")
+        if job.get("checkpoint_json"):
+            try:
+                checkpoint_count = len(json.loads(job["checkpoint_json"]))
+                lines.append(f"已保留 {checkpoint_count} 个章节检查点；可调用 resume_review(\"{jid}\") 续跑。")
+            except Exception:
+                lines.append("存在检查点但内容无法解析，建议重新提交任务。")
     return "\n".join(lines)
 
 
