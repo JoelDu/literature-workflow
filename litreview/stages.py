@@ -309,7 +309,8 @@ def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) ->
 
 
 def gather_evidence(section: OutlineSection, store, embedder, client, model,
-                    settings, console, paper_meta: dict, reranker=None) -> list:
+                    settings, console, paper_meta: dict, reranker=None,
+                    doc_usage_history: dict = None) -> list:
     # 1) 每个问题分别向量召回，按 chunk_id 并集去重，保留最高检索分
     recall_k = settings.RERANK_CANDIDATES if reranker else settings.REVIEW_TOP_K
     pool = {}
@@ -329,8 +330,15 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
         best = {}
         for q in section.questions:
             for idx, score in reranker.rerank(q, docs):
-                if idx not in best or score > best[idx]:
-                    best[idx] = score
+                doc_id = pooled[idx].doc_id
+                # 跨章节长尾文献探索机制：前置章节已被多次引用的文献施加适当降权，让未曝光的优质文献浮现
+                penalty = 1.0
+                if doc_usage_history and doc_id in doc_usage_history:
+                    usage_cnt = doc_usage_history[doc_id]
+                    penalty = max(0.55, 1.0 - 0.25 * usage_cnt)
+                adj_score = score * penalty
+                if idx not in best or adj_score > best[idx]:
+                    best[idx] = adj_score
         ranked = sorted(best.items(), key=lambda kv: -kv[1])[: settings.REVIEW_TOP_K]
         candidates = []
         for idx, score in ranked:
@@ -385,6 +393,39 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
                      score=r["score"], summary=r["summary"],
                      section_title=r["chunk"].section_title,
                      retrieval_score=r["chunk"].score) for r in kept]
+
+
+def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_meta: dict,
+                             exclude_doc_ids: set = None, top_n: int = 25) -> list:
+    """第二轨道：为本章节检索 20~25 篇外围/支撑性背景文献清单（排除 Track A 深度证据文献），用于宏观归纳与分类铺垫。"""
+    exclude_set = exclude_doc_ids or set()
+    scored_docs = {}
+    for q in section.questions:
+        qvec = embedder.embed_query(q)
+        for sc in store.search(qvec, top_k=60, max_per_doc=1):
+            if sc.doc_id in exclude_set:
+                continue
+            if sc.doc_id not in scored_docs or sc.score > scored_docs[sc.doc_id]:
+                scored_docs[sc.doc_id] = sc.score
+
+    sorted_doc_ids = sorted(scored_docs.keys(), key=lambda d: -scored_docs[d])[:top_n]
+    bib_items = []
+    for d_id in sorted_doc_ids:
+        m = paper_meta.get(d_id, {})
+        if not m:
+            continue
+        # 获取简短四元组或摘要
+        tldr_text = m.get("tldr") or m.get("abstract") or m.get("summary") or "缓控释肥料材料与养分释放相关研究"
+        bib_items.append({
+            "doc_id": d_id,
+            "title": _best_title(m),
+            "authors": _short_authors(m.get("authors", ""), m.get("language", "zh"), m.get("title", "")),
+            "year": m.get("year") or "年份不详",
+            "doc_type": m.get("doc_type", "paper"),
+            "cite_key": m.get("cite_key") or d_id[:8],
+            "tldr": tldr_text[:200]
+        })
+    return bib_items
 
 
 # ── Stage C：写作 ─────────────────────────────────────────────────────────────
@@ -489,7 +530,8 @@ def format_reference(n: int, doc_id: str, m: dict) -> str:
 
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
-                  words: tuple = (600, 1000), focus: str = "") -> SectionDraft:
+                  words: tuple = (1800, 2600), focus: str = "",
+                  broad_bib: list = None) -> SectionDraft:
     blocks = []
     valid_cite_marks = set()
     cite_to_doc = {}
@@ -510,18 +552,37 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
             f"（{m.get('year') or '年份不详'}）《{_best_title(m)}》[{doc_type_label}] 引用标记 [@{cite_key}]\n"
             f"     证据：{ev.summary}"
         )
+
+    broad_blocks = []
+    for j, b in enumerate(broad_bib or [], 1):
+        cite_key = b.get("cite_key") or b["doc_id"][:id_prefix_len]
+        valid_cite_marks.add(cite_key)
+        valid_cite_marks.add(b["doc_id"][:id_prefix_len])
+        valid_cite_marks.add(b["doc_id"])
+        cite_to_doc[cite_key] = b["doc_id"]
+        cite_to_doc[b["doc_id"][:id_prefix_len]] = b["doc_id"]
+        cite_to_doc[b["doc_id"]] = b["doc_id"]
+
+        doc_type_label = dt.label(b.get("doc_type", "paper"))
+        broad_blocks.append(
+            f"[B{j}] 来源：{b.get('authors', '')}（{b.get('year', '年份不详')}）《{b.get('title', '')}》[{doc_type_label}] 引用标记 [@{cite_key}]\n"
+            f"     核心论点/背景：{b.get('tldr', '')}"
+        )
+
     focus_line = f"\n8. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
     sample_1 = list(cite_to_doc.keys())[0] if cite_to_doc else "U-J25-001"
     sample_2 = list(cite_to_doc.keys())[1] if len(cite_to_doc) > 1 else sample_1
 
     prompt = prompts.WRITE_SECTION_PROMPT.format(
         review_title=review_title, heading=section.heading,
-        evidence_blocks="\n".join(blocks),
+        evidence_blocks="\n".join(blocks) if blocks else "暂无第一轨深度证据",
+        broad_bib_blocks="\n".join(broad_blocks) if broad_blocks else "暂无第二轨背景文献",
         sample_cite_1=sample_1, sample_cite_2=sample_2,
         words_min=words[0], words_max=words[1], focus_line=focus_line)
     text = _chat(client, model, prompt, json_mode=False,
                  call_type="write_section", stage="stage_C_write_section",
-                 meta={"review_title": review_title, "heading": section.heading, "evidence_count": len(evidence)}).strip()
+                 meta={"review_title": review_title, "heading": section.heading,
+                       "evidence_count": len(evidence), "broad_bib_count": len(broad_bib or [])}).strip()
 
     # 丢弃不在证据集中的引用标记（幻觉引用）
     def _filter_cite(m):

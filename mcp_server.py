@@ -985,11 +985,14 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
         else:
             section_words, intro_words, concl_words = (1800, 2600), (600, 1000), (800, 1200)
 
+        from litreview.stages import gather_broad_bibliography
         section_evidence = []
+        section_broad_bibs = []
+        doc_usage_history = {}
         for i, sec in enumerate(outline.sections, 1):
             log(f"阶段 B：收集证据 [{i}/{len(outline.sections)}] {sec.heading}")
             ev = gather_evidence(sec, store, embedder, client, settings.ANALYSIS_MODEL, settings,
-                                 console, paper_meta, reranker=reranker)
+                                 console, paper_meta, reranker=reranker, doc_usage_history=doc_usage_history)
             # Token 预算保护：单章节证据严格限长，避免大模型 API 报 context_length_exceeded
             ev_budget = []
             total_chars = 0
@@ -1000,13 +1003,19 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                 ev_budget.append(e)
                 total_chars += c_len
             section_evidence.append(ev_budget)
-            log(f"  保留 {len(ev_budget)} 条高相关证据（Token安全预算内）")
+
+            # 检索第二轨道：广泛背景与对比支撑文献池 (25 篇)
+            ev_doc_ids = {e.doc_id for e in ev_budget}
+            broad_bib = gather_broad_bibliography(sec, store, embedder, paper_meta,
+                                                 exclude_doc_ids=ev_doc_ids, top_n=25)
+            section_broad_bibs.append(broad_bib)
+            log(f"  保留 {len(ev_budget)} 条第一轨深度证据，装载 {len(broad_bib)} 篇第二轨背景文献")
 
         drafts = []
         used_figures = set()
-        for i, (sec, evs) in enumerate(zip(outline.sections, section_evidence), 1):
-            if not evs:
-                log(f"阶段 C：章节 [{i}] {sec.heading} 无证据，跳过")
+        for i, (sec, evs, b_bib) in enumerate(zip(outline.sections, section_evidence, section_broad_bibs), 1):
+            if not evs and not b_bib:
+                log(f"阶段 C：章节 [{i}] {sec.heading} 无文献支持，跳过")
                 continue
             log(f"阶段 C：撰写章节 [{i}/{len(outline.sections)}] {sec.heading}")
             
@@ -1015,7 +1024,7 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             for sec_attempt in range(3):
                 try:
                     sec_draft = write_section(sec, evs, paper_meta, outline.title, client, model,
-                                              words=section_words, focus=focus)
+                                              words=section_words, focus=focus, broad_bib=b_bib)
                     break
                 except Exception as sec_err:
                     if sec_attempt == 2:
@@ -1024,6 +1033,10 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                         time.sleep(2 * (sec_attempt + 1))
             
             if sec_draft:
+                # 记录本章实际引用的 doc_id，供后续章节探索性降权与去重分析
+                for d_id in sec_draft.cited_doc_ids:
+                    doc_usage_history[d_id] = doc_usage_history.get(d_id, 0) + 1
+
                 n_figs = select_section_figures(store, reranker, sec, sec_draft, settings,
                                                 console, used_figures)
                 if n_figs:
