@@ -3,12 +3,13 @@
 import pytest
 
 import utils
-from llm_router import LLMRouter, make_deepseek_client
+from llm_router import LLMRouter, make_openai_client
 from mineru_client import MinerUClient
 
 
 _CREDENTIAL_VARS = (
     "MINERU_API_KEY",
+    "OPENAI_API_KEY",
     "DEEPSEEK_API_KEY",
     "GEMINI_API_KEY",
     "SILICONFLOW_API_KEY",
@@ -40,13 +41,19 @@ def test_network_clients_validate_credentials_when_created(monkeypatch):
     with pytest.raises(ValueError, match="MINERU_API_KEY"):
         MinerUClient("")
 
-    with pytest.raises(ValueError, match="SILICONFLOW_API_KEY"):
-        make_deepseek_client(quiet=True)
+    monkeypatch.setattr(utils, "_settings", None)
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        make_openai_client(quiet=True)
 
 
-def test_gemini_is_optional_for_current_llm_route(monkeypatch):
+def test_legacy_generation_credentials_are_optional_for_current_route(monkeypatch):
     _clear_credentials(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-openai-key")
+    monkeypatch.setattr(utils, "_settings", None)
+    fake_client = object()
+    monkeypatch.setattr("llm_router.OpenAI", lambda **_kwargs: fake_client)
 
-    router = LLMRouter(deepseek_api_key="test-only-deepseek-key")
+    router = LLMRouter()
 
-    assert router.gemini_client is None
+    assert router.openai_client is fake_client
+    assert router.openai_model == "gpt-5.4-mini"

@@ -22,13 +22,15 @@ def make_openai_client(api_key: str | None = None, quiet: bool = False):
     from utils import get_settings
     settings = get_settings()
     key = api_key or settings.OPENAI_API_KEY
+    if not key:
+        raise ValueError("未配置 OPENAI_API_KEY，无法创建论文分析与综述生成客户端")
     model = getattr(settings, "ANALYSIS_MODEL", "gpt-5.4-mini")
     kwargs = {"api_key": key, "base_url": settings.OPENAI_API_BASE, "timeout": 180}
     # 宿主机 MCP 会清掉共享文件里的失效系统代理；项目专用 LIT 代理必须显式传给
     # OpenAI 客户端。嵌入/重排客户端独立创建，因此不会被这个代理配置牵连。
     proxy = os.getenv("LIT_HTTPS_PROXY") or os.getenv("LIT_HTTP_PROXY")
     if proxy:
-        kwargs["http_client"] = httpx.Client(proxy=proxy, timeout=180, verify=False)
+        kwargs["http_client"] = httpx.Client(proxy=proxy, timeout=180)
     client = OpenAI(**kwargs)
     if not quiet:
         print(f"[LLM Router] 使用模型 {model}。")
