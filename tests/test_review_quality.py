@@ -122,3 +122,27 @@ def test_render_refuses_blocking_review_without_writing_file(tmp_path):
         raise AssertionError("blocking review must not be exported")
 
     assert not list(tmp_path.glob("综述_*.md"))
+
+
+def test_track_b_only_quantitative_claim_is_warned_not_blocked():
+    review = ReviewDoc(
+        title="测试综述",
+        topic="测试",
+        sections=[SectionDraft(
+            heading="数据边界",
+            markdown="已有探索报道释放期达到 90 d [1]。",
+            cited_doc_ids=["background"],
+            track_b_doc_ids=["background"],
+        )],
+    )
+    context = EvidenceContext(
+        number_to_doc_id={1: "background"},
+        track_b_doc_ids=frozenset({"background"}),
+    )
+    meta = {"background": {"title": "背景综述", "doc_type": "paper"}}
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.blocking_issues == []
+    assert any(issue.code == "track_b_quantitative_claim" for issue in result.report.issues)
+    assert result.review.sections[0].track_b_doc_ids == ["background"]

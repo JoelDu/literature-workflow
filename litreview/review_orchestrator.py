@@ -95,11 +95,8 @@ def _validate_draft(draft: SectionDraft, available_doc_ids: set) -> None:
     cited = set(draft.cited_doc_ids)
     if available_doc_ids and not cited:
         issues.append("正文没有保留任何有效引用")
-    required_cites = min(18, len(available_doc_ids))
-    if required_cites >= 3 and len(cited) < required_cites:
-        issues.append(f"独立引用仅 {len(cited)} 篇，至少需要 {required_cites} 篇")
-    if len(cited) > 28:
-        issues.append(f"独立引用达到 {len(cited)} 篇，超过单章 28 篇上限")
+    if len(cited) > 18:
+        issues.append(f"独立引用达到 {len(cited)} 篇，超过单章 18 篇上限")
     if len(available_doc_ids) >= 3:
         table_lines = [line for line in draft.markdown.splitlines() if line.lstrip().startswith("|")]
         if len(table_lines) < 3:

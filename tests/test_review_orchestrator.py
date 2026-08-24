@@ -87,3 +87,32 @@ def test_track_b_failure_degrades_to_track_a(monkeypatch):
 
     assert len(result.drafts) == 1
     assert any("第二轨" in line and "降级" in line for line in logs)
+
+
+def test_section_validation_does_not_force_a_minimum_citation_quota():
+    from litreview.models import SectionDraft
+    from litreview.review_orchestrator import _validate_draft
+
+    cited = [f"doc-{index}" for index in range(6)]
+    draft = SectionDraft(
+        heading="证据有限但论点完整",
+        markdown=(
+            "正文有六篇直接证据。\n\n"
+            "| 体系 | 条件 | 结果 |\n"
+            "|---|---|---|\n"
+            "| A | 25 ℃ | 60 d |"
+        ),
+        cited_doc_ids=cited,
+    )
+
+    _validate_draft(draft, {f"doc-{index}" for index in range(20)})
+
+
+def test_write_prompt_uses_evidence_roles_and_sober_style():
+    from litreview import prompts
+
+    assert "数据、接触角、释放率" in prompts.WRITE_SECTION_PROMPT
+    assert "第二轨" in prompts.WRITE_SECTION_PROMPT
+    assert "气势磅礴" not in prompts.WRITE_SECTION_PROMPT
+    assert "卡脖子" not in prompts.WRITE_SECTION_PROMPT
+    assert "18~28" not in prompts.WRITE_SECTION_PROMPT

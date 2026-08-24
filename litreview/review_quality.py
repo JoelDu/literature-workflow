@@ -26,6 +26,11 @@ _NOISE_RE = re.compile(
 )
 _UNCERTAIN_RE = re.compile(r"推测为|或类似|未明确标注|暂无全名", re.I)
 _TITLE_AUTHOR_RE = re.compile(r"_([一-龥]{2,4})$")
+_QUANTIFIED_UNIT_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:%|％|°|℃|d\b|天\b|kJ/mol\b|MPa\b|g/mol\b|r/min\b|mg\b|kg\b|cm\b|mm\b|μm\b|nm\b)",
+    re.I,
+)
+_SENTENCE_RE = re.compile(r"[^\n。！？!?;；]+(?:[。！？!?;；]|$)")
 
 
 @dataclass(frozen=True)
@@ -303,10 +308,42 @@ def audit_and_clean_review(
             doc_id = new_number_to_doc.get(int(number))
             if doc_id and doc_id not in cited_ids:
                 cited_ids.append(doc_id)
+
+        def canonicalize_roles(doc_ids: set[str]) -> set[str]:
+            canonical = set()
+            for doc_id in doc_ids:
+                identity = _identity(doc_id, paper_meta.get(doc_id, {}))
+                canonical.add(identity_to_doc.get(identity, doc_id))
+            return canonical
+
+        track_a_ids = canonicalize_roles(
+            set(allowed_evidence.track_a_doc_ids) | set(draft.track_a_doc_ids)
+        )
+        track_b_ids = canonicalize_roles(
+            set(allowed_evidence.track_b_doc_ids) | set(draft.track_b_doc_ids)
+        ) - track_a_ids
+        for sentence_match in _SENTENCE_RE.finditer(markdown):
+            sentence = sentence_match.group(0)
+            if not _QUANTIFIED_UNIT_RE.search(sentence):
+                continue
+            sentence_docs = {
+                new_number_to_doc[int(number)]
+                for number in _NUMERIC_CITE_RE.findall(sentence)
+                if int(number) in new_number_to_doc
+            }
+            if sentence_docs and sentence_docs <= track_b_ids:
+                report.add(
+                    "track_b_quantitative_claim",
+                    "warning",
+                    "含数值与单位的句子仅由第二轨背景文献支撑，建议改用第一轨直接证据",
+                    heading,
+                )
         new_sections.append(SectionDraft(
             heading=heading,
             markdown=markdown,
             cited_doc_ids=cited_ids,
+            track_a_doc_ids=[doc_id for doc_id in cited_ids if doc_id in track_a_ids],
+            track_b_doc_ids=[doc_id for doc_id in cited_ids if doc_id in track_b_ids],
             source_evidence_count=draft.source_evidence_count,
         ))
     conclusion = rewrite(review_doc.conclusion, "结论与展望")

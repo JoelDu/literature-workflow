@@ -557,7 +557,9 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
             f"     核心论点/背景：{b.get('tldr', '')}"
         )
 
-    available_doc_count = len({ev.doc_id for ev in evidence} | {b["doc_id"] for b in (broad_bib or [])})
+    track_a_available = {ev.doc_id for ev in evidence}
+    track_b_available = {b["doc_id"] for b in (broad_bib or [])} - track_a_available
+    available_doc_count = len(track_a_available | track_b_available)
     if available_doc_count >= 3:
         table_requirement = (
             "本章有至少 3 篇可比较文献，必须在正文合适位置嵌入一张 Markdown 横向对比表。"
@@ -568,6 +570,12 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
     repair_line = f"\n9. 上次输出校验未通过：{validation_feedback}。本次必须逐项修复。" if validation_feedback else ""
     sample_1 = list(cite_to_doc.keys())[0] if cite_to_doc else "U-J25-001"
     sample_2 = list(cite_to_doc.keys())[1] if len(cite_to_doc) > 1 else sample_1
+    recommended_min = min(available_doc_count, max(5, words[0] // 250))
+    recommended_max = min(18, available_doc_count, max(8, words[1] // 150))
+    citation_guidance = (
+        f"按本章篇幅与可用证据，通常可参考 {recommended_min}-{recommended_max} 篇独立来源；"
+        "这是写作建议而非配额，应由论点覆盖与证据增量自然决定。"
+    )
 
     prompt = prompts.WRITE_SECTION_PROMPT.format(
         review_title=review_title, heading=section.heading,
@@ -575,6 +583,7 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         broad_bib_blocks="\n".join(broad_blocks) if broad_blocks else "暂无第二轨背景文献",
         sample_cite_1=sample_1, sample_cite_2=sample_2,
         words_min=words[0], words_max=words[1], table_requirement=table_requirement,
+        citation_guidance=citation_guidance,
         focus_line=focus_line, repair_line=repair_line)
     text = _chat(client, model, prompt, json_mode=False,
                  call_type="write_section", stage="stage_C_write_section",
@@ -591,7 +600,13 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         doc_id = cite_to_doc.get(m.group(1))
         if doc_id and doc_id not in cited:
             cited.append(doc_id)
-    return SectionDraft(heading=section.heading, markdown=text, cited_doc_ids=cited)
+    return SectionDraft(
+        heading=section.heading,
+        markdown=text,
+        cited_doc_ids=cited,
+        track_a_doc_ids=[doc_id for doc_id in cited if doc_id in track_a_available],
+        track_b_doc_ids=[doc_id for doc_id in cited if doc_id in track_b_available],
+    )
 
 
 def write_intro_conclusion(outline: Outline, drafts: list, client, model,
@@ -657,8 +672,14 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
             return f"[{numbering[doc_id]}]"
         return _CITE_RE.sub(repl, text)
 
-    new_sections = [SectionDraft(heading=d.heading, markdown=_renumber(d.markdown),
-                                 cited_doc_ids=d.cited_doc_ids) for d in drafts]
+    new_sections = [SectionDraft(
+        heading=d.heading,
+        markdown=_renumber(d.markdown),
+        cited_doc_ids=d.cited_doc_ids,
+        track_a_doc_ids=d.track_a_doc_ids,
+        track_b_doc_ids=d.track_b_doc_ids,
+        source_evidence_count=d.source_evidence_count,
+    ) for d in drafts]
 
     raw_review = ReviewDoc(
         title=outline.title, topic=outline.topic,
@@ -667,7 +688,15 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
         doc_count=len(ordered_docs), evidence_count=evidence_total,
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
-    context = EvidenceContext(number_to_doc_id={numbering[d]: d for d in ordered_docs})
+    context = EvidenceContext(
+        number_to_doc_id={numbering[d]: d for d in ordered_docs},
+        track_a_doc_ids=frozenset(
+            doc_id for draft in drafts for doc_id in draft.track_a_doc_ids
+        ),
+        track_b_doc_ids=frozenset(
+            doc_id for draft in drafts for doc_id in draft.track_b_doc_ids
+        ),
+    )
     return audit_and_clean_review(raw_review, context, paper_meta).review
 
 
