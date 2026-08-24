@@ -116,3 +116,17 @@ def test_write_prompt_uses_evidence_roles_and_sober_style():
     assert "气势磅礴" not in prompts.WRITE_SECTION_PROMPT
     assert "卡脖子" not in prompts.WRITE_SECTION_PROMPT
     assert "18~28" not in prompts.WRITE_SECTION_PROMPT
+    assert "| 体系/材料 | 改性手段 | 核心工艺条件 | 释放周期(d) | 关键表征数据 | 参考文献 |" in prompts.WRITE_SECTION_PROMPT
+
+
+def test_missing_planned_table_is_non_blocking():
+    from litreview.models import SectionDraft
+    from litreview.review_orchestrator import _has_markdown_table, _validate_draft
+
+    draft = SectionDraft(
+        heading="数据不足",
+        markdown="依据有限证据进行文字阐述。",
+        cited_doc_ids=["doc-1"],
+    )
+    _validate_draft(draft, {"doc-1", "doc-2", "doc-3"})
+    assert not _has_markdown_table(draft.markdown)

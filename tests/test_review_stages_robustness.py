@@ -16,6 +16,61 @@ def test_outline_validation_enforces_tier_and_question_counts():
     assert any("2-4 个" in error for error in errors)
 
 
+def test_outline_table_plan_is_lightweight_and_backward_compatible():
+    from litreview import prompts
+    from litreview.models import Outline
+
+    old_outline = Outline.from_dict({
+        "title": "旧检查点",
+        "sections": [{"heading": "机理", "questions": ["问题一", "问题二"]}],
+    })
+    planned = Outline.from_dict({
+        "title": "新大纲",
+        "sections": [{
+            "heading": "横向比较", "questions": ["问题一", "问题二"],
+            "table_suggested": True,
+        }],
+    })
+
+    assert old_outline.sections[0].table_suggested is False
+    assert planned.sections[0].table_suggested is True
+    assert "table_suggested" in prompts.OUTLINE_PROMPT
+    assert "required_metrics" not in prompts.OUTLINE_PROMPT
+
+
+def test_comparison_table_needs_outline_plan_and_three_comparable_sources():
+    from litreview.models import Evidence, OutlineSection
+    from litreview.stages import comparison_table_required
+
+    evidence = [
+        Evidence(chunk_id=index, doc_id=f"doc-{index}", score=8,
+                 summary=f"在对照条件下释放周期为 {40 + index * 10} d")
+        for index in range(1, 4)
+    ]
+
+    assert comparison_table_required(
+        OutlineSection(heading="对比", questions=[], table_suggested=True), evidence
+    )
+    assert not comparison_table_required(
+        OutlineSection(heading="机理", questions=[], table_suggested=False), evidence
+    )
+    assert not comparison_table_required(
+        OutlineSection(heading="对比", questions=[], table_suggested=True), evidence[:2]
+    )
+
+
+def test_adaptive_weights_are_contextual_and_history_penalty_is_clamped():
+    from litreview.models import OutlineSection
+    from litreview.stages import _doc_type_weight, _history_factor
+
+    standards = OutlineSection(heading="检测标准与评价规范", questions=[])
+    mechanism = OutlineSection(heading="释放机理", questions=[])
+
+    assert _doc_type_weight(standards, {"doc_type": "standard"}) == 1.10
+    assert _doc_type_weight(mechanism, {"doc_type": "patent"}) == 0.85
+    assert _history_factor("used", {"used": 99}) == 0.35
+
+
 def test_broad_track_penalizes_used_docs_and_skips_placeholder_metadata():
     from litreview.models import OutlineSection
     from litreview.stages import gather_broad_bibliography

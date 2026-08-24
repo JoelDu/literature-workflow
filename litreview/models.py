@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 class OutlineSection(BaseModel):
     heading: str
     questions: list = Field(default_factory=list)  # 2-4 个中文检索问题
+    table_suggested: bool = False
 
 
 class Outline(BaseModel):

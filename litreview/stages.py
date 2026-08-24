@@ -332,6 +332,83 @@ def load_outline_file(path: str, topic: str) -> Outline:
 
 # ── Stage B：证据收集 ─────────────────────────────────────────────────────────
 
+def _history_factor(doc_id: str, doc_usage_history: dict = None) -> float:
+    """跨章降权保留 0.35 下限，避免核心文献因早期被引用而永久归零。"""
+    usage = (doc_usage_history or {}).get(doc_id, 0)
+    return max(0.35, 1.0 - 0.20 * usage)
+
+
+def _doc_type_weight(section: OutlineSection, meta: dict) -> float:
+    """文献类型权重随章节语境变化，不把专利声明等同于实验验证。"""
+    doc_type = dt.normalize(meta.get("doc_type", "")) or dt.DEFAULT_TYPE
+    context = f"{section.heading} {' '.join(str(q) for q in section.questions)}"
+    if doc_type == "standard":
+        return 1.10 if any(word in context for word in ("标准", "规范", "定义", "检测", "评价")) else 0.90
+    if doc_type == "patent":
+        return 0.95 if any(word in context for word in ("工艺", "制备", "设备", "产业化", "放大")) else 0.85
+    return {
+        "paper": 1.00, "report": 0.90, "thesis": 0.90,
+        "conf": 0.85, "book": 0.70, "web": 0.65,
+    }.get(doc_type, 1.00)
+
+
+def _marginal_value(
+    result: dict,
+    section: OutlineSection,
+    paper_meta: dict,
+    doc_usage_history: dict = None,
+) -> float:
+    chunk = result["chunk"]
+    retrieval = max(0.0, float(getattr(chunk, "score", 0.0)))
+    evidence_strength = max(0.0, min(1.0, float(result.get("score", 0)) / 10.0))
+    return retrieval * evidence_strength * _doc_type_weight(
+        section, paper_meta.get(chunk.doc_id, {})
+    ) * _history_factor(chunk.doc_id, doc_usage_history)
+
+
+_COMPARABLE_METRICS = {
+    "release": (
+        re.compile(r"释放|控释|缓释", re.I),
+        re.compile(r"\d+(?:\.\d+)?\s*(?:d\b|天|%|％)", re.I),
+    ),
+    "contact_angle": (
+        re.compile(r"接触角|WCA", re.I),
+        re.compile(r"\d+(?:\.\d+)?\s*°", re.I),
+    ),
+    "degradation": (
+        re.compile(r"降解|失重", re.I),
+        re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|d\b|天)", re.I),
+    ),
+    "strength": (
+        re.compile(r"强度|模量", re.I),
+        re.compile(r"\d+(?:\.\d+)?\s*MPa\b", re.I),
+    ),
+}
+
+
+def _has_nearby_metric_value(text: str, terms: re.Pattern, values: re.Pattern) -> bool:
+    for term in terms.finditer(text):
+        for value in values.finditer(text):
+            gap = max(term.start(), value.start()) - min(term.end(), value.end())
+            if gap <= 24:
+                return True
+    return False
+
+
+def comparable_metric_doc_count(evidence: list) -> int:
+    """返回具备同类可比量化指标的最大独立文献数。"""
+    metric_docs = {name: set() for name in _COMPARABLE_METRICS}
+    for item in evidence:
+        for name, (terms, values) in _COMPARABLE_METRICS.items():
+            if _has_nearby_metric_value(item.summary or "", terms, values):
+                metric_docs[name].add(item.doc_id)
+    return max((len(doc_ids) for doc_ids in metric_docs.values()), default=0)
+
+
+def comparison_table_required(section: OutlineSection, evidence: list) -> bool:
+    return bool(section.table_suggested and comparable_metric_doc_count(evidence) >= 3)
+
+
 def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) -> dict:
     m = paper_meta.get(chunk.doc_id, {})
     cite_key = m.get("cite_key") or chunk.doc_id[:8]
@@ -366,8 +443,7 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
         return []
 
     def _cross_chapter_score(item, score):
-        usage_count = (doc_usage_history or {}).get(item.doc_id, 0)
-        return score * max(0.55, 1.0 - 0.25 * usage_count)
+        return score * _history_factor(item.doc_id, doc_usage_history)
 
     # 1.5) 重排序：每个问题分别 rerank，按 chunk 取各问题最高分，重排后取 top-k
     if reranker is not None:
@@ -381,23 +457,26 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
                 successful_rerank = True
             for idx, score in reranked:
                 # 跨章节长尾文献探索机制：前置章节已被多次引用的文献施加适当降权，让未曝光的优质文献浮现
-                adj_score = _cross_chapter_score(pooled[idx], score)
-                if idx not in best or adj_score > best[idx]:
-                    best[idx] = adj_score
+                if idx not in best or score > best[idx]:
+                    best[idx] = score
         if not successful_rerank:
             # 服务故障与真实低相关不能混为一谈；故障时确定性回退到原向量分。
             ranked = [
-                (index, _cross_chapter_score(item, item.score))
+                (index, item.score)
                 for index, item in sorted(
-                    enumerate(pooled), key=lambda pair: -pair[1].score
+                    enumerate(pooled),
+                    key=lambda pair: -_cross_chapter_score(pair[1], pair[1].score),
                 )[:review_top_k]
             ]
         else:
-            ranked = sorted(best.items(), key=lambda kv: -kv[1])[:review_top_k]
+            ranked = sorted(
+                best.items(),
+                key=lambda pair: -_cross_chapter_score(pooled[pair[0]], pair[1]),
+            )[:review_top_k]
         candidates = []
         for idx, score in ranked:
             sc = pooled[idx]
-            sc.score = score  # 用 rerank 分覆盖向量分（写入 Evidence.retrieval_score）
+            sc.score = score  # 用未降权 rerank 分覆盖向量分，降权在边际价值中统一施加
             candidates.append(sc)
     else:
         candidates = sorted(
@@ -421,27 +500,31 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
 
     # 3) 门槛过滤 + 排序 + 文献多样性优选保留 top-N
     valid_results = [r for r in results if r["score"] >= settings.REVIEW_MIN_SCORE and r["summary"].strip()]
-    valid_results.sort(key=lambda r: -r["score"])
-
-    # 强制多样性：单篇文献在最终证据集中最多占 2 条，确保单章覆盖 12-18 篇独立文献
-    diverse_kept = []
-    doc_counts = {}
-    for r in valid_results:
-        d_id = r["chunk"].doc_id
-        if doc_counts.get(d_id, 0) < 2:
-            diverse_kept.append(r)
-            doc_counts[d_id] = doc_counts.get(d_id, 0) + 1
-            if len(diverse_kept) >= evidence_n:
-                break
-
-    # 若多样性过滤后数量未满，再放宽从其余高分条目中补充
-    if len(diverse_kept) < evidence_n:
-        for r in valid_results:
-            if r not in diverse_kept:
-                diverse_kept.append(r)
-            if len(diverse_kept) >= evidence_n:
-                    break
-    kept = diverse_kept
+    # 边际价值综合语义相关性、证据强度与文献类型。同文献第 3 个起的
+    # chunk 只保留 0.2 增量，且边际价值明显不足时自然停止，不为填满配额引入弱证据。
+    per_doc_rank = {}
+    ranked_results = []
+    for result in sorted(
+        valid_results,
+        key=lambda item: -_marginal_value(
+            item, section, paper_meta, doc_usage_history
+        ),
+    ):
+        doc_id = result["chunk"].doc_id
+        rank = per_doc_rank.get(doc_id, 0)
+        per_doc_rank[doc_id] = rank + 1
+        chunk_decay = 1.0 if rank < 2 else 0.2
+        ranked_results.append((
+            result,
+            _marginal_value(result, section, paper_meta, doc_usage_history) * chunk_decay,
+        ))
+    ranked_results.sort(key=lambda pair: -pair[1])
+    best_value = ranked_results[0][1] if ranked_results else 0.0
+    marginal_floor = best_value * 0.20
+    kept = [
+        result for result, value in ranked_results[:evidence_n]
+        if value > 0 and value >= marginal_floor
+    ]
 
     if len(kept) < 3:
         console.print(f"[yellow]⚠️ 章节「{section.heading}」证据不足（仅 {len(kept)} 条），生成内容可能较薄。")
@@ -463,8 +546,7 @@ def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_me
         for sc in store.search(qvec, top_k=60, max_per_doc=1):
             if sc.doc_id in exclude_set:
                 continue
-            penalty = max(0.55, 1.0 - 0.25 * (doc_usage_history or {}).get(sc.doc_id, 0))
-            adjusted_score = sc.score * penalty
+            adjusted_score = sc.score * _history_factor(sc.doc_id, doc_usage_history)
             if sc.doc_id not in scored_docs or adjusted_score > scored_docs[sc.doc_id]:
                 scored_docs[sc.doc_id] = adjusted_score
 
@@ -560,12 +642,13 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
     track_a_available = {ev.doc_id for ev in evidence}
     track_b_available = {b["doc_id"] for b in (broad_bib or [])} - track_a_available
     available_doc_count = len(track_a_available | track_b_available)
-    if available_doc_count >= 3:
+    if comparison_table_required(section, evidence):
         table_requirement = (
-            "本章有至少 3 篇可比较文献，必须在正文合适位置嵌入一张 Markdown 横向对比表。"
+            "大纲已规划横向比较，且第一轨至少 3 篇文献含同类量化指标，"
+            "必须在正文合适位置嵌入一张 Markdown 横向对比表。"
         )
     else:
-        table_requirement = "可比较文献不足 3 篇，不得为了凑表格虚构数据。"
+        table_requirement = "本章未同时满足大纲规划和同类可比数据门槛，不要生成表格。"
     focus_line = f"\n8. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
     repair_line = f"\n9. 上次输出校验未通过：{validation_feedback}。本次必须逐项修复。" if validation_feedback else ""
     sample_1 = list(cite_to_doc.keys())[0] if cite_to_doc else "U-J25-001"

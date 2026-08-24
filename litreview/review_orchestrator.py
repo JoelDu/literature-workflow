@@ -97,12 +97,15 @@ def _validate_draft(draft: SectionDraft, available_doc_ids: set) -> None:
         issues.append("正文没有保留任何有效引用")
     if len(cited) > 18:
         issues.append(f"独立引用达到 {len(cited)} 篇，超过单章 18 篇上限")
-    if len(available_doc_ids) >= 3:
-        table_lines = [line for line in draft.markdown.splitlines() if line.lstrip().startswith("|")]
-        if len(table_lines) < 3:
-            issues.append("缺少横向对比 Markdown 表格")
     if issues:
         raise SectionValidationError("；".join(issues))
+
+
+def _has_markdown_table(markdown: str) -> bool:
+    table_lines = [
+        line for line in markdown.splitlines() if line.lstrip().startswith("|")
+    ]
+    return len(table_lines) >= 3
 
 
 def _is_retryable_section_error(exc: Exception) -> bool:
@@ -148,6 +151,11 @@ def generate_review_sections(
             review_top_k=config.review_top_k, evidence_n=config.evidence_n,
         )
         evidence, core_chars = _budget_core_evidence(evidence, config.source_char_budget)
+        require_comparison_table = stages.comparison_table_required(section, evidence)
+        if section.table_suggested and not require_comparison_table:
+            hooks.on_progress(
+                "  大纲建议表格，但同类可比量化证据少于 3 篇，已降级为文字阐述"
+            )
 
         broad_bib = []
         remaining_chars = max(0, config.source_char_budget - core_chars)
@@ -188,6 +196,11 @@ def generate_review_sections(
                     available = {item.doc_id for item in evidence}
                     available.update(item["doc_id"] for item in broad_bib)
                     _validate_draft(draft, available)
+                    if require_comparison_table and not _has_markdown_table(draft.markdown):
+                        hooks.on_progress(
+                            "⚠️ 横向比较已激活，但本次正文未生成 Markdown 表格；"
+                            "已记录非阻塞警告并保留文字阐述"
+                        )
                 break
             except Exception as exc:
                 draft = None
