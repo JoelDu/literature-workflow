@@ -116,6 +116,20 @@ def cmd_db_doctor(args):
                       f"{issue.message}" + (f"（{issue.count}）" if issue.count else ""))
 
 
+def cmd_db_repair_graph(args):
+    """Plan a graph repair or explicitly build a separate validated shadow."""
+    from litreview.db_repair import repair_graph_shadow
+
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    graph_path = os.getenv(
+        "CITATION_NETWORK_DB_PATH",
+        os.getenv("TEST_CITATION_DB_PATH", os.path.join(data_dir, "test_citation_network.db")),
+    )
+    report = repair_graph_shadow(settings.DB_PATH, graph_path, apply=args.apply,
+                                 shadow_path=args.shadow_out)
+    console.print_json(report.to_json())
+
+
 def _make_embedder(client):
     from litreview.embedder import Embedder
     return Embedder(client, settings.EMBEDDING_MODEL, settings.EMBEDDING_DIM,
@@ -659,6 +673,11 @@ def main():
     p = sub.add_parser("db-doctor", help="严格只读地体检生产库、引文图谱库与候选缓存库")
     p.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     p.set_defaults(func=cmd_db_doctor)
+
+    p = sub.add_parser("db-repair-graph", help="预演图谱修复；显式 --apply 时仅生成独立 Shadow DB")
+    p.add_argument("--apply", action="store_true", help="执行修复，但只写 --shadow-out 指定的新数据库")
+    p.add_argument("--shadow-out", help="全新 Shadow DB 输出路径；禁止与现有图谱库相同")
+    p.set_defaults(func=cmd_db_repair_graph)
 
     p = sub.add_parser("search", help="检索调试")
     p.add_argument("query")
