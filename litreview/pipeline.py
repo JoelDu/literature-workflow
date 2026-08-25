@@ -27,6 +27,38 @@ from litreview.snowball import init_cache_db
 from litreview.sqlite_runtime import connect_sqlite
 
 
+_TERMINAL_CANDIDATE_STATES = {
+    "PARSED", "GRAPH_INDEXED", "VECTOR_INDEXED", "VECTOR_INDEXED_TEST", "INDEXED",
+    "QUARANTINED_INCOMPLETE",
+}
+
+
+def _already_processed_candidate(conn: sqlite3.Connection, candidate_id: str,
+                                 openalex_id: str | None, doi: str | None,
+                                 in_library: int, lifecycle_status: str) -> dict | None:
+    """Return the prior observation that makes acquisition redundant."""
+    if in_library or lifecycle_status in _TERMINAL_CANDIDATE_STATES:
+        return {"candidate_id": candidate_id, "lifecycle_status": lifecycle_status}
+    clauses, params = [], []
+    if str(openalex_id or "").strip():
+        clauses.append("lower(trim(openalex_id))=lower(trim(?))")
+        params.append(openalex_id)
+    if str(doi or "").strip():
+        clauses.append("lower(trim(doi))=lower(trim(?))")
+        params.append(doi)
+    if not clauses:
+        return None
+    row = conn.execute(f"""SELECT candidate_id, lifecycle_status
+        FROM discovered_candidates
+        WHERE candidate_id != ? AND ({' OR '.join(clauses)})
+          AND (in_library=1 OR lifecycle_status IN
+               ('PARSED','GRAPH_INDEXED','VECTOR_INDEXED','VECTOR_INDEXED_TEST',
+                'INDEXED','QUARANTINED_INCOMPLETE'))
+        ORDER BY in_library DESC, discovered_at DESC LIMIT 1""",
+        [candidate_id, *params]).fetchone()
+    return {"candidate_id": row[0], "lifecycle_status": row[1]} if row else None
+
+
 def list_discovery_candidates(
     cache_db_path: str,
     query_run_id: Optional[str] = None,
@@ -41,14 +73,11 @@ def list_discovery_candidates(
     if not os.path.exists(cache_db_path):
         return {"error": f"外部发现缓存库不存在: {cache_db_path}"}
 
-    conn = sqlite3.connect(f"file:{cache_db_path}?mode=ro", uri=True)
+    conn = connect_sqlite(cache_db_path, readonly=True)
     c = conn.cursor()
-
-    # 如果未指定 query_run_id，则默认查询最近一次运行
-    if not query_run_id:
-        latest_run = c.execute("SELECT query_run_id FROM discovery_runs ORDER BY created_at DESC LIMIT 1").fetchone()
-        if latest_run:
-            query_run_id = latest_run[0]
+    has_canonical_view = c.execute("""SELECT 1 FROM sqlite_master
+        WHERE type='view' AND name='v_canonical_candidates'""").fetchone() is not None
+    source = "discovered_candidates" if query_run_id or not has_canonical_view else "v_canonical_candidates"
 
     where_clauses = []
     params = []
@@ -75,7 +104,7 @@ def list_discovery_candidates(
 
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-    count_sql = f"SELECT COUNT(*) FROM discovered_candidates {where_sql}"
+    count_sql = f"SELECT COUNT(*) FROM {source} {where_sql}"
     total_count = c.execute(count_sql, params).fetchone()[0]
 
     select_sql = f"""
@@ -84,7 +113,7 @@ def list_discovery_candidates(
                oa_url, landing_page_url, track, direction, source_seeds_json,
                co_citation_count, recommendation_reason, in_library, in_library_work_id,
                match_method, lifecycle_status, discovered_at
-        FROM discovered_candidates
+        FROM {source}
         {where_sql}
         ORDER BY co_citation_count DESC, cited_by_count DESC, publication_year DESC
         LIMIT ? OFFSET ?
@@ -152,7 +181,7 @@ def approve_candidates(
     target_status = "APPROVED" if action.upper() == "APPROVE" else "REJECTED"
     now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(cache_db_path)
+    conn = connect_sqlite(cache_db_path, foreign_keys=True)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -315,20 +344,22 @@ def acquire_fulltext(
         staging_dir = os.path.join(os.path.dirname(os.path.abspath(cache_db_path)), "staging_pdf")
     os.makedirs(staging_dir, exist_ok=True)
 
-    conn = sqlite3.connect(cache_db_path)
+    conn = connect_sqlite(cache_db_path, foreign_keys=True)
     c = conn.cursor()
 
     if candidate_ids:
         placeholders = ",".join(["?"] * len(candidate_ids))
         rows = c.execute(f"""
-            SELECT candidate_id, title, oa_url, landing_page_url, lifecycle_status, doi
+            SELECT candidate_id, title, oa_url, landing_page_url, lifecycle_status, doi,
+                   openalex_id, in_library
             FROM discovered_candidates
             WHERE candidate_id IN ({placeholders}) AND lifecycle_status IN ('APPROVED', 'FULLTEXT_ACQUIRED', 'FULLTEXT_UNAVAILABLE', 'INDEXED', 'PARSED', 'GRAPH_INDEXED', 'VECTOR_INDEXED', 'VECTOR_INDEXED_TEST')
             LIMIT ?
         """, candidate_ids + [max_fetch]).fetchall()
     else:
         rows = c.execute("""
-            SELECT candidate_id, title, oa_url, landing_page_url, lifecycle_status, doi
+            SELECT candidate_id, title, oa_url, landing_page_url, lifecycle_status, doi,
+                   openalex_id, in_library
             FROM discovered_candidates
             WHERE lifecycle_status = 'APPROVED' AND is_open_access = 1 AND oa_url IS NOT NULL
             ORDER BY co_citation_count DESC, cited_by_count DESC
@@ -342,7 +373,16 @@ def acquire_fulltext(
     }
 
     for r in rows:
-        cid, title, oa_url, landing_url, cur_status, doi = r
+        cid, title, oa_url, landing_url, cur_status, doi, openalex_id, in_library = r
+        prior = _already_processed_candidate(
+            conn, cid, openalex_id, doi, in_library, cur_status)
+        if prior is not None:
+            results.append({
+                "candidate_id": cid, "title": title, "status": "ALREADY_PROCESSED",
+                "matched_candidate_id": prior["candidate_id"],
+                "matched_status": prior["lifecycle_status"],
+            })
+            continue
         target_url = oa_url or landing_url
         now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

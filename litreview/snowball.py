@@ -108,7 +108,51 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
 CREATE INDEX IF NOT EXISTS idx_discovered_run ON discovered_candidates(query_run_id);
 CREATE INDEX IF NOT EXISTS idx_discovered_doi ON discovered_candidates(doi);
 CREATE INDEX IF NOT EXISTS idx_discovered_openalex ON discovered_candidates(openalex_id);
+CREATE INDEX IF NOT EXISTS idx_discovered_status_time
+    ON discovered_candidates(lifecycle_status, discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_discovered_openalex_status_time
+    ON discovered_candidates(openalex_id, lifecycle_status, discovered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_discovered_run_track_status
+    ON discovered_candidates(query_run_id, track, lifecycle_status);
 CREATE INDEX IF NOT EXISTS idx_decisions_cand ON candidate_decisions(candidate_id);
+
+CREATE VIEW IF NOT EXISTS v_canonical_candidates AS
+SELECT * FROM (
+    SELECT c.*,
+           CASE
+             WHEN trim(COALESCE(c.openalex_id, '')) != ''
+               THEN 'openalex:' || lower(trim(c.openalex_id))
+             WHEN trim(COALESCE(c.doi, '')) != ''
+               THEN 'doi:' || lower(trim(c.doi))
+             ELSE 'title_year:' || lower(trim(c.title)) || ':' || COALESCE(c.publication_year, '')
+           END AS canonical_key,
+           ROW_NUMBER() OVER (
+             PARTITION BY CASE
+               WHEN trim(COALESCE(c.openalex_id, '')) != ''
+                 THEN 'openalex:' || lower(trim(c.openalex_id))
+               WHEN trim(COALESCE(c.doi, '')) != ''
+                 THEN 'doi:' || lower(trim(c.doi))
+               ELSE 'title_year:' || lower(trim(c.title)) || ':' || COALESCE(c.publication_year, '')
+             END
+             ORDER BY c.in_library DESC,
+               CASE c.lifecycle_status
+                 WHEN 'QUARANTINED_INCOMPLETE' THEN 120
+                 WHEN 'VECTOR_INDEXED' THEN 110
+                 WHEN 'VECTOR_INDEXED_TEST' THEN 105
+                 WHEN 'GRAPH_INDEXED' THEN 100
+                 WHEN 'PARSED' THEN 90
+                 WHEN 'FULLTEXT_ACQUIRED' THEN 80
+                 WHEN 'APPROVED' THEN 60
+                 WHEN 'REJECTED' THEN 50
+                 WHEN 'FULLTEXT_UNAVAILABLE' THEN 40
+                 WHEN 'DISCOVERED' THEN 10
+                 ELSE 0 END DESC,
+               c.discovered_at DESC,
+               c.candidate_id DESC
+           ) AS canonical_rank
+    FROM discovered_candidates c
+) ranked
+WHERE canonical_rank = 1;
 
 CREATE TRIGGER IF NOT EXISTS trg_prevent_update_candidate_decisions
 BEFORE UPDATE ON candidate_decisions

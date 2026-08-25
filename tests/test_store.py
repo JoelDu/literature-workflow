@@ -32,6 +32,29 @@ def _unit(v):
     return v / np.linalg.norm(v)
 
 
+def test_evidence_cache_key_tracks_all_invalidation_dimensions():
+    with tempfile.TemporaryDirectory() as td:
+        store, _ = _make_store(td)
+        base = store.evidence_cache_key("content", " Query  A ", "p1", "model", "s1")[0]
+        assert base == store.evidence_cache_key("content", "query a", "p1", "model", "s1")[0]
+        assert base != store.evidence_cache_key("changed", "query a", "p1", "model", "s1")[0]
+        assert base != store.evidence_cache_key("content", "query b", "p1", "model", "s1")[0]
+        assert base != store.evidence_cache_key("content", "query a", "p2", "model", "s1")[0]
+        assert base != store.evidence_cache_key("content", "query a", "p1", "model2", "s1")[0]
+        assert base != store.evidence_cache_key("content", "query a", "p1", "model", "s2")[0]
+
+
+def test_evidence_cache_round_trip_and_empty_summary_is_not_cached():
+    with tempfile.TemporaryDirectory() as td:
+        store, _ = _make_store(td)
+        store.put_evidence_cache(1, "content", "query", "p1", "model", "s1", 8, "")
+        assert store.get_evidence_cache(1, "content", "query", "p1", "model", "s1") is None
+        store.put_evidence_cache(1, "content", "query", "p1", "model", "s1", 8, "useful")
+        assert store.get_evidence_cache(1, "content", "query", "p1", "model", "s1") == {
+            "score": 8, "summary": "useful"}
+        assert store.get_evidence_cache(1, "changed", "query", "p1", "model", "s1") is None
+
+
 def test_schema_idempotent(tmp_path=None):
     with tempfile.TemporaryDirectory() as td:
         store, _ = _make_store(td)

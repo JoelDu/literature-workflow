@@ -78,6 +78,13 @@ class VectorStore:
             summary    TEXT,
             created_at TEXT DEFAULT (datetime('now','localtime'))
         )""")
+        c.execute("PRAGMA table_info(review_evidence_cache)")
+        _cache_cols = {row[1] for row in c.fetchall()}
+        for _col, _decl in (("content_hash", "TEXT"), ("prompt_version", "TEXT"),
+                            ("model_name", "TEXT"), ("schema_version", "TEXT")):
+            if _col not in _cache_cols:
+                c.execute(f"ALTER TABLE review_evidence_cache ADD COLUMN {_col} {_decl}")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_review_evidence_chunk ON review_evidence_cache(chunk_id)")
         # ── 结构化元数据（enrich 管道产出） ──
         c.execute("""CREATE TABLE IF NOT EXISTS paper_details (
             doc_id      TEXT PRIMARY KEY,
@@ -263,28 +270,72 @@ class VectorStore:
         self._fingerprint = fingerprint
         conn = self._conn()
         c = conn.cursor()
-        c.execute("""SELECT c.chunk_id, c.doc_id, c.section_title, c.content, c.embedding
-                     FROM review_chunks c
+        where_sql = """FROM review_chunks c
                      LEFT JOIN paper_details d ON c.doc_id = d.doc_id
                      WHERE c.embedding IS NOT NULL
-                       AND COALESCE(d.quarantine_status, 'NORMAL') = 'NORMAL'""")
-        rows = c.fetchall()
-        conn.close()
-        if not rows:
+                       AND COALESCE(d.quarantine_status, 'NORMAL') = 'NORMAL'"""
+        row_count = c.execute(f"SELECT COUNT(*) {where_sql}").fetchone()[0]
+        c.execute(f"""SELECT c.chunk_id, c.doc_id, c.section_title, c.content, c.embedding
+                     {where_sql}""")
+        if not row_count:
+            conn.close()
             self._matrix = np.zeros((0, self.dim), dtype=np.float32)
             self._meta = []
             return self._matrix, self._meta
-        vecs, meta = [], []
-        for chunk_id, doc_id, section_title, content, blob in rows:
+        matrix = np.empty((row_count, self.dim), dtype=np.float32)
+        meta = []
+        valid = 0
+        for chunk_id, doc_id, section_title, content, blob in c:
             v = np.frombuffer(blob, dtype=np.float32)
             if v.shape[0] != self.dim:
                 continue  # 换过嵌入模型后的旧向量，跳过
-            vecs.append(v)
+            matrix[valid] = v
             meta.append({"chunk_id": chunk_id, "doc_id": doc_id,
                          "section_title": section_title, "content": content})
-        self._matrix = np.vstack(vecs) if vecs else np.zeros((0, self.dim), dtype=np.float32)
+            valid += 1
+        conn.close()
+        self._matrix = matrix[:valid] if valid else np.zeros((0, self.dim), dtype=np.float32)
         self._meta = meta
         return self._matrix, self._meta
+
+    @staticmethod
+    def evidence_cache_key(content: str, query: str, prompt_version: str,
+                           model_name: str, schema_version: str) -> tuple[str, str]:
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        normalized_query = " ".join(query.split()).casefold()
+        raw = "\x1f".join((content_hash, normalized_query, prompt_version,
+                            model_name, schema_version))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest(), content_hash
+
+    def get_evidence_cache(self, chunk_id: int, content: str, query: str,
+                           prompt_version: str, model_name: str,
+                           schema_version: str) -> dict | None:
+        key, _ = self.evidence_cache_key(content, query, prompt_version,
+                                         model_name, schema_version)
+        conn = self._conn()
+        row = conn.execute("""SELECT score, summary FROM review_evidence_cache
+                              WHERE cache_key=?""", (key,)).fetchone()
+        conn.close()
+        if not row or row[0] is None or not str(row[1] or "").strip():
+            return None
+        return {"score": int(row[0]), "summary": str(row[1])}
+
+    def put_evidence_cache(self, chunk_id: int, content: str, query: str,
+                           prompt_version: str, model_name: str,
+                           schema_version: str, score: int, summary: str) -> None:
+        if not str(summary or "").strip():
+            return
+        key, content_hash = self.evidence_cache_key(
+            content, query, prompt_version, model_name, schema_version)
+        conn = self._conn()
+        conn.execute("""INSERT OR REPLACE INTO review_evidence_cache
+            (cache_key, chunk_id, query, score, summary, content_hash,
+             prompt_version, model_name, schema_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (key, chunk_id, query, int(score), summary, content_hash,
+             prompt_version, model_name, schema_version))
+        conn.commit()
+        conn.close()
 
     def _doc_type_map(self) -> dict:
         """doc_id → doc_type（缺省 'paper'），供来源过滤。"""
@@ -584,7 +635,7 @@ class VectorStore:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM papers WHERE status='EXPORTED'")
         exported = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM review_index_meta WHERE embedded=1")
+        c.execute("SELECT COUNT(DISTINCT doc_id) FROM review_chunks WHERE embedding IS NOT NULL")
         indexed = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM review_chunks")
         chunks = c.fetchone()[0]

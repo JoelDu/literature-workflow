@@ -32,7 +32,9 @@ def get_dashboard_stratified_stats(
             p_c = p_conn.cursor()
             prod_baseline = p_c.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
             prod_chunks = p_c.execute("SELECT COUNT(*) FROM review_chunks").fetchone()[0]
-            prod_indexed_docs = p_c.execute("SELECT COUNT(DISTINCT doc_id) FROM review_chunks").fetchone()[0]
+            prod_indexed_docs = p_c.execute(
+                "SELECT COUNT(DISTINCT doc_id) FROM review_chunks WHERE embedding IS NOT NULL"
+            ).fetchone()[0]
             p_conn.close()
         except Exception as e:
             logger.warning(f"Failed to query prod db stats: {e}")

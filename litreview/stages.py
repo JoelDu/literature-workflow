@@ -409,7 +409,18 @@ def comparison_table_required(section: OutlineSection, evidence: list) -> bool:
     return bool(section.table_suggested and comparable_metric_doc_count(evidence) >= 3)
 
 
-def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) -> dict:
+EVIDENCE_SCHEMA_VERSION = "1"
+
+
+def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta,
+                   store=None) -> dict:
+    cache_query = f"{heading}\n{questions_text}"
+    if store is not None and hasattr(store, "get_evidence_cache"):
+        cached = store.get_evidence_cache(
+            chunk.chunk_id, chunk.content, cache_query, prompts.PROMPT_VERSION,
+            model, EVIDENCE_SCHEMA_VERSION)
+        if cached is not None:
+            return {"chunk": chunk, **cached, "cached": True}
     m = paper_meta.get(chunk.doc_id, {})
     cite_key = m.get("cite_key") or chunk.doc_id[:8]
     prompt = prompts.MAP_PROMPT.format(
@@ -421,7 +432,13 @@ def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta) ->
     data = _chat_json(client, model, prompt, call_type="map_chunk", stage="stage_B_map",
                       meta={"heading": heading, "doc_id": chunk.doc_id, "chunk_id": chunk.chunk_id})
     score = int(data.get("score", 0))
-    return {"chunk": chunk, "score": max(1, min(10, score)), "summary": str(data.get("summary", ""))}
+    result = {"chunk": chunk, "score": max(1, min(10, score)),
+              "summary": str(data.get("summary", ""))}
+    if store is not None and hasattr(store, "put_evidence_cache") and result["summary"].strip():
+        store.put_evidence_cache(
+            chunk.chunk_id, chunk.content, cache_query, prompts.PROMPT_VERSION,
+            model, EVIDENCE_SCHEMA_VERSION, result["score"], result["summary"])
+    return result
 
 
 def gather_evidence(section: OutlineSection, store, embedder, client, model,
@@ -490,7 +507,7 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
     results = []
     with ThreadPoolExecutor(max_workers=settings.REVIEW_MAP_CONCURRENCY) as pool_exec:
         futures = {pool_exec.submit(_map_one_chunk, client, model, section.heading,
-                                    questions_text, c, paper_meta): c for c in candidates}
+                                    questions_text, c, paper_meta, store): c for c in candidates}
         for fut in as_completed(futures):
             c = futures[fut]
             try:

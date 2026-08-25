@@ -12,10 +12,27 @@ from litreview.pipeline import (
     approve_candidates,
     acquire_fulltext,
     ingest_acquired_candidates,
-    realign_citation_graph
+    realign_citation_graph,
+    _already_processed_candidate,
 )
 from litreview.snowball import init_cache_db
 from litreview.graph_schema import init_graph_schema
+
+
+def test_acquisition_guard_matches_prior_openalex_observation(tmp_path):
+    cache = tmp_path / "cache.db"
+    init_cache_db(str(cache))
+    conn = sqlite3.connect(cache)
+    conn.execute("INSERT INTO discovery_runs VALUES ('r1','[]','both',1,'{}','{}','now')")
+    conn.execute("""INSERT INTO discovered_candidates
+        (candidate_id,query_run_id,openalex_id,title,track,direction,source_seeds_json,
+         co_citation_count,recommendation_reason,in_library,data_source,response_hash,
+         lifecycle_status,discovered_at)
+        VALUES ('done','r1','W1','Same','FOUNDATIONAL','backward','[]',0,'',1,
+                'openalex','','VECTOR_INDEXED','now')""")
+    result = _already_processed_candidate(conn, "new", "w1", None, 0, "APPROVED")
+    conn.close()
+    assert result == {"candidate_id": "done", "lifecycle_status": "VECTOR_INDEXED"}
 
 
 @pytest.fixture

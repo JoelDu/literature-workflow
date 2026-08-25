@@ -33,6 +33,24 @@ def test_crossref_client_parameters():
     assert "(mailto:user@test.org)" in client.user_agent
 
 
+def test_canonical_candidate_view_prefers_state_over_recency(tmp_path):
+    cache = tmp_path / "cache.db"
+    init_cache_db(str(cache))
+    conn = sqlite3.connect(cache)
+    conn.execute("INSERT INTO discovery_runs VALUES ('r1','[]','both',1,'{}','{}','2026-01-01')")
+    conn.execute("INSERT INTO discovery_runs VALUES ('r2','[]','both',1,'{}','{}','2026-08-01')")
+    sql = """INSERT INTO discovered_candidates
+        (candidate_id,query_run_id,openalex_id,title,track,direction,source_seeds_json,
+         co_citation_count,recommendation_reason,in_library,data_source,response_hash,
+         lifecycle_status,discovered_at)
+        VALUES (?,?, 'W1','Same','FOUNDATIONAL','backward','[]',0,'',0,'openalex','',?,?)"""
+    conn.execute(sql, ('old-indexed', 'r1', 'VECTOR_INDEXED', '2026-01-01'))
+    conn.execute(sql, ('new-discovered', 'r2', 'DISCOVERED', '2026-08-01'))
+    row = conn.execute("SELECT candidate_id, canonical_key FROM v_canonical_candidates").fetchone()
+    conn.close()
+    assert row == ('old-indexed', 'openalex:w1')
+
+
 def test_snowball_ledger_and_governance_fixed_fixture(tmp_path):
     """基于固定 OpenAlex 响应夹具验证账本闭环、无虚构施引关系与独立缓存库存储。"""
     # 构建本地测试馆藏库供碰撞检测

@@ -1,6 +1,21 @@
 from types import SimpleNamespace
 
 
+def test_map_chunk_uses_versioned_cache_without_calling_model(monkeypatch):
+    from litreview import stages
+
+    chunk = SimpleNamespace(chunk_id=1, doc_id="doc", content="evidence", section_title="")
+    store = SimpleNamespace(get_evidence_cache=lambda *_a: {"score": 9, "summary": "cached"})
+    monkeypatch.setattr(stages, "_chat_json", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("model must not run on a cache hit")))
+
+    result = stages._map_one_chunk(None, "model", "heading", "question", chunk,
+                                   {"doc": {}}, store)
+
+    assert result["cached"] is True
+    assert result["summary"] == "cached"
+
+
 def test_outline_validation_enforces_tier_and_question_counts():
     from litreview.models import Outline, OutlineSection
     from litreview.stages import _outline_validation_errors, get_scaling_config
@@ -130,7 +145,7 @@ def test_cross_chapter_penalty_also_works_without_reranker(monkeypatch):
     )
     monkeypatch.setattr(
         stages, "_map_one_chunk",
-        lambda _client, _model, _heading, _questions, chunk, _meta:
+        lambda _client, _model, _heading, _questions, chunk, _meta, _store:
         {"chunk": chunk, "score": 8, "summary": "有效证据"},
     )
 
