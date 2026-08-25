@@ -248,7 +248,26 @@ class VectorStore:
         conn.close()
         return rows
 
-    # ── 检索 ──────────────────────────────────────────────────────────────
+    def get_corpus_fingerprint(self) -> str | None:
+        """获取当前语料库索引状态的 64 位 SHA256 确定性指纹。
+        读取 review_index_meta 按 doc_id 排序的 doc_id/md_hash/embedded；
+        若表不存在则安全返回 None，绝不向只读数据库执行任何 DDL。
+        """
+        import hashlib
+        conn = self._conn()
+        c = conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='review_index_meta'")
+        if not c.fetchone():
+            conn.close()
+            return None
+        rows = c.execute(
+            "SELECT doc_id, COALESCE(md_hash, ''), COALESCE(embedded, 0) "
+            "FROM review_index_meta ORDER BY doc_id ASC"
+        ).fetchall()
+        conn.close()
+        payload = [{"doc_id": str(r[0]), "md_hash": str(r[1]), "embedded": int(r[2])} for r in rows]
+        canon_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+        return hashlib.sha256(canon_json.encode('utf-8')).hexdigest()
 
     def _embed_fingerprint(self) -> tuple:
         """"已嵌入内容"的轻量指纹：(已嵌入文档数, 最新一次索引时间)。
@@ -263,6 +282,11 @@ class VectorStore:
         每行 16KB BLOB 的表，每次检索都全表扫一遍代价太大。
         """
         conn = self._conn()
+        c = conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='review_index_meta'")
+        if not c.fetchone():
+            conn.close()
+            return (0, "")
         row = conn.execute(
             "SELECT COUNT(*), COALESCE(MAX(indexed_at), '') FROM review_index_meta "
             "WHERE embedded=1").fetchone()

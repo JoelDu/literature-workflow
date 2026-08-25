@@ -362,10 +362,12 @@ def audit_and_clean_review(
         ))
     conclusion = rewrite(review_doc.conclusion, "结论与展望")
 
+    sorted_ref_items = sorted(new_number_to_doc.items())
     references = [
         format_reference(number, doc_id, canonical_meta.get(doc_id, paper_meta.get(doc_id, {})))
-        for number, doc_id in sorted(new_number_to_doc.items())
+        for number, doc_id in sorted_ref_items
     ]
+    reference_doc_ids = [doc_id for _, doc_id in sorted_ref_items]
     cleaned_review = ReviewDoc(
         title=review_doc.title,
         topic=review_doc.topic,
@@ -373,6 +375,7 @@ def audit_and_clean_review(
         sections=new_sections,
         conclusion=conclusion,
         references=references,
+        reference_doc_ids=reference_doc_ids,
         doc_count=len(references),
         evidence_count=review_doc.evidence_count,
         generated_at=review_doc.generated_at,

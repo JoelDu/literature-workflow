@@ -46,6 +46,7 @@ class SectionGenerationResult:
     section_broad_bibs: list
     failed_sections: list
     doc_usage_history: dict
+    evidence_by_heading: dict = field(default_factory=dict)
 
     @property
     def evidence_count(self) -> int:
@@ -138,8 +139,11 @@ def generate_review_sections(
     failed_sections = []
     used_figures = set()
 
+    evidence_by_heading: dict = {draft.heading: None for draft in drafts}
+
     for index, section in enumerate(outline.sections, 1):
         if section.heading in completed_headings:
+            evidence_by_heading[section.heading] = None
             hooks.on_progress(f"检查点恢复：跳过已完成章节 [{index}] {section.heading}")
             continue
 
@@ -177,6 +181,7 @@ def generate_review_sections(
             f"  保留 {len(evidence)} 条第一轨证据、{len(broad_bib)} 篇第二轨文献"
         )
         if not evidence and not broad_bib:
+            evidence_by_heading[section.heading] = []
             failed_sections.append(section.heading)
             hooks.on_progress(f"阶段 C：章节 [{index}] 无文献支持，跳过")
             continue
@@ -212,9 +217,11 @@ def generate_review_sections(
                 time.sleep(2 ** (attempt + 1))
 
         if draft is None:
+            evidence_by_heading[section.heading] = []
             failed_sections.append(section.heading)
             continue
 
+        evidence_by_heading[section.heading] = list(evidence)
         draft.source_evidence_count = len(evidence)
         for doc_id in draft.cited_doc_ids:
             doc_usage_history[doc_id] = doc_usage_history.get(doc_id, 0) + 1
@@ -236,4 +243,5 @@ def generate_review_sections(
         section_broad_bibs=section_broad_bibs,
         failed_sections=failed_sections,
         doc_usage_history=doc_usage_history,
+        evidence_by_heading=evidence_by_heading,
     )

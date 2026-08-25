@@ -44,6 +44,7 @@ class ReviewDoc(BaseModel):
     sections: list = Field(default_factory=list)   # list[SectionDraft]
     conclusion: str = ""
     references: list = Field(default_factory=list) # 已格式化编号的参考文献行
+    reference_doc_ids: list[str] = Field(default_factory=list) # 与 references 严格 1:1 对应的 doc_id 列表
     doc_count: int = 0
     evidence_count: int = 0
     generated_at: str = ""

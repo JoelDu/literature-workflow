@@ -13,6 +13,7 @@
 """
 import io
 import os
+import re
 import sys
 import json
 import time
@@ -837,7 +838,9 @@ def _init_review_jobs_db(recover_interrupted: bool = False):
                     research_gap TEXT,
                     thesis TEXT,
                     mainline_logic TEXT,
-                    target_lang TEXT DEFAULT 'zh'
+                    target_lang TEXT DEFAULT 'zh',
+                    manifest_path TEXT,
+                    manifest_error TEXT
                 )
             """)
             existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(review_jobs)").fetchall()]
@@ -850,6 +853,8 @@ def _init_review_jobs_db(recover_interrupted: bool = False):
                 ("thesis", "TEXT"),
                 ("mainline_logic", "TEXT"),
                 ("target_lang", "TEXT DEFAULT 'zh'"),
+                ("manifest_path", "TEXT"),
+                ("manifest_error", "TEXT"),
             ):
                 if column not in existing_cols:
                     conn.execute(f"ALTER TABLE review_jobs ADD COLUMN {column} {ddl}")
@@ -880,8 +885,8 @@ def _persist_review_job(job_dict: dict):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""
             INSERT OR REPLACE INTO review_jobs
-            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job_dict["job_id"],
             job_dict.get("topic", ""),
@@ -904,6 +909,8 @@ def _persist_review_job(job_dict: dict):
             job_dict.get("thesis", ""),
             job_dict.get("mainline_logic", ""),
             job_dict.get("target_lang", "zh"),
+            job_dict.get("manifest", ""),
+            job_dict.get("manifest_error", ""),
         ))
         conn.commit()
     finally:
@@ -916,10 +923,11 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
     conn = _get_db_conn(readonly=True)
     try:
         c = conn.cursor()
+        select_cols = "job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error"
         if job_id:
-            c.execute("SELECT job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang FROM review_jobs WHERE job_id = ?", (job_id,))
+            c.execute(f"SELECT {select_cols} FROM review_jobs WHERE job_id = ?", (job_id,))
         else:
-            c.execute("SELECT job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang FROM review_jobs ORDER BY queued_at DESC LIMIT 1")
+            c.execute(f"SELECT {select_cols} FROM review_jobs ORDER BY queued_at DESC LIMIT 1")
         row = c.fetchone()
         if row:
             return {
@@ -944,6 +952,8 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
                 "thesis": row[18] or "",
                 "mainline_logic": row[19] or "",
                 "target_lang": row[20] or "zh",
+                "manifest": row[21] or "" if len(row) > 21 and row[21] is not None else "",
+                "manifest_error": row[22] or "" if len(row) > 22 and row[22] is not None else "",
             }
     finally:
         conn.close()
@@ -997,6 +1007,7 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             _persist_review_job(job)
 
     try:
+        t0 = time.time()
         client = _client()
         model = settings.REVIEW_MODEL
         store, embedder, reranker = _store(), _embedder(), _reranker()
@@ -1090,20 +1101,80 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
         except Exception as e:
             log(f"⚠️ Word 导出失败（markdown 已正常生成）: {e}")
 
+        manifest_path = ""
+        manifest_err = None
+        try:
+            from litreview.manifest import (
+                write_review_manifest, ManifestInput, RunContext, PromptSnapshot, RetrievalSnapshot
+            )
+            from litreview import prompts
+            run_ctx = RunContext(
+                topic=topic,
+                run_id=job_id,
+                trigger_source="mcp",
+                model_name=model,
+                analysis_model=settings.ANALYSIS_MODEL,
+                reranker_model=settings.RERANK_MODEL,
+                target_words=words,
+                target_lang=target_lang,
+                focus=focus,
+                thesis=thesis,
+                research_gap=research_gap,
+                mainline_logic=mainline_logic,
+                prompts=PromptSnapshot(
+                    outline_prompt_version=prompts.PROMPT_VERSION,
+                    section_prompt_version=prompts.PROMPT_VERSION,
+                    tldr_prompt_version=prompts.PROMPT_VERSION,
+                ),
+                retrieval=RetrievalSnapshot(
+                    review_top_k=scaling.get("rerank_top_k", 0),
+                    evidence_n=scaling.get("evidence_n", 0),
+                    target_words=words,
+                    section_words_min=section_words[0],
+                    section_words_max=section_words[1],
+                    reranker_model=settings.RERANK_MODEL,
+                ),
+                duration_seconds=int(time.time() - t0),
+                corpus_fingerprint=store.get_corpus_fingerprint(),
+            )
+            manifest_path = write_review_manifest(ManifestInput(
+                output_md_path=out_path,
+                review=review,
+                outline=outline,
+                evidence_by_heading=section_result.evidence_by_heading,
+                paper_meta=paper_meta,
+                run_context=run_ctx,
+                docx_path=docx_path or None,
+            ))
+            log(f"✔ Manifest 运行清单生成完毕: {os.path.basename(manifest_path)}")
+        except Exception as exc:
+            manifest_err = str(exc)
+            log(f"⚠️ Manifest 运行清单生成失败（Markdown 已正常生成）: {exc}")
+
         with _jobs_lock:
-            job["status"] = "partial" if section_result.failed_sections else "done"
+            job["status"] = "partial" if (section_result.failed_sections or manifest_err) else "done"
             job["output"] = out_path
             job["docx"] = docx_path
+            job["manifest"] = manifest_path or ""
+            job["manifest_error"] = manifest_err or ""
             job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             job["summary"] = (f"《{review.title}》：{len(review.sections)} 章节、"
                               f"引用 {review.doc_count} 篇、证据 {review.evidence_count} 条")
             if section_result.failed_sections:
                 job["summary"] += f"；未完成章节：{', '.join(section_result.failed_sections)}"
+            if manifest_err:
+                job["summary"] += "；运行清单生成失败"
             _persist_review_job(job)
-        log(f"✅ 完成，输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else ""))
+        if section_result.failed_sections or manifest_err:
+            log(f"⚠️ 部分完成（存在未完成章节或清单异常）：输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else "") + (f"，清单警告: {manifest_err}" if manifest_err else ""))
+        else:
+            log(f"✅ 完成，输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else "") + (f"，清单: {manifest_path}" if manifest_path else ""))
+        status_tag = "partial" if (section_result.failed_sections or manifest_err) else "success"
         log_run_event(mode="review", event="review_generated", title=review.title,
-                      status="success", extra={"topic": topic, "via": "mcp",
-                                               "output": out_path, "docx": docx_path})
+                      status=status_tag, extra={"topic": topic, "via": "mcp",
+                                               "output": out_path, "docx": docx_path,
+                                               "manifest": manifest_path,
+                                               "manifest_error": manifest_err})
     except Exception as e:
         with _jobs_lock:
             job["status"] = "failed"
@@ -1141,7 +1212,8 @@ def start_review(topic: str, focus: str = "", words: int = 0,
     job_dict = {
         "job_id": job_id, "topic": topic, "focus": focus, "words": words,
         "sections": sections, "outline_json": outline_json, "status": "queued",
-        "log": [f"[{datetime.now().strftime('%H:%M:%S')}] {check_msg}"], "output": "", "docx": "", "error": "", "summary": "",
+        "log": [f"[{datetime.now().strftime('%H:%M:%S')}] {check_msg}"], "output": "", "docx": "",
+        "manifest": "", "manifest_error": "", "error": "", "summary": "",
         "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "started_at": "", "completed_at": "", "heartbeat_at": "", "checkpoint_json": "",
         "research_gap": research_gap, "thesis": thesis,
@@ -1174,6 +1246,8 @@ def resume_review(job_id: str) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     job["status"] = "queued"
     job["error"] = ""
+    job["manifest"] = ""
+    job["manifest_error"] = ""
     job["completed_at"] = ""
     job["started_at"] = ""
     job["heartbeat_at"] = now_str
@@ -1211,17 +1285,31 @@ def review_status(job_id: str = "") -> str:
     when = job.get("started_at") or job.get("queued_at", "")
     label = "启动于" if job.get("started_at") else "入队于"
     lines = [f"任务 {jid}（{job.get('topic', '-')}）状态: {job['status']}，{label} {when}"]
+    loc = get_locator()
     logs = job.get("log", [])
     if logs:
-        lines += logs[-8:]
+        sanitized_logs = [
+            re.sub(r'/(?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+', lambda m: loc.sanitize_path_for_remote(m.group(0)), l)
+            for l in logs[-8:]
+        ]
+        lines += sanitized_logs
     if job["status"] in ("done", "partial"):
         lines.append(f"结果: {job.get('summary', '-')}")
-        loc = get_locator()
         raw_out = job.get('output', '')
         raw_docx = job.get('docx', '')
+        raw_manifest = job.get('manifest', '')
         lines.append(f"Markdown URI: {loc.sanitize_path_for_remote(raw_out)} (文件: {raw_out})")
         if raw_docx:
             lines.append(f"Word docx URI: {loc.sanitize_path_for_remote(raw_docx)} (文件: {raw_docx})")
+        if raw_manifest:
+            lines.append(f"Manifest URI: {loc.sanitize_path_for_remote(raw_manifest)}")
+        if job.get("manifest_error"):
+            err_msg = str(job["manifest_error"])
+            for p in (raw_out, raw_docx, raw_manifest):
+                if p and p in err_msg:
+                    err_msg = err_msg.replace(p, loc.sanitize_path_for_remote(p))
+            err_msg = re.sub(r'/(?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+', lambda m: loc.sanitize_path_for_remote(m.group(0)), err_msg)
+            lines.append(f"Manifest 警告: {err_msg}")
     elif job["status"] in ("failed", "interrupted"):
         lines.append(f"错误: {job.get('error', '-')[:400]}")
         if job.get("checkpoint_json"):

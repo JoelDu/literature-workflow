@@ -653,21 +653,81 @@ def cmd_generate(args):
     except Exception as e:
         console.print(f"[yellow]⚠️ Word 导出失败（markdown 已正常生成）: {e}")
 
+    manifest_path = ""
+    manifest_error = None
+    try:
+        from litreview.manifest import (
+            write_review_manifest, ManifestInput, RunContext, PromptSnapshot, RetrievalSnapshot
+        )
+        from litreview import prompts
+        import uuid
+        run_ctx = RunContext(
+            topic=args.topic,
+            run_id=str(uuid.uuid4()),
+            trigger_source="cli",
+            model_name=model,
+            analysis_model=settings.ANALYSIS_MODEL,
+            reranker_model=settings.RERANK_MODEL,
+            target_words=args.words or 0,
+            target_lang=args.lang or "zh",
+            focus=focus,
+            thesis=getattr(args, 'thesis', '') or '',
+            research_gap=getattr(args, 'gap', '') or '',
+            mainline_logic=getattr(args, 'logic', '') or '',
+            prompts=PromptSnapshot(
+                outline_prompt_version=prompts.PROMPT_VERSION,
+                section_prompt_version=prompts.PROMPT_VERSION,
+                tldr_prompt_version=prompts.PROMPT_VERSION,
+            ),
+            retrieval=RetrievalSnapshot(
+                review_top_k=scaling.get("rerank_top_k", 0),
+                evidence_n=scaling.get("evidence_n", 0),
+                target_words=args.words or 0,
+                section_words_min=section_words[0],
+                section_words_max=section_words[1],
+                reranker_model=settings.RERANK_MODEL,
+            ),
+            duration_seconds=int(time.time() - t0),
+            corpus_fingerprint=store.get_corpus_fingerprint(),
+        )
+        manifest_path = write_review_manifest(ManifestInput(
+            output_md_path=out_path,
+            review=review,
+            outline=outline,
+            evidence_by_heading=section_result.evidence_by_heading,
+            paper_meta=paper_meta,
+            run_context=run_ctx,
+            docx_path=docx_path or None,
+        ))
+    except Exception as exc:
+        manifest_error = str(exc)
+        console.print(f"[yellow]⚠️ Manifest 清单生成失败（Markdown 已正常保存）: {exc}")
+
     elapsed = int(time.time() - t0)
-    console.rule("[bold green]✅ 综述生成完成")
+    if failed_sections or manifest_error:
+        console.rule("[bold yellow]⚠️ 综述部分完成（存在未完成章节或清单异常）")
+    else:
+        console.rule("[bold green]✅ 综述生成完成")
     if failed_sections:
         console.print(f"[yellow]⚠️ 以下章节因接口故障未生成，可稍后重跑: {', '.join(failed_sections)}")
+    if manifest_error:
+        console.print(f"[yellow]⚠️ 清单警告: {manifest_error}")
     console.print(f"标题: [bold]{review.title}[/bold]")
     console.print(f"章节: {len(review.sections)} 个 | 引用文献: {review.doc_count} 篇 | "
                   f"证据: {review.evidence_count} 条 | 耗时: {elapsed}s")
     console.print(f"输出: [bold cyan]{out_path}[/bold cyan]")
     if docx_path:
         console.print(f"Word: [bold cyan]{docx_path}[/bold cyan]")
+    if manifest_path:
+        console.print(f"清单: [bold cyan]{manifest_path}[/bold cyan]")
+
+    status_tag = "partial" if (failed_sections or manifest_error) else "success"
     log_run_event(mode="review", event="review_generated", title=review.title,
-                  status="success",
+                  status=status_tag,
                   extra={"topic": args.topic, "sections": len(review.sections),
                          "cited_docs": review.doc_count, "elapsed_s": elapsed,
-                         "output": out_path, "docx": docx_path})
+                         "output": out_path, "docx": docx_path, "manifest": manifest_path,
+                         "manifest_error": manifest_error})
 
 
 def main():

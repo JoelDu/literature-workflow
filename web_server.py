@@ -897,24 +897,84 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
         except Exception as e:
             log(f"⚠️ Word 转换失败 (可能是 pandoc 尚未安装，Markdown 文件已正常保存): {e}")
 
+        manifest_path = ""
+        manifest_err = None
+        try:
+            from litreview.manifest import (
+                write_review_manifest, ManifestInput, RunContext, PromptSnapshot, RetrievalSnapshot
+            )
+            from litreview import prompts
+            evidence_by_heading = {sec.heading: evs for sec, evs in zip(outline.sections, section_evidence)}
+            run_ctx = RunContext(
+                topic=topic,
+                run_id=job_id,
+                trigger_source="web",
+                model_name=model,
+                analysis_model=analysis_model,
+                reranker_model=settings.RERANK_MODEL,
+                target_words=words,
+                target_lang="zh",
+                focus=focus,
+                thesis="",
+                research_gap="",
+                mainline_logic="",
+                prompts=PromptSnapshot(
+                    outline_prompt_version=prompts.PROMPT_VERSION,
+                    section_prompt_version=prompts.PROMPT_VERSION,
+                    tldr_prompt_version=prompts.PROMPT_VERSION,
+                ),
+                retrieval=RetrievalSnapshot(
+                    review_top_k=getattr(settings, "REVIEW_TOP_K", 0),
+                    evidence_n=getattr(settings, "REVIEW_EVIDENCE_N", 0),
+                    target_words=words,
+                    section_words_min=section_words[0],
+                    section_words_max=section_words[1],
+                    reranker_model=settings.RERANK_MODEL,
+                ),
+                duration_seconds=int(time.time() - t0),
+                corpus_fingerprint=store.get_corpus_fingerprint(),
+            )
+            manifest_path = write_review_manifest(ManifestInput(
+                output_md_path=out_path,
+                review=review,
+                outline=outline,
+                evidence_by_heading=evidence_by_heading,
+                paper_meta=paper_meta,
+                run_context=run_ctx,
+                docx_path=docx_path or None,
+            ))
+            log(f"✔ Manifest 运行清单生成完毕: {os.path.basename(manifest_path)}")
+        except Exception as exc:
+            manifest_err = str(exc)
+            log(f"⚠️ Manifest 运行清单生成失败 (Markdown 文件已正常保存): {exc}")
+
         elapsed = int(time.time() - t0)
         with _jobs_lock:
-            job["status"] = "done"
-            job["current_stage"] = "COMPLETED"
+            job["status"] = "partial" if manifest_err else "done"
+            job["current_stage"] = "PARTIAL_COMPLETED" if manifest_err else "COMPLETED"
             job["progress"] = 100
             job["output_md"] = out_path
             job["output_docx"] = docx_path
+            job["output_manifest"] = manifest_path
             job["filename_md"] = os.path.basename(out_path) if out_path else ""
             job["filename_docx"] = os.path.basename(docx_path) if docx_path else ""
+            job["filename_manifest"] = os.path.basename(manifest_path) if manifest_path else ""
+            if manifest_err:
+                job["manifest_error"] = manifest_err
             job["doc_count"] = review.doc_count
             job["evidence_count"] = review.evidence_count
             job["elapsed_seconds"] = elapsed
             
-        log(f"🎉 综述生成完毕！使用模型 {model}，引用文献 {review.doc_count} 篇，引用证据 {review.evidence_count} 条，总耗时 {elapsed} 秒。")
-        log_run_event(mode="review", event="review_generated", title=review.title, status="success",
+        if manifest_err:
+            log(f"⚠️ 综述正文与 Word 已生成，但运行清单生成失败: {manifest_err}")
+        else:
+            log(f"🎉 综述生成完毕！使用模型 {model}，引用文献 {review.doc_count} 篇，引用证据 {review.evidence_count} 条，总耗时 {elapsed} 秒。")
+        status_tag = "partial" if manifest_err else "success"
+        log_run_event(mode="review", event="review_generated", title=review.title, status=status_tag,
                       extra={"topic": topic, "sections": len(review.sections),
                              "cited_docs": review.doc_count, "elapsed_s": elapsed,
-                             "output": out_path, "docx": docx_path, "model": model})
+                             "output": out_path, "docx": docx_path, "manifest": manifest_path,
+                             "manifest_error": manifest_err, "model": model})
     except Exception as e:
         logger.error(f"综述生成失败: {e}\n{traceback.format_exc()}")
         with _jobs_lock:
