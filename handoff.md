@@ -484,3 +484,25 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
     * **全量回归与测试覆盖**：
       - 新增 `tests/test_manifest.py` (13 项) 与 `tests/test_run_validation.py` (31 项)；
       - 全量自动化测试 307 项通过 (307 passed, 1 warning, 100% 全绿通过)。
+
+49. **综述可复现性 Phase 1C-A：可信基线注册表与 CLI 闭环 (2026-08-25)**：
+    * **Baseline Registry 深模块 (`litreview/run_baseline.py`)**：
+      - 公开三组极简强类型接口：`promote_review_baseline(manifest, registry, output_root, allow_warn)`、`check_review_candidate(candidate_manifest, registry, output_root)`、`list_review_baselines(registry, output_root)`；
+      - 核心函数显式接收 `registry_path` 与 `output_root`，业务模块零耦合 `settings`，易于隔离测试与多环境部署；
+      - **统一主题规范化 (`canonicalize_topic`) 与指纹 Key**：在 `run_validation.py` 抽取无环私有 seam，统一由 `compute_topic_key` 与 `compare_review_runs` 复用（Unicode NFKC + 首尾去空 + 内部连续空白折叠 + casefold 小写化后 SHA256），彻底消除等价主题比对漂移；空主题严禁提升；
+      - **注册表严格结构与语义完整性校验 (`_validate_registry_structure`)**：
+        * 只记录 `topic_key`、`topic`、规范相对 `manifest_locator`、清单完整 `manifest_sha256`、`run_id`、时间戳与校验状态；零物理绝对路径、零全文与密钥；
+        * 严格要求 `map_key == entry.topic_key == compute_topic_key(entry.topic)`，且 `manifest_locator` 为规范 POSIX 相对路径并通过 `output_root` containment 检验；
+        * `list`、`promote`、`check` 三大入口统一复用语义校验，发现任何条目损坏即整体判 FAIL，不写回、不静默保留；
+      - **提升规则 (Promote)**：优先校验 realpath containment 防御目录穿越与 symlink 逃逸；必须前置通过 `validate_review_run` 校验；FAIL 坚决拒绝且不碰旧注册表；WARN 默认拒绝（仅 `--allow-warn` 允许）；同一主题原子替换；原子写入（同目录 `.tmp` + `fsync` + `os.replace`）；
+      - **候选巡检规则 (Check)**：优先校验候选 realpath containment，外部或 symlink 逃逸候选立即早退 FAIL (`DANGEROUS_PATH`)；候选校验 FAIL 直接早退；无注册表/无基线返回 WARN (`NO_BASELINE`)；基线丢失/哈希篡改/逃逸返回 FAIL；正常解析后调用 `compare_review_runs` 输出确定性比对；
+      - **基线列表 (List)**：按主题与 key 确定性排序输出；
+    * **CLI 适配与机器输出 (`review.py`)**：
+      - 新增 `review.py baseline-promote MANIFEST [--allow-warn] [--json]`、`review.py baseline-check MANIFEST [--json]`、`review.py baseline-list [--json]`；
+      - 配置绑定真实 `REVIEW_OUTPUT_DIR` 与 `REVIEW_BASELINE_REGISTRY_PATH`（默认 `obsidian_vault/reviews/baselines.registry.json`）；
+      - `--json` 输出纯净 JSON，退出码严格对齐 `0=PASS, 1=WARN, 2=FAIL`；
+    * **测试与阶段说明**：
+      - 新增 `tests/test_run_baseline.py` (22 项隔离测试，100% 通过)；
+      - 关联核心模块 (8 套件) 107 项通过 (1 warning)；
+      - 全仓库全量自动化测试 329 passed, 1 warning (100% 全绿)；
+      - 本阶段为 Phase 1C-A（深模块与 CLI 闭环），暂未自动接入 Web/MCP。

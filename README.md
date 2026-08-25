@@ -184,11 +184,15 @@ python review.py generate "主题" [--outline outline.json] [--dry-run] \
     [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数] [--lang zh|en]
 python review.py validate-run 综述_xxx.manifest.json [--json] # 【运行校验】只读验证清单契约、Markdown/DOCX哈希及质量门
 python review.py compare-runs 基线.manifest.json 候选.manifest.json [--json] # 【基线对比】比对两次运行，客观评估质量退化与配置演进
+python review.py baseline-promote 综述_xxx.manifest.json [--allow-warn] [--json] # 【基线提升】将运行清单注册/原子替换为该主题的官方认可基线 (Phase 1C-A)
+python review.py baseline-check 综述_xxx.manifest.json [--json] # 【基线检查】自动比对候选清单与注册表中已有的主题认可基线 (Phase 1C-A)
+python review.py baseline-list [--json] # 【基线列表】查看注册表中所有已登记主题的认可基线摘要 (Phase 1C-A)
 ```
 
 生成参数与运行审计说明：
 - `validate-run`：严格只读校验单次综述 `.manifest.json` 侧车清单的完整性、产物哈希真实性与质量门状态（退出码 0=PASS, 1=WARN, 2=FAIL）；
 - `compare-runs`：对比两次综述运行清单（同主题），客观判定质量门退化与证据溯源降级，并输出引用集合 Jaccard 相似度与演进 Delta；
+- `baseline-promote` / `baseline-check` / `baseline-list`（Phase 1C-A）：可信基线注册表深模块与 CLI 闭环，支持主题指纹标准化（NFKC+casefold+SHA256）、基线原子替换、候选自动基线巡检与防路径逃逸。当前为深模块与 CLI 闭环，暂未自动接入 Web/MCP；
 - `propose`：大纲前置人机对齐，基于本地馆藏扫描 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 6 种主线分类逻辑）；
 - `--thesis`：一句话核心学术论点（作者要论证的核心判断，绝非进展流水账）；
 - `--gap`：一句话学术缺口/痛点（直击现有研究未做透、存在争议的关键矛盾）；

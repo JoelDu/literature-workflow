@@ -78,6 +78,7 @@ class Settings(BaseModel):
     REVIEW_EVIDENCE_N: int = 32            # 每章最终保留的高分多样化证据数（覆盖 12-18 篇独立文献）
     REVIEW_MAP_CONCURRENCY: int = 8
     REVIEW_OUTPUT_DIR: str = "./obsidian_vault/reviews"
+    REVIEW_BASELINE_REGISTRY_PATH: str = "./obsidian_vault/reviews/baselines.registry.json"
     REVIEW_AUTO_INDEX: bool = True           # 导出后自动增量更新向量索引
     BOOK_SPLIT_PAGES: int = 180              # 教材入库时每份 PDF 最大页数（≤ MinerU 单任务上限）
     BOOK_INPUT_DIR: str = "./input_books"    # add-book 不传路径时默认扫描此目录（与 INPUT_PDF_DIR 平行）
@@ -151,6 +152,10 @@ def get_settings() -> Settings:
                 "NIGHTLY_INDEX_DEADLINE": os.getenv("NIGHTLY_INDEX_DEADLINE", "08:00"),
                 "REVIEW_MAP_CONCURRENCY": int(os.getenv("REVIEW_MAP_CONCURRENCY", "8")),
                 "REVIEW_OUTPUT_DIR": os.getenv("REVIEW_OUTPUT_DIR", "./obsidian_vault/reviews"),
+                "REVIEW_BASELINE_REGISTRY_PATH": os.getenv(
+                    "REVIEW_BASELINE_REGISTRY_PATH",
+                    os.path.join(os.getenv("REVIEW_OUTPUT_DIR", "./obsidian_vault/reviews"), "baselines.registry.json"),
+                ),
                 "REVIEW_AUTO_INDEX": os.getenv("REVIEW_AUTO_INDEX", "true").lower() == "true",
                 "BOOK_SPLIT_PAGES": int(os.getenv("BOOK_SPLIT_PAGES", "180")),
                 "BOOK_INPUT_DIR": os.getenv("BOOK_INPUT_DIR", "./input_books"),

@@ -11,7 +11,16 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from typing import Any, Mapping, Sequence
+
+
+def canonicalize_topic(topic: str) -> str:
+    """计算主题的标准规范化形式 (Unicode NFKC + 首尾去空 + 内部连续空白折叠 + casefold 小写化)。"""
+    if not isinstance(topic, str):
+        return ""
+    norm = unicodedata.normalize("NFKC", topic)
+    return " ".join(norm.strip().casefold().split())
 
 
 HEX64_REGEX = re.compile(r"^[a-f0-9]{64}$")
@@ -858,13 +867,15 @@ def compare_review_runs(base_manifest_path: str, candidate_manifest_path: str) -
             issues=issues,
         )
 
-    # 2. 检查主题一致性
-    same_topic = (base_val.topic == cand_val.topic and bool(base_val.topic))
+    # 2. 检查主题一致性 (基于 NFKC + 去空 + 空白折叠 + casefold 标准化语义)
+    base_canon_topic = canonicalize_topic(base_val.topic)
+    cand_canon_topic = canonicalize_topic(cand_val.topic)
+    same_topic = (base_canon_topic == cand_canon_topic and bool(base_canon_topic))
     if not same_topic:
         issues.append(ValidationIssue(
             code="TOPIC_MISMATCH",
             severity="FAIL",
-            message=f"比对主题不一致：基线《{base_val.topic}》 vs 候选《{cand_val.topic}》",
+            message=f"比对主题不一致：基线《{_sanitize_path_in_str(base_val.topic)}》 vs 候选《{_sanitize_path_in_str(cand_val.topic)}》",
             location="topic_intent.topic",
         ))
 

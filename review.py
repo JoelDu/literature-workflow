@@ -220,6 +220,113 @@ def cmd_compare_runs(args):
     sys.exit(exit_codes.get(report.verdict, 2))
 
 
+def cmd_baseline_promote(args):
+    """将指定运行清单提升为该主题的官方认可基线。"""
+    from litreview.run_baseline import promote_review_baseline
+    report = promote_review_baseline(
+        manifest_path=args.manifest,
+        registry_path=settings.REVIEW_BASELINE_REGISTRY_PATH,
+        output_root=settings.REVIEW_OUTPUT_DIR,
+        allow_warn=getattr(args, "allow_warn", False),
+    )
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
+    else:
+        colour_map = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+        verdict_colour = colour_map.get(report.verdict, "white")
+        console.print(f"\n[bold {verdict_colour}]🏆 综述基线提升报告: {report.verdict}[/bold {verdict_colour}]")
+        if report.topic:
+            console.print(f"主题名称: {report.topic}")
+        if report.topic_key:
+            console.print(f"主题 Key: [cyan]{report.topic_key[:16]}...[/cyan]")
+        if report.manifest_locator:
+            console.print(f"清单位置 (相对): [cyan]{report.manifest_locator}[/cyan]")
+        if report.run_id:
+            console.print(f"运行 ID: {report.run_id}")
+        if report.manifest_sha256:
+            console.print(f"清单哈希: {report.manifest_sha256[:16]}...")
+
+        if report.issues:
+            console.print(f"\n[bold]问题与告警项 ({len(report.issues)} 项):[/bold]")
+            for iss in report.issues:
+                c = "red" if iss.severity == "FAIL" else "yellow"
+                console.print(f"  [{c}][{iss.severity}] {iss.code}: {iss.message} (位置: {iss.location})[/{c}]")
+        console.print()
+
+    exit_codes = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    sys.exit(exit_codes.get(report.verdict, 2))
+
+
+def cmd_baseline_check(args):
+    """自动比对候选综述清单与已注册认可基线。"""
+    from litreview.run_baseline import check_review_candidate
+    report = check_review_candidate(
+        candidate_manifest_path=args.manifest,
+        registry_path=settings.REVIEW_BASELINE_REGISTRY_PATH,
+        output_root=settings.REVIEW_OUTPUT_DIR,
+    )
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
+    else:
+        colour_map = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+        verdict_colour = colour_map.get(report.verdict, "white")
+        console.print(f"\n[bold {verdict_colour}]🛡️ 综述基线检查报告: {report.verdict} (状态: {report.status})[/bold {verdict_colour}]")
+        if report.topic:
+            console.print(f"主题名称: {report.topic}")
+        console.print(f"候选清单位置: [cyan]{report.candidate_manifest_locator}[/cyan]")
+        if report.baseline_manifest_locator:
+            console.print(f"基线清单位置: [cyan]{report.baseline_manifest_locator}[/cyan]")
+
+        if report.comparison_report and report.comparison_report.deltas:
+            console.print(f"\n[bold]演进与差异项 ({len(report.comparison_report.deltas)} 项):[/bold]")
+            for d in report.comparison_report.deltas:
+                c = "red" if d.is_regression else "cyan"
+                console.print(f"  [{c}][{d.category}] {d.message}[/{c}]")
+
+        if report.issues:
+            console.print(f"\n[bold]问题与告警项 ({len(report.issues)} 项):[/bold]")
+            for iss in report.issues:
+                c = "red" if iss.severity == "FAIL" else "yellow"
+                console.print(f"  [{c}][{iss.severity}] {iss.code}: {iss.message} (位置: {iss.location})[/{c}]")
+        console.print()
+
+    exit_codes = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    sys.exit(exit_codes.get(report.verdict, 2))
+
+
+def cmd_baseline_list(args):
+    """列出基线注册表中所有已注册主题。"""
+    from litreview.run_baseline import list_review_baselines
+    report = list_review_baselines(
+        registry_path=settings.REVIEW_BASELINE_REGISTRY_PATH,
+        output_root=settings.REVIEW_OUTPUT_DIR,
+    )
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
+    else:
+        if report.verdict == "FAIL":
+            console.print(f"\n[bold red]❌ 读取基线注册表失败: {report.registry_filename}[/bold red]")
+            for iss in report.issues:
+                console.print(f"  [red][{iss.severity}] {iss.code}: {iss.message}[/red]")
+        else:
+            table = Table(title=f"📋 已注册综述认可基线 ({report.total_baselines} 项)", show_lines=True)
+            table.add_column("主题名称", style="cyan")
+            table.add_column("运行 ID")
+            table.add_column("相对 Locator")
+            table.add_column("校验状态")
+            table.add_column("提升时间", style="dim")
+            for b in report.baselines:
+                table.add_row(b.topic, b.run_id, b.manifest_locator, b.validation_verdict, b.promoted_at[:19])
+            console.print(table)
+        console.print()
+
+    exit_codes = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    sys.exit(exit_codes.get(report.verdict, 2))
+
+
 def _make_embedder(client):
     from litreview.embedder import Embedder
     return Embedder(client, settings.EMBEDDING_MODEL, settings.EMBEDDING_DIM,
@@ -950,6 +1057,21 @@ def main():
     p.add_argument("candidate", help="候选 .manifest.json 文件路径")
     p.add_argument("--json", action="store_true", help="输出机器可读纯 JSON")
     p.set_defaults(func=cmd_compare_runs)
+
+    p = sub.add_parser("baseline-promote", help="将指定综述运行清单提升为该主题的官方认可基线")
+    p.add_argument("manifest", help="待提升为基线的 .manifest.json 清单文件路径")
+    p.add_argument("--allow-warn", action="store_true", help="允许包含非阻塞告警项 (WARN) 的清单提升为基线")
+    p.add_argument("--json", action="store_true", help="输出机器可读纯 JSON")
+    p.set_defaults(func=cmd_baseline_promote)
+
+    p = sub.add_parser("baseline-check", help="自动比对候选综述清单与已注册的认可基线")
+    p.add_argument("manifest", help="候选综述的 .manifest.json 清单文件路径")
+    p.add_argument("--json", action="store_true", help="输出机器可读纯 JSON")
+    p.set_defaults(func=cmd_baseline_check)
+
+    p = sub.add_parser("baseline-list", help="列出基线注册表中所有已注册主题的认可基线")
+    p.add_argument("--json", action="store_true", help="输出机器可读纯 JSON")
+    p.set_defaults(func=cmd_baseline_list)
 
     args = parser.parse_args()
     args.func(args)
