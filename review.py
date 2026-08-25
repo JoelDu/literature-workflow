@@ -141,6 +141,85 @@ def cmd_db_repair_production(args):
     console.print_json(report.to_json())
 
 
+def cmd_validate_run(args):
+    """校验单个综述运行清单的契约合规性、文件完整性与哈希真实性。"""
+    from litreview.run_validation import validate_review_run
+    report = validate_review_run(args.manifest)
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
+    else:
+        colour_map = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+        verdict_colour = colour_map.get(report.verdict, "white")
+        console.print(f"\n[bold {verdict_colour}]📋 综述运行校验报告: {report.verdict}[/bold {verdict_colour}]")
+        console.print(f"清单文件: [cyan]{report.manifest_filename}[/cyan]")
+        if report.topic:
+            console.print(f"综述主题: {report.topic}")
+        if report.run_id:
+            console.print(f"运行 ID: {report.run_id}")
+        if report.model_name:
+            console.print(f"生成模型: {report.model_name}")
+        if report.markdown_filename:
+            md_status = "✅ 匹配" if report.markdown_sha256_match else "❌ 缺失或不匹配"
+            console.print(f"Markdown 文件: {report.markdown_filename} ({md_status})")
+        if report.docx_filename:
+            docx_status = "✅ 匹配" if report.docx_sha256_match else "❌ 缺失或不匹配"
+            console.print(f"Word Docx 文件: {report.docx_filename} ({docx_status})")
+        console.print(f"引用映射状态: {report.reference_mapping_status} (文献数: {report.cited_references_count})")
+        console.print(f"章节数: {report.section_count} ｜ 证据总数: {report.evidence_count}")
+
+        if report.issues:
+            console.print(f"\n[bold]发现问题与告警项 ({len(report.issues)} 项):[/bold]")
+            for iss in report.issues:
+                c = "red" if iss.severity == "FAIL" else "yellow"
+                console.print(f"  [{c}][{iss.severity}] {iss.code}: {iss.message} (位置: {iss.location})[/{c}]")
+        console.print()
+
+    exit_codes = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    sys.exit(exit_codes.get(report.verdict, 2))
+
+
+def cmd_compare_runs(args):
+    """比对两次综述运行清单（基线 vs 候选），评估质量退化与配置演进。"""
+    from litreview.run_validation import compare_review_runs
+    report = compare_review_runs(args.base, args.candidate)
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
+    else:
+        colour_map = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+        verdict_colour = colour_map.get(report.verdict, "white")
+        console.print(f"\n[bold {verdict_colour}]⚖️ 综述基线比对报告: {report.verdict}[/bold {verdict_colour}]")
+        console.print(f"基线清单: [cyan]{report.base_manifest_filename}[/cyan] ({report.base_validation.verdict})")
+        console.print(f"候选清单: [cyan]{report.candidate_manifest_filename}[/cyan] ({report.candidate_validation.verdict})")
+        console.print(f"比对主题: {report.topic}")
+
+        if report.reference_diff.status == "complete":
+            console.print(f"引用文献 Jaccard 相似度: {report.reference_diff.jaccard_similarity} (基线: {report.reference_diff.base_count} 篇, 候选: {report.reference_diff.candidate_count} 篇)")
+            if report.reference_diff.added_doc_ids:
+                console.print(f"  新增引用 (+{len(report.reference_diff.added_doc_ids)}): {', '.join(report.reference_diff.added_doc_ids)}")
+            if report.reference_diff.removed_doc_ids:
+                console.print(f"  移除引用 (-{len(report.reference_diff.removed_doc_ids)}): {', '.join(report.reference_diff.removed_doc_ids)}")
+        else:
+            console.print("引用文献对比: 存在历史兼容清单，未进行完整集合比对")
+
+        if report.deltas:
+            console.print(f"\n[bold]参数与产物演进差异 ({len(report.deltas)} 项):[/bold]")
+            for d in report.deltas:
+                c = "red" if d.is_regression else "cyan"
+                console.print(f"  [{c}][{d.category}] {d.message}[/{c}]")
+
+        if report.issues:
+            console.print(f"\n[bold red]比对发现的问题与退化项 ({len(report.issues)} 项):[/bold red]")
+            for iss in report.issues:
+                c = "red" if iss.severity == "FAIL" else "yellow"
+                console.print(f"  [{c}][{iss.severity}] {iss.code}: {iss.message} (位置: {iss.location})[/{c}]")
+        console.print()
+
+    exit_codes = {"PASS": 0, "WARN": 1, "FAIL": 2}
+    sys.exit(exit_codes.get(report.verdict, 2))
+
+
 def _make_embedder(client):
     from litreview.embedder import Embedder
     return Embedder(client, settings.EMBEDDING_MODEL, settings.EMBEDDING_DIM,
@@ -860,6 +939,17 @@ def main():
     p.add_argument("--lang", choices=["zh", "en"], default="zh", help="目标语言（默认 zh）")
     p.add_argument("--dry-run", action="store_true", help="停在证据阶段，打印证据表")
     p.set_defaults(func=cmd_generate)
+
+    p = sub.add_parser("validate-run", help="校验单次综述运行清单的契约合规性、文件完整性与哈希真实性")
+    p.add_argument("manifest", help="待校验的 .manifest.json 清单文件路径")
+    p.add_argument("--json", action="store_true", help="输出机器可读纯 JSON")
+    p.set_defaults(func=cmd_validate_run)
+
+    p = sub.add_parser("compare-runs", help="比对两次综述运行清单（基线 vs 候选），评估质量退化与配置演进")
+    p.add_argument("base", help="基线 .manifest.json 文件路径")
+    p.add_argument("candidate", help="候选 .manifest.json 文件路径")
+    p.add_argument("--json", action="store_true", help="输出机器可读纯 JSON")
+    p.set_defaults(func=cmd_compare_runs)
 
     args = parser.parse_args()
     args.func(args)

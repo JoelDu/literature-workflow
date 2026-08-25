@@ -470,3 +470,17 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
     * **Stage A/C 程序化质量闸门**：大纲校验章节规模及每章 2-4 个非空检索问题，失败后定向纠错一次；正文校验有效引用覆盖与 3 篇以上文献的 Markdown 横向表格，Thesis/Research Gap 显式传入引言结论；
     * **检查点可恢复**：SQLite `locked/busy` 异常不再被内部吞掉，五次指数退避实际生效；启动恢复只运行一次，`running/queued` 僵尸任务转为 `interrupted`；新增 `resume_review(job_id)` 复用规范化大纲、章节正文、引用与证据计数续跑；
     * **验证结果**：综述相关测试 38 项通过；全量回归 215 项通过，剩余 8 项为动态生产数据数量基线及既有代理配置断言，与本轮综述修改无关。
+
+48. **综述可复现性 Phase 1A/1B：运行清单与基线对比深度模块 (2026-08-25)**：
+    * **Review Run Manifest 深模块 (`litreview/manifest.py`)**：每次生成综述旁路原子写出同名 `.manifest.json` 侧车文件，记录 `schema_version=1` 规范结构（模型、Prompt 快照、检索参数、白名单元数据快照与 SHA256 指纹、按章节证据树、质量门结果与环境指纹）；严格隐私白名单保护，绝不保存未授权私有全文与密钥；
+    * **运行校验与基线对比深模块 (`litreview/run_validation.py`)**：
+      - 公开极简强类型接口 `validate_review_run(manifest_path) -> RunValidationReport` 与 `compare_review_runs(base, candidate) -> RunComparisonReport`；
+      - 全程 0 LLM、0 网络、0 DB、0 Git 调用，严格只读；报告与错误严格基于文件名基名与逻辑位置，绝不泄露宿主机物理绝对路径；
+      - 校验规则：严格校验 Schema 白名单结构、产物文件基名安全、Markdown/DOCX 物理哈希一致性、64 位 Hex 哈希格式、阻塞质量门缺陷及引用映射一致性；
+      - 对比规则：基线与候选各自通过校验且主题相同；仅客观质量退化（阻塞缺陷新增、章节证据溯源从 complete/empty 退化为 unavailable_*）判 FAIL；模型/配置/语料变化与指标波动记录为确定性 Delta，绝不因引用数或证据数下降设硬失败阈值；引用映射双 complete 时输出确定性 added/removed 列表与 Jaccard 相似度；
+    * **CLI 适配与机器输出 (`review.py`)**：
+      - 新增 `review.py validate-run MANIFEST [--json]` 与 `review.py compare-runs BASE CANDIDATE [--json]`；
+      - `--json` 模式下输出纯净机器可读 JSON，无任何 Rich 文本或日志混入 stdout；退出码对齐 `0=PASS, 1=WARN, 2=FAIL`；
+    * **全量回归与测试覆盖**：
+      - 新增 `tests/test_manifest.py` (13 项) 与 `tests/test_run_validation.py` (31 项)；
+      - 全量自动化测试 307 项通过 (307 passed, 1 warning, 100% 全绿通过)。

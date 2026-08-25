@@ -182,9 +182,13 @@ python review.py outline "主题" -o outline.json [--thesis "核心立论"] [--g
 python review.py generate "主题" [--outline outline.json] [--dry-run] \
     [--thesis "核心立论"] [--gap "学术缺口"] [--logic "主线分类逻辑"] \
     [--focus "侧重方向"] [--words 目标总字数] [--sections 章节数] [--lang zh|en]
+python review.py validate-run 综述_xxx.manifest.json [--json] # 【运行校验】只读验证清单契约、Markdown/DOCX哈希及质量门
+python review.py compare-runs 基线.manifest.json 候选.manifest.json [--json] # 【基线对比】比对两次运行，客观评估质量退化与配置演进
 ```
 
-生成参数说明：
+生成参数与运行审计说明：
+- `validate-run`：严格只读校验单次综述 `.manifest.json` 侧车清单的完整性、产物哈希真实性与质量门状态（退出码 0=PASS, 1=WARN, 2=FAIL）；
+- `compare-runs`：对比两次综述运行清单（同主题），客观判定质量门退化与证据溯源降级，并输出引用集合 Jaccard 相似度与演进 Delta；
 - `propose`：大纲前置人机对齐，基于本地馆藏扫描 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 6 种主线分类逻辑）；
 - `--thesis`：一句话核心学术论点（作者要论证的核心判断，绝非进展流水账）；
 - `--gap`：一句话学术缺口/痛点（直击现有研究未做透、存在争议的关键矛盾）；
