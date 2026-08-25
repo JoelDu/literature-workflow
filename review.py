@@ -84,6 +84,38 @@ def cmd_status(args):
         console.print(f"[yellow]提示：运行 `python review.py index` 处理 {s['pending_docs']} 篇待索引文献。")
 
 
+def cmd_db_doctor(args):
+    """Run the three-database audit without opening any write connection."""
+    from litreview.db_doctor import inspect_databases
+
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    graph_path = os.getenv(
+        "CITATION_NETWORK_DB_PATH",
+        os.getenv("TEST_CITATION_DB_PATH", os.path.join(data_dir, "test_citation_network.db")),
+    )
+    cache_path = os.getenv(
+        "EXTERNAL_DISCOVERY_CACHE_DB_PATH",
+        os.path.join(data_dir, "external_discovery_cache.db"),
+    )
+    report = inspect_databases(settings.DB_PATH, graph_path, cache_path)
+    if args.json:
+        console.print_json(report.to_json())
+        return
+    table = Table(title="SQLite 数据健康体检", show_lines=True)
+    table.add_column("数据库")
+    table.add_column("表/行")
+    table.add_column("quick_check")
+    table.add_column("FK 违规", justify="right")
+    for db in report.databases:
+        table.add_row(db.name, f"{len(db.tables)} / {sum(db.tables.values())}",
+                      db.quick_check, str(db.foreign_key_violations))
+    console.print(table)
+    for issue in report.issues:
+        colour = "red" if issue.severity == "blocking" else "yellow"
+        console.print(f"[{colour}]{issue.severity.upper()} {issue.database}/{issue.code}: "
+                      f"{issue.message}" + (f"（{issue.count}）" if issue.count else ""))
+
+
 def _make_embedder(client):
     from litreview.embedder import Embedder
     return Embedder(client, settings.EMBEDDING_MODEL, settings.EMBEDDING_DIM,
@@ -623,6 +655,10 @@ def main():
 
     p = sub.add_parser("status", help="索引统计")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("db-doctor", help="严格只读地体检生产库、引文图谱库与候选缓存库")
+    p.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    p.set_defaults(func=cmd_db_doctor)
 
     p = sub.add_parser("search", help="检索调试")
     p.add_argument("query")

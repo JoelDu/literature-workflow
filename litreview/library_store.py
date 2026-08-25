@@ -10,6 +10,7 @@ import logging
 from typing import Dict, List, Any, Optional
 
 from litreview.citation_network import query_citation_network
+from litreview.graph_domain import CitationEdgeStatus
 
 logger = logging.getLogger("literature_analyzer.library_store")
 
@@ -19,7 +20,7 @@ def get_dashboard_stratified_stats(
     test_citation_db_path: str,
     cache_db_path: str
 ) -> Dict[str, Any]:
-    """计算仪表盘分层统计指标，保证5组互斥实体分区严格闭合为 9114。"""
+    """计算仪表盘分层统计指标；所有数量均以当前数据库为准。"""
     
     # 1. 生产库只读统计 (batch_tracking.db)
     prod_baseline = 344
@@ -85,9 +86,12 @@ def get_dashboard_stratified_stats(
             
             # 边统计
             e_total = g_c.execute("SELECT count(*) FROM citation_edges").fetchone()[0]
-            e_conf = g_c.execute("SELECT count(*) FROM citation_edges WHERE edge_status='CONFIRMED'").fetchone()[0]
-            e_cand = g_c.execute("SELECT count(*) FROM citation_edges WHERE edge_status='CANDIDATE'").fetchone()[0]
-            e_unres = g_c.execute("SELECT count(*) FROM citation_edges WHERE edge_status='UNRESOLVED'").fetchone()[0]
+            e_conf = g_c.execute("SELECT count(*) FROM citation_edges WHERE edge_status=?",
+                                 (CitationEdgeStatus.CONFIRMED.value,)).fetchone()[0]
+            e_cand = g_c.execute("SELECT count(*) FROM citation_edges WHERE edge_status=?",
+                                 (CitationEdgeStatus.CANDIDATE.value,)).fetchone()[0]
+            e_unres = g_c.execute("SELECT count(*) FROM citation_edges WHERE edge_status=?",
+                                  (CitationEdgeStatus.UNRESOLVED_EXTERNAL.value,)).fetchone()[0]
             
             m_total = g_c.execute("SELECT count(*) FROM reference_mentions").fetchone()[0]
             m_res = e_conf + e_cand

@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS citation_edges (
     edge_id TEXT PRIMARY KEY,
     citing_work_id TEXT NOT NULL REFERENCES works(work_id) ON DELETE RESTRICT,
     cited_work_id TEXT NOT NULL REFERENCES works(work_id) ON DELETE RESTRICT,
-    edge_status TEXT NOT NULL DEFAULT 'CONFIRMED',  -- CONFIRMED, DISPUTED, REVOKED
+    edge_status TEXT NOT NULL DEFAULT 'CONFIRMED',  -- CONFIRMED, CANDIDATE, UNRESOLVED_EXTERNAL, DISPUTED, REVOKED
     first_observed_at TEXT NOT NULL,
     last_confirmed_at TEXT NOT NULL,
     CHECK (citing_work_id != cited_work_id),  -- 严格禁止自环引用 (Work 归并时必须阻断并进入冲突审计)
