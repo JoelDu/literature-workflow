@@ -485,6 +485,9 @@ def enrich_document_metadata(
                     SET journal_or_venue = COALESCE(NULLIF(?, ''), journal_or_venue),
                         publication_year = COALESCE(?, publication_year),
                         authors_json = CASE WHEN ? != '[]' THEN ? ELSE authors_json END,
+                        volume = COALESCE(NULLIF(?, ''), volume),
+                        issue = COALESCE(NULLIF(?, ''), issue),
+                        pages = COALESCE(NULLIF(?, ''), pages),
                         updated_at = ?
                     WHERE work_id = ?
                 """, (
@@ -492,6 +495,9 @@ def enrich_document_metadata(
                     match_result.get("publication_year"),
                     authors_json,
                     authors_json,
+                    match_result.get("volume", ""),
+                    match_result.get("issue", ""),
+                    match_result.get("pages", ""),
                     now_str,
                     real_wid
                 ))

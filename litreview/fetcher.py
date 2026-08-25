@@ -63,6 +63,25 @@ def calculate_title_similarity(s1: str, s2: str) -> float:
     return len(intersection) / len(union)
 
 
+def parse_openalex_biblio(item: dict) -> dict:
+    """从 OpenAlex 作品数据中规范化解析卷、期与页码范围。"""
+    biblio = item.get("biblio") or {}
+    volume = str(biblio.get("volume") or "").strip()
+    issue = str(biblio.get("issue") or "").strip()
+    first_p = str(biblio.get("first_page") or "").strip()
+    last_p = str(biblio.get("last_page") or "").strip()
+    pages = f"{first_p}-{last_p}" if (first_p and last_p and first_p != last_p) else (first_p or last_p or "")
+    return {"volume": volume, "issue": issue, "pages": pages}
+
+
+def parse_crossref_biblio(item: dict) -> dict:
+    """从 CrossRef 作品数据中规范化解析卷、期与页码/文章编号。"""
+    volume = str(item.get("volume") or "").strip()
+    issue = str(item.get("issue") or "").strip()
+    pages = str(item.get("page") or item.get("article-number") or "").strip()
+    return {"volume": volume, "issue": issue, "pages": pages}
+
+
 def fetch_openalex_by_doi(doi: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
     """通过 OpenAlex API 获取 DOI 对应的权威学术元数据。"""
     valid_doi = clean_doi(doi)
@@ -90,12 +109,17 @@ def fetch_openalex_by_doi(doi: str, timeout: int = 8) -> Optional[Dict[str, Any]
             is_oa = bool(oa_info.get("is_oa", False))
             oa_url = oa_info.get("oa_url") or msg.get("primary_location", {}).get("pdf_url")
             
+            bib_meta = parse_openalex_biblio(msg)
+
             return {
                 "doi": valid_doi,
                 "title": title,
                 "authors": ", ".join(authors),
                 "authors_list": authors,
                 "journal": journal,
+                "volume": bib_meta["volume"],
+                "issue": bib_meta["issue"],
+                "pages": bib_meta["pages"],
                 "year": str(year) if year else "",
                 "publication_year": year,
                 "cited_by_count": msg.get("cited_by_count", 0),
@@ -150,9 +174,11 @@ def fetch_crossref(doi: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
 
             container_titles = msg.get("container-title", [])
             journal = container_titles[0].strip() if container_titles and isinstance(container_titles, list) else ""
-            if not journal:
-                short_containers = msg.get("short-container-title", [])
-                journal = short_containers[0].strip() if short_containers and isinstance(short_containers, list) else ""
+            short_containers = msg.get("short-container-title", [])
+            if not journal and short_containers and isinstance(short_containers, list):
+                journal = short_containers[0].strip()
+
+            bib_meta = parse_crossref_biblio(msg)
 
             year = ""
             for date_key in ("published-print", "published-online", "published", "created", "issued"):
@@ -171,6 +197,9 @@ def fetch_crossref(doi: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
                 "authors": authors_str,
                 "authors_list": authors_list,
                 "journal": journal,
+                "volume": bib_meta["volume"],
+                "issue": bib_meta["issue"],
+                "pages": bib_meta["pages"],
                 "year": year,
                 "publication_year": int(year) if year and year.isdigit() else None,
                 "publisher": publisher,
@@ -218,12 +247,17 @@ def resolve_work_by_title_and_author(
                         pub_year = item.get("publication_year")
                         oa_info = item.get("open_access", {})
                         
+                        bib_meta = parse_openalex_biblio(item)
+
                         return {
                             "doi": cand_doi,
                             "title": cand_title,
                             "authors": ", ".join(authors_list),
                             "authors_list": authors_list,
                             "journal": journal,
+                            "volume": bib_meta["volume"],
+                            "issue": bib_meta["issue"],
+                            "pages": bib_meta["pages"],
                             "year": str(pub_year) if pub_year else "",
                             "publication_year": pub_year,
                             "cited_by_count": item.get("cited_by_count", 0),
@@ -265,6 +299,8 @@ def resolve_work_by_title_and_author(
                         container_titles = it.get("container-title", [])
                         journal = container_titles[0] if container_titles else ""
                         
+                        bib_meta = parse_crossref_biblio(it)
+
                         year_str = ""
                         for date_key in ("published-print", "published-online", "published", "created"):
                             date_parts = it.get(date_key, {}).get("date-parts", [])
@@ -278,6 +314,9 @@ def resolve_work_by_title_and_author(
                             "authors": ", ".join(authors_list),
                             "authors_list": authors_list,
                             "journal": journal,
+                            "volume": bib_meta["volume"],
+                            "issue": bib_meta["issue"],
+                            "pages": bib_meta["pages"],
                             "year": year_str,
                             "publication_year": int(year_str) if year_str.isdigit() else None,
                             "cited_by_count": it.get("is-referenced-by-count", 0),

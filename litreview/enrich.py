@@ -255,6 +255,12 @@ def run_enrich(settings, console, client=None, force: bool = False, use_llm: boo
                                 details["authors"] = cr_meta["authors"]
                             if cr_meta.get("journal"):
                                 details["journal"] = cr_meta["journal"]
+                            if cr_meta.get("volume"):
+                                details["volume"] = cr_meta["volume"]
+                            if cr_meta.get("issue"):
+                                details["issue"] = cr_meta["issue"]
+                            if cr_meta.get("pages"):
+                                details["pages"] = cr_meta["pages"]
                             if cr_meta.get("year"):
                                 details["year"] = cr_meta["year"]
                             if cr_meta.get("publisher"):

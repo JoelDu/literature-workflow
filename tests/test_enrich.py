@@ -66,3 +66,128 @@ def test_reranker_degrades_gracefully():
     result = r.rerank("query", ["doc1", "doc2"], top_n=2)
     assert result == [(0, 0.0), (1, 0.0)]
     assert result.degraded is True
+
+
+def test_parse_openalex_and_crossref_biblio_helpers():
+    from litreview.fetcher import parse_openalex_biblio, parse_crossref_biblio
+
+    # 1. OpenAlex page range
+    oa_item = {
+        "biblio": {
+            "volume": "12",
+            "issue": "4",
+            "first_page": "100",
+            "last_page": "115"
+        }
+    }
+    oa_meta = parse_openalex_biblio(oa_item)
+    assert oa_meta == {"volume": "12", "issue": "4", "pages": "100-115"}
+
+    # 2. OpenAlex single page
+    oa_single = {"biblio": {"volume": "5", "issue": "1", "first_page": "42", "last_page": "42"}}
+    assert parse_openalex_biblio(oa_single) == {"volume": "5", "issue": "1", "pages": "42"}
+
+    # 3. OpenAlex empty biblio
+    assert parse_openalex_biblio({}) == {"volume": "", "issue": "", "pages": ""}
+
+    # 4. CrossRef standard
+    cr_item = {"volume": "450", "issue": "2", "page": "123-134"}
+    assert parse_crossref_biblio(cr_item) == {"volume": "450", "issue": "2", "pages": "123-134"}
+
+    # 5. CrossRef article-number fallback
+    cr_art = {"volume": "10", "issue": "", "article-number": "104521"}
+    assert parse_crossref_biblio(cr_art) == {"volume": "10", "issue": "", "pages": "104521"}
+
+
+def test_save_enrichment_volume_issue_pages_and_preservation(tmp_path):
+    """验证 paper_details 的 volume、issue、pages 首次写入，以及后续部分缺字段时保留旧值。"""
+    from litreview.store import VectorStore
+    import sqlite3
+
+    db_path = str(tmp_path / "test.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE papers (id TEXT PRIMARY KEY, title TEXT, language TEXT, status TEXT, result_json TEXT)")
+    conn.execute("INSERT INTO papers (id, title, status) VALUES ('doc1', 'Test Paper', 'EXPORTED')")
+    conn.commit()
+    conn.close()
+
+    store = VectorStore(db_path, 4096)
+    details = {
+        "title": "Test Paper",
+        "authors": "Author A, Author B",
+        "journal": "Chemical Engineering Journal",
+        "year": "2023",
+        "volume": "450",
+        "issue": "2",
+        "pages": "100-110",
+        "doi": "10.1016/j.cej.2023.100110",
+        "doc_type": "paper",
+        "legal_status": "有效",
+    }
+    store.save_enrichment("doc1", details, assets=[], refs=[])
+
+    meta = store.get_paper_meta(["doc1"])
+    assert meta["doc1"]["volume"] == "450"
+    assert meta["doc1"]["issue"] == "2"
+    assert meta["doc1"]["pages"] == "100-110"
+    assert meta["doc1"]["journal"] == "Chemical Engineering Journal"
+    assert meta["doc1"]["legal_status"] == "有效"
+
+    # 第二次写入（如轻量重扫，不带 volume/issue/pages/legal_status）：应保留原有值
+    details_partial = {
+        "title": "Test Paper Renamed",
+        "authors": "Author A, Author B",
+        "journal": "Chemical Engineering Journal",
+        "year": "2023",
+        "doi": "10.1016/j.cej.2023.100110",
+        "doc_type": "paper",
+    }
+    store.save_enrichment("doc1", details_partial, assets=[], refs=[])
+    meta2 = store.get_paper_meta(["doc1"])
+    assert meta2["doc1"]["volume"] == "450"
+    assert meta2["doc1"]["issue"] == "2"
+    assert meta2["doc1"]["pages"] == "100-110"
+    assert meta2["doc1"]["legal_status"] == "有效"
+
+
+def test_readonly_vectorstore_on_legacy_schema_without_volume(tmp_path):
+    """验证 VectorStore(readonly=True) 在旧 schema（无 volume/issue/pages 列）上只读查询时不崩溃且不写 DDL。"""
+    from litreview.store import VectorStore
+    import sqlite3
+
+    db_path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE papers (id TEXT PRIMARY KEY, title TEXT, language TEXT, status TEXT, result_json TEXT)")
+    # 模拟历史旧版 paper_details（完全没有 volume, issue, pages 等列）
+    conn.execute("""CREATE TABLE paper_details (
+        doc_id TEXT PRIMARY KEY,
+        title TEXT,
+        authors TEXT,
+        journal TEXT,
+        year TEXT,
+        doi TEXT,
+        doc_type TEXT DEFAULT 'paper'
+    )""")
+    conn.execute("INSERT INTO papers (id, title, status) VALUES ('old_doc', 'Legacy Paper', 'EXPORTED')")
+    conn.execute("INSERT INTO paper_details (doc_id, title, journal, year) VALUES ('old_doc', 'Legacy Paper', 'Nature', '2021')")
+    conn.commit()
+    conn.close()
+
+    # 以只读模式连接旧库
+    ro_store = VectorStore(db_path, 4096, readonly=True)
+    meta = ro_store.get_paper_meta(["old_doc"])
+
+    assert "old_doc" in meta
+    assert meta["old_doc"]["journal"] == "Nature"
+    assert meta["old_doc"]["year"] == "2021"
+    assert meta["old_doc"]["volume"] == ""
+    assert meta["old_doc"]["issue"] == ""
+    assert meta["old_doc"]["pages"] == ""
+
+    # 验证旧库的表结构完全未被篡改（未执行 ALTER TABLE DDL）
+    chk_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    cols = {r[1] for r in chk_conn.execute("PRAGMA table_info(paper_details)").fetchall()}
+    chk_conn.close()
+    assert "volume" not in cols
+    assert "issue" not in cols
+    assert "pages" not in cols

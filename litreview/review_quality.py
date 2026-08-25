@@ -102,6 +102,7 @@ def clean_paper_meta(meta: Mapping | None) -> dict:
     for key in (
         "title", "title_zh", "title_en", "journal", "year", "doi", "publisher",
         "pub_place", "edition", "patent_no", "doc_no", "filing_date", "url",
+        "volume", "issue", "pages",
     ):
         cleaned[key] = _clean_scalar(cleaned.get(key))
     cleaned["authors"] = _clean_authors(cleaned.get("authors"))
@@ -183,7 +184,20 @@ def format_reference(n: int, doc_id: str, meta: Mapping | None) -> str:
     else:
         journal = m.get("journal", "")
         year_text = year or "[出版年不详]"
-        tail = f" {journal}, {year_text}." if journal else f" {year_text}."
+        vol = m.get("volume", "")
+        issue = m.get("issue", "")
+        pages = m.get("pages", "")
+
+        vol_issue = ""
+        if vol:
+            vol_issue = f", {vol}"
+            if issue:
+                vol_issue += f"({issue})"
+        elif issue:
+            vol_issue = f"({issue})"
+
+        page_part = f": {pages}" if pages else ""
+        tail = f" {journal}, {year_text}{vol_issue}{page_part}." if journal else f" {year_text}{vol_issue}{page_part}."
         doi = m.get("doi", "")
         body = f"[{n}] {lead}{title}[J].{tail}" + (f" DOI: {doi}." if doi else "")
     return body.rstrip() + link

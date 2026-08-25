@@ -100,7 +100,10 @@ class VectorStore:
             n_tables    INTEGER DEFAULT 0,
             n_refs      INTEGER DEFAULT 0,
             enriched_at TEXT,
-            source      TEXT
+            source      TEXT,
+            volume      TEXT,
+            issue       TEXT,
+            pages       TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS paper_assets (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +138,10 @@ class VectorStore:
                             ("effective_date", "TEXT"),
                             ("quarantine_status", "TEXT DEFAULT 'NORMAL'"),
                             ("quarantine_reason", "TEXT"),
-                            ("cite_key", "TEXT")):
+                            ("cite_key", "TEXT"),
+                            ("volume", "TEXT"),
+                            ("issue", "TEXT"),
+                            ("pages", "TEXT")):
             if _col not in _pd_cols:
                 c.execute(f"ALTER TABLE paper_details ADD COLUMN {_col} {_decl}")
         conn.commit()
@@ -386,14 +392,24 @@ class VectorStore:
     # ── 论文元数据 ────────────────────────────────────────────────────────
 
     def get_paper_meta(self, doc_ids: list = None) -> dict:
-        """doc_id → 元数据 dict。paper_details 的结构化字段（enrich 产出）优先于 result_json。"""
+        """doc_id → 元数据 dict。paper_details 的结构化字段（enrich 产出）优先于 result_json。
+        对旧库/只读库 schema 做安全兼容，绝不向只读数据库写任何 DDL。
+        """
         conn = self._conn()
         c = conn.cursor()
-        base_sql = """SELECT p.id, p.title, p.language, p.result_json,
-                             d.title_zh, d.title_en, d.doi, d.authors, d.journal, d.year, d.keywords,
-                             d.doc_type, d.publisher, d.pub_place, d.edition,
-                             d.patent_no, d.filing_date, d.legal_status, d.status_checked_at,
-                             d.doc_no, d.url, d.effective_date, d.cite_key
+        c.execute("PRAGMA table_info(paper_details)")
+        existing_cols = {row[1] for row in c.fetchall()}
+
+        def _col(name: str) -> str:
+            return f"d.{name}" if name in existing_cols else f"NULL AS {name}"
+
+        base_sql = f"""SELECT p.id, p.title, p.language, p.result_json,
+                             {_col('title_zh')}, {_col('title_en')}, {_col('doi')}, {_col('authors')},
+                             {_col('journal')}, {_col('year')}, {_col('keywords')},
+                             {_col('doc_type')}, {_col('publisher')}, {_col('pub_place')}, {_col('edition')},
+                             {_col('patent_no')}, {_col('filing_date')}, {_col('legal_status')}, {_col('status_checked_at')},
+                             {_col('doc_no')}, {_col('url')}, {_col('effective_date')}, {_col('cite_key')},
+                             {_col('volume')}, {_col('issue')}, {_col('pages')}
                       FROM papers p LEFT JOIN paper_details d ON d.doc_id = p.id"""
         if doc_ids:
             marks = ",".join("?" * len(doc_ids))
@@ -407,7 +423,8 @@ class VectorStore:
              d_title_zh, d_title_en, d_doi, d_authors, d_journal, d_year, d_keywords,
              d_doc_type, d_publisher, d_pub_place, d_edition,
              d_patent_no, d_filing_date, d_legal_status, d_status_checked,
-             d_doc_no, d_url, d_effective, d_cite_key) in rows:
+             d_doc_no, d_url, d_effective, d_cite_key,
+             d_volume, d_issue, d_pages) in rows:
             meta = {"title": title or "", "language": language or "zh",
                     "authors": "", "journal": "", "year": "", "tldr": "",
                     "title_zh": d_title_zh or "", "title_en": d_title_en or "",
@@ -419,16 +436,20 @@ class VectorStore:
                     "status_checked_at": d_status_checked or "",
                     "doc_no": d_doc_no or "", "url": d_url or "",
                     "effective_date": d_effective or "",
-                    "cite_key": d_cite_key or ""}
+                    "cite_key": d_cite_key or "",
+                    "volume": d_volume or "", "issue": d_issue or "",
+                    "pages": d_pages or ""}
             if result_json:
                 try:
                     analysis = json.loads(result_json)
-                    for k in ("authors", "journal", "year", "tldr"):
-                        meta[k] = str(analysis.get(k, "") or "")
+                    for k in ("authors", "journal", "year", "tldr", "volume", "issue", "pages"):
+                        if analysis.get(k):
+                            meta[k] = str(analysis.get(k, "") or "")
                 except Exception:
                     pass
             # 结构化字段优先覆盖（非空才覆盖）
-            for k, v in (("authors", d_authors), ("journal", d_journal), ("year", d_year)):
+            for k, v in (("authors", d_authors), ("journal", d_journal), ("year", d_year),
+                         ("volume", d_volume), ("issue", d_issue), ("pages", d_pages)):
                 if v:
                     meta[k] = str(v)
             out[doc_id] = meta
@@ -443,7 +464,8 @@ class VectorStore:
     _MARKABLE_COLS = ("patent_no", "doc_no", "filing_date", "effective_date",
                       "authors", "publisher", "pub_place", "year",
                       "title", "title_zh", "title_en",
-                      "keywords", "journal", "isbn", "edition", "url")
+                      "keywords", "journal", "isbn", "edition", "url",
+                      "volume", "issue", "pages")
 
     def list_docs(self, doc_type: str) -> list:
         """返回某一类型的全部著录项目，按编号/日期倒序。
@@ -589,7 +611,7 @@ class VectorStore:
             # INSERT OR REPLACE 会整行重写，若不先取出人工填过的那几列，
             # 一次 enrich --force 就把它们冲成空。这几列除非本次显式带值，否则一律沿用旧值：
             # 状态与核实日期是人工核实结果，doc_no/url 是重扫或人工 set-type 写进去的。
-            _CARRY = ("legal_status", "status_checked_at", "doc_no", "url", "effective_date")
+            _CARRY = ("legal_status", "status_checked_at", "doc_no", "url", "effective_date", "volume", "issue", "pages")
             _old = c.execute(
                 f"SELECT {', '.join(_CARRY)} FROM paper_details WHERE doc_id=?",
                 (doc_id,)).fetchone() or ("",) * len(_CARRY)
@@ -599,8 +621,8 @@ class VectorStore:
                           keywords, n_figures, n_tables, n_refs, enriched_at, source,
                           doc_type, publisher, pub_place, edition, isbn,
                           patent_no, filing_date, legal_status, status_checked_at,
-                          doc_no, url, effective_date)
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          doc_no, url, effective_date, volume, issue, pages)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (doc_id, details.get("title", ""), details.get("title_zh", ""),
                        details.get("title_en", ""), details.get("doi", ""),
                        details.get("authors", ""), details.get("journal", ""),
@@ -612,7 +634,8 @@ class VectorStore:
                        details.get("isbn", ""),
                        details.get("patent_no", ""), details.get("filing_date", ""),
                        _kept["legal_status"], _kept["status_checked_at"],
-                       _kept["doc_no"], _kept["url"], _kept["effective_date"]))
+                       _kept["doc_no"], _kept["url"], _kept["effective_date"],
+                       _kept["volume"], _kept["issue"], _kept["pages"]))
             c.execute("DELETE FROM paper_assets WHERE doc_id=?", (doc_id,))
             for a in assets:
                 c.execute("""INSERT INTO paper_assets (doc_id, asset_type, img_path, caption, page_idx)

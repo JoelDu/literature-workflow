@@ -146,3 +146,55 @@ def test_track_b_only_quantitative_claim_is_warned_not_blocked():
     assert result.blocking_issues == []
     assert any(issue.code == "track_b_quantitative_claim" for issue in result.report.issues)
     assert result.review.sections[0].track_b_doc_ids == ["background"]
+
+
+def test_journal_reference_formatting_with_volume_issue_pages():
+    from litreview.review_quality import format_reference
+
+    # 1. 完整卷期页码：Chemical Engineering Journal, 2023, 450(2): 123-134.
+    ref1 = format_reference(1, "doc-1", {
+        "title": "膜层改性机理",
+        "authors": "张三, 李四, 王五",
+        "journal": "Chemical Engineering Journal",
+        "year": "2023",
+        "volume": "450",
+        "issue": "2",
+        "pages": "123-134",
+        "doi": "10.1016/j.cej.2023.141234",
+        "doc_type": "paper",
+    })
+    assert "[1] 张三, 李四, 王五. 膜层改性机理[J]. Chemical Engineering Journal, 2023, 450(2): 123-134. DOI: 10.1016/j.cej.2023.141234." in ref1
+
+    # 2. 仅卷号与页码（无期号）：Nature, 2024, 610: 45-50.
+    ref2 = format_reference(2, "doc-2", {
+        "title": "磷肥循环经济",
+        "authors": "Alice Smith, Bob Jones",
+        "journal": "Nature",
+        "year": "2024",
+        "volume": "610",
+        "pages": "45-50",
+        "doc_type": "paper",
+    })
+    assert "[2] Alice Smith, Bob Jones. 磷肥循环经济[J]. Nature, 2024, 610: 45-50." in ref2
+
+    # 3. 仅期号与页码（无卷号）：化肥工业, 2022(4): 18-22.
+    ref3 = format_reference(3, "doc-3", {
+        "title": "新型肥料评价",
+        "authors": "赵六",
+        "journal": "化肥工业",
+        "year": "2022",
+        "issue": "4",
+        "pages": "18-22",
+        "doc_type": "paper",
+    })
+    assert "[3] 赵六. 新型肥料评价[J]. 化肥工业, 2022(4): 18-22." in ref3
+
+    # 4. 仅年份（无卷期页码）：降级回退最小著录
+    ref4 = format_reference(4, "doc-4", {
+        "title": "早期综述",
+        "authors": "钱七",
+        "journal": "磷肥与复肥",
+        "year": "2020",
+        "doc_type": "paper",
+    })
+    assert "[4] 钱七. 早期综述[J]. 磷肥与复肥, 2020." in ref4
