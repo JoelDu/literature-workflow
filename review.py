@@ -889,15 +889,61 @@ def cmd_generate(args):
         manifest_error = str(exc)
         console.print(f"[yellow]⚠️ Manifest 清单生成失败（Markdown 已正常保存）: {exc}")
 
+    baseline_verdict = None
+    baseline_status = None
+    baseline_summary = None
+    baseline_error = None
+    if manifest_path and os.path.exists(manifest_path):
+        try:
+            from litreview.run_baseline import check_review_candidate
+            chk_report = check_review_candidate(
+                candidate_manifest_path=manifest_path,
+                registry_path=settings.REVIEW_BASELINE_REGISTRY_PATH,
+                output_root=settings.REVIEW_OUTPUT_DIR,
+            )
+            baseline_verdict = chk_report.verdict
+            baseline_status = chk_report.status
+            if chk_report.status == "no_baseline":
+                baseline_summary = "无已注册基线（首次生成）"
+            elif chk_report.verdict == "PASS":
+                baseline_summary = "与官方认可基线一致"
+            elif chk_report.verdict == "WARN":
+                baseline_summary = "基线比对存在演进差异"
+            elif chk_report.status == "candidate_invalid":
+                baseline_summary = "候选清单校验未通过"
+            elif chk_report.status == "baseline_invalid":
+                baseline_summary = "基线注册表或基线文件损坏"
+            else:
+                baseline_summary = "检测到基线质量退化"
+        except Exception as b_exc:
+            from litreview.run_validation import _sanitize_path_in_str
+            baseline_status = "check_error"
+            baseline_summary = "基线检查异常"
+            baseline_error = _sanitize_path_in_str(str(b_exc))
+
     elapsed = int(time.time() - t0)
     if failed_sections or manifest_error:
         console.rule("[bold yellow]⚠️ 综述部分完成（存在未完成章节或清单异常）")
+    elif baseline_verdict == "FAIL":
+        console.rule("[bold red]⚠️ 综述生成完成（基线检查发现质量退化或基线损坏）")
+    elif baseline_status == "check_error":
+        console.rule("[bold yellow]⚠️ 综述生成完成（自动基线检查异常）")
     else:
         console.rule("[bold green]✅ 综述生成完成")
     if failed_sections:
         console.print(f"[yellow]⚠️ 以下章节因接口故障未生成，可稍后重跑: {', '.join(failed_sections)}")
     if manifest_error:
         console.print(f"[yellow]⚠️ 清单警告: {manifest_error}")
+    if baseline_status == "no_baseline":
+        console.print("[yellow]🛡️ 基线检查: WARN (无已注册基线 / 首次生成)[/yellow]")
+    elif baseline_verdict == "PASS":
+        console.print(f"[green]🛡️ 基线检查: PASS ({baseline_summary})[/green]")
+    elif baseline_verdict == "WARN":
+        console.print(f"[yellow]🛡️ 基线检查: WARN ({baseline_summary})[/yellow]")
+    elif baseline_verdict == "FAIL":
+        console.print(f"[bold red]🛡️ 基线检查: FAIL ({baseline_summary})[/bold red]")
+    elif baseline_status == "check_error":
+        console.print(f"[yellow]🛡️ 基线检查: 不可用 ({baseline_summary}: {baseline_error})[/yellow]")
     console.print(f"标题: [bold]{review.title}[/bold]")
     console.print(f"章节: {len(review.sections)} 个 | 引用文献: {review.doc_count} 篇 | "
                   f"证据: {review.evidence_count} 条 | 耗时: {elapsed}s")
@@ -913,7 +959,11 @@ def cmd_generate(args):
                   extra={"topic": args.topic, "sections": len(review.sections),
                          "cited_docs": review.doc_count, "elapsed_s": elapsed,
                          "output": out_path, "docx": docx_path, "manifest": manifest_path,
-                         "manifest_error": manifest_error})
+                         "manifest_error": manifest_error,
+                         "baseline_verdict": baseline_verdict,
+                         "baseline_status": baseline_status,
+                         "baseline_summary": baseline_summary,
+                         "baseline_error": baseline_error})
 
 
 def main():

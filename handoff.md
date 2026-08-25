@@ -505,4 +505,20 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
       - 新增 `tests/test_run_baseline.py` (22 项隔离测试，100% 通过)；
       - 关联核心模块 (8 套件) 107 项通过 (1 warning)；
       - 全仓库全量自动化测试 329 passed, 1 warning (100% 全绿)；
-      - 本阶段为 Phase 1C-A（深模块与 CLI 闭环），暂未自动接入 Web/MCP。
+      - 奠定了可信基线注册表深模块底座与 CLI 入口。
+
+50. **综述可复现性 Phase 1C-B：自动基线检查接入与最终状态闭环 (2026-08-25)**：
+    * **跨进程并发锁 (`fcntl.flock`) 强化 (`litreview/run_baseline.py`)**：
+      - 在 `promote_review_baseline` 的 `read -> mutate -> replace` 全临界区增加持久 `.lock` 跨进程文件锁；
+      - 超时安全返回 `FAIL (REGISTRY_LOCK_TIMEOUT)`，杜绝多进程并发提升时条目静默覆盖或注册表损坏；
+    * **三入口自动巡检闭环 (`review.py`, `web_server.py`, `mcp_server.py`)**：
+      - 在成功生成 Phase 1A Manifest 产物后，直接调用 `check_review_candidate`；
+      - **基线状态与生成状态解耦**：记录 `baseline_verdict`、`baseline_status`、`baseline_summary`、`baseline_error`，生成成功时即使基线检查为 `FAIL` 仍保持 `status=done`（绝不伪装为 partial 或生成失败），如实呈现质量退化；
+      - 检查过程自身抛异常时保持产物与 `status=done`，安全降级为 `baseline_status="check_error"`，详细错误内部路径脱敏，绝不泄漏物理路径；
+      - **诚实呈现**：CLI `generate` 横幅与日志区分 PASS (绿)、WARN/NO_BASELINE (黄)、FAIL (红退化)、check_error (黄不可用)，FAIL/错误时禁用无条件庆祝文案；
+      - **Web API & SSE 广播**：任务详情与 SSE 流实时暴露 4 个基线字段与结构化日志；
+      - **MCP Server & SQLite 迁移**：`review_jobs` 表增量安全迁移，完整支持重启回读；`start_review` 与 `resume_review` 入队时清空陈旧字段，`review_status` 输出脱敏基线信息；
+    * **全量回归与测试覆盖**：
+      - `tests/test_run_baseline.py` (25 项) + `tests/test_run_validation.py` (31 项) + `tests/test_manifest.py` (15 项)；
+      - 关联核心模块 (8 套件) 112 项测试通过 (1 warning)；
+      - 全仓库全量自动化测试 **334 passed, 1 warning (100% 全绿通过)**。

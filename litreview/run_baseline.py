@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import datetime
+import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
@@ -123,6 +126,45 @@ def _atomic_write_registry(registry_path: str, registry_data: dict[str, Any]) ->
             except OSError:
                 pass
         raise
+
+
+@contextmanager
+def _acquire_registry_lock(registry_path: str, timeout_seconds: float = 5.0):
+    """跨进程文件锁，保护基线注册表 read-mutate-replace 全临界区。
+
+    使用同目录 .lock 文件与 fcntl.flock，超时安全返回。
+    """
+    registry_dir = os.path.dirname(os.path.abspath(registry_path))
+    os.makedirs(registry_dir, exist_ok=True)
+    lock_path = registry_path + ".lock"
+
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    start_time = time.monotonic()
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() - start_time >= timeout_seconds:
+                    break
+                time.sleep(0.05)
+
+        if not acquired:
+            raise TimeoutError("Acquiring registry lock timed out")
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            lock_file.close()
+        except OSError:
+            pass
 
 
 def _validate_registry_structure(registry_data: Any, output_root: str, issues: list[ValidationIssue]) -> bool:
@@ -340,6 +382,7 @@ def promote_review_baseline(
     registry_path: str,
     output_root: str,
     allow_warn: bool = False,
+    lock_timeout_seconds: float = 5.0,
 ) -> BaselinePromoteReport:
     """将指定综述运行清单提升/更新为该主题的官方认可基线。
 
@@ -440,74 +483,93 @@ def promote_review_baseline(
     # 4. 计算清单 SHA256
     manifest_sha256 = _calc_file_sha256(real_manifest) or ""
 
-    # 5. 加载/校验现有注册表
-    registry_data: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "updated_at": "",
-        "baselines": {},
-    }
-    if os.path.exists(registry_path):
-        try:
-            with open(registry_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            reg_issues: list[ValidationIssue] = []
-            if not _validate_registry_structure(loaded, output_root, reg_issues):
-                reg_issues.append(ValidationIssue(
-                    code="REGISTRY_CORRUPTED",
-                    severity="FAIL",
-                    message="现有基线注册表文件格式非法或损坏，拒绝写入以保护数据",
-                    location="registry",
-                ))
-                return BaselinePromoteReport(
-                    verdict="FAIL",
-                    topic_key=topic_key,
-                    topic=clean_topic,
-                    manifest_locator=rel_locator,
-                    manifest_sha256=manifest_sha256,
-                    run_id=_sanitize_path_in_str(val_report.run_id),
-                    validation_verdict=val_report.verdict,
-                    validation_report=val_report,
-                    issues=reg_issues,
-                )
-            registry_data = loaded
-        except Exception:
-            issues.append(ValidationIssue(
-                code="REGISTRY_CORRUPTED",
-                severity="FAIL",
-                message="无法读取或解析现有基线注册表 JSON",
-                location="registry",
-            ))
-            return BaselinePromoteReport(
-                verdict="FAIL",
-                topic_key=topic_key,
-                topic=clean_topic,
-                manifest_locator=rel_locator,
-                manifest_sha256=manifest_sha256,
-                run_id=_sanitize_path_in_str(val_report.run_id),
-                validation_verdict=val_report.verdict,
-                validation_report=val_report,
-                issues=issues,
-            )
-
-    # 6. 原子更新注册表
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    registry_data["updated_at"] = now_iso
-    if not isinstance(registry_data.get("baselines"), dict):
-        registry_data["baselines"] = {}
-
-    registry_data["baselines"][topic_key] = {
-        "topic_key": topic_key,
-        "topic": clean_topic,
-        "manifest_locator": rel_locator,
-        "manifest_sha256": manifest_sha256,
-        "run_id": _sanitize_path_in_str(val_report.run_id),
-        "generated_at": _sanitize_path_in_str(val_report.generated_at),
-        "promoted_at": now_iso,
-        "validation_verdict": val_report.verdict,
-    }
-
+    # 5. 在跨进程文件锁临界区内重新加载最新注册表、严格校验并原子写入
     try:
-        _atomic_write_registry(registry_path, registry_data)
+        with _acquire_registry_lock(registry_path, timeout_seconds=lock_timeout_seconds):
+            registry_data: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "updated_at": "",
+                "baselines": {},
+            }
+            if os.path.exists(registry_path):
+                try:
+                    with open(registry_path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    reg_issues: list[ValidationIssue] = []
+                    if not _validate_registry_structure(loaded, output_root, reg_issues):
+                        reg_issues.append(ValidationIssue(
+                            code="REGISTRY_CORRUPTED",
+                            severity="FAIL",
+                            message="现有基线注册表文件格式非法或损坏，拒绝写入以保护数据",
+                            location="registry",
+                        ))
+                        return BaselinePromoteReport(
+                            verdict="FAIL",
+                            topic_key=topic_key,
+                            topic=clean_topic,
+                            manifest_locator=rel_locator,
+                            manifest_sha256=manifest_sha256,
+                            run_id=_sanitize_path_in_str(val_report.run_id),
+                            validation_verdict=val_report.verdict,
+                            validation_report=val_report,
+                            issues=reg_issues,
+                        )
+                    registry_data = loaded
+                except Exception:
+                    issues.append(ValidationIssue(
+                        code="REGISTRY_CORRUPTED",
+                        severity="FAIL",
+                        message="无法读取或解析现有基线注册表 JSON",
+                        location="registry",
+                    ))
+                    return BaselinePromoteReport(
+                        verdict="FAIL",
+                        topic_key=topic_key,
+                        topic=clean_topic,
+                        manifest_locator=rel_locator,
+                        manifest_sha256=manifest_sha256,
+                        run_id=_sanitize_path_in_str(val_report.run_id),
+                        validation_verdict=val_report.verdict,
+                        validation_report=val_report,
+                        issues=issues,
+                    )
+
+            # 6. 原子更新注册表
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            registry_data["updated_at"] = now_iso
+            if not isinstance(registry_data.get("baselines"), dict):
+                registry_data["baselines"] = {}
+
+            registry_data["baselines"][topic_key] = {
+                "topic_key": topic_key,
+                "topic": clean_topic,
+                "manifest_locator": rel_locator,
+                "manifest_sha256": manifest_sha256,
+                "run_id": _sanitize_path_in_str(val_report.run_id),
+                "generated_at": _sanitize_path_in_str(val_report.generated_at),
+                "promoted_at": now_iso,
+                "validation_verdict": val_report.verdict,
+            }
+
+            _atomic_write_registry(registry_path, registry_data)
+    except TimeoutError:
+        issues.append(ValidationIssue(
+            code="REGISTRY_LOCK_TIMEOUT",
+            severity="FAIL",
+            message="获取基线注册表跨进程锁超时，拒绝写入以保护并发完整性",
+            location="registry.lock",
+        ))
+        return BaselinePromoteReport(
+            verdict="FAIL",
+            topic_key=topic_key,
+            topic=clean_topic,
+            manifest_locator=rel_locator,
+            manifest_sha256=manifest_sha256,
+            run_id=_sanitize_path_in_str(val_report.run_id),
+            validation_verdict=val_report.verdict,
+            validation_report=val_report,
+            issues=issues,
+        )
     except Exception:
         issues.append(ValidationIssue(
             code="REGISTRY_WRITE_ERROR",

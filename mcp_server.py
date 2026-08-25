@@ -840,7 +840,11 @@ def _init_review_jobs_db(recover_interrupted: bool = False):
                     mainline_logic TEXT,
                     target_lang TEXT DEFAULT 'zh',
                     manifest_path TEXT,
-                    manifest_error TEXT
+                    manifest_error TEXT,
+                    baseline_verdict TEXT,
+                    baseline_status TEXT,
+                    baseline_summary TEXT,
+                    baseline_error TEXT
                 )
             """)
             existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(review_jobs)").fetchall()]
@@ -855,6 +859,10 @@ def _init_review_jobs_db(recover_interrupted: bool = False):
                 ("target_lang", "TEXT DEFAULT 'zh'"),
                 ("manifest_path", "TEXT"),
                 ("manifest_error", "TEXT"),
+                ("baseline_verdict", "TEXT"),
+                ("baseline_status", "TEXT"),
+                ("baseline_summary", "TEXT"),
+                ("baseline_error", "TEXT"),
             ):
                 if column not in existing_cols:
                     conn.execute(f"ALTER TABLE review_jobs ADD COLUMN {column} {ddl}")
@@ -885,8 +893,8 @@ def _persist_review_job(job_dict: dict):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""
             INSERT OR REPLACE INTO review_jobs
-            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error, baseline_verdict, baseline_status, baseline_summary, baseline_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job_dict["job_id"],
             job_dict.get("topic", ""),
@@ -911,6 +919,10 @@ def _persist_review_job(job_dict: dict):
             job_dict.get("target_lang", "zh"),
             job_dict.get("manifest", ""),
             job_dict.get("manifest_error", ""),
+            job_dict.get("baseline_verdict", None),
+            job_dict.get("baseline_status", None),
+            job_dict.get("baseline_summary", None),
+            job_dict.get("baseline_error", None),
         ))
         conn.commit()
     finally:
@@ -923,7 +935,7 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
     conn = _get_db_conn(readonly=True)
     try:
         c = conn.cursor()
-        select_cols = "job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error"
+        select_cols = "job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error, baseline_verdict, baseline_status, baseline_summary, baseline_error"
         if job_id:
             c.execute(f"SELECT {select_cols} FROM review_jobs WHERE job_id = ?", (job_id,))
         else:
@@ -954,6 +966,10 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
                 "target_lang": row[20] or "zh",
                 "manifest": row[21] or "" if len(row) > 21 and row[21] is not None else "",
                 "manifest_error": row[22] or "" if len(row) > 22 and row[22] is not None else "",
+                "baseline_verdict": row[23] if len(row) > 23 and row[23] is not None else None,
+                "baseline_status": row[24] if len(row) > 24 and row[24] is not None else None,
+                "baseline_summary": row[25] if len(row) > 25 and row[25] is not None else None,
+                "baseline_error": row[26] if len(row) > 26 and row[26] is not None else None,
             }
     finally:
         conn.close()
@@ -1151,12 +1167,50 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             manifest_err = str(exc)
             log(f"⚠️ Manifest 运行清单生成失败（Markdown 已正常生成）: {exc}")
 
+        baseline_verdict = None
+        baseline_status = None
+        baseline_summary = None
+        baseline_error = None
+        if manifest_path and os.path.exists(manifest_path):
+            try:
+                from litreview.run_baseline import check_review_candidate
+                chk_report = check_review_candidate(
+                    candidate_manifest_path=manifest_path,
+                    registry_path=settings.REVIEW_BASELINE_REGISTRY_PATH,
+                    output_root=settings.REVIEW_OUTPUT_DIR,
+                )
+                baseline_verdict = chk_report.verdict
+                baseline_status = chk_report.status
+                if chk_report.status == "no_baseline":
+                    baseline_summary = "无已注册基线（首次生成）"
+                elif chk_report.verdict == "PASS":
+                    baseline_summary = "基线比对通过"
+                elif chk_report.verdict == "WARN":
+                    baseline_summary = "基线比对存在演进差异"
+                elif chk_report.status == "candidate_invalid":
+                    baseline_summary = "候选清单校验未通过"
+                elif chk_report.status == "baseline_invalid":
+                    baseline_summary = "基线注册表或基线文件损坏"
+                else:
+                    baseline_summary = "检测到基线质量退化"
+                log(f"🛡️ 自动基线检查完成: {chk_report.verdict} ({chk_report.status}) - {baseline_summary}")
+            except Exception as b_exc:
+                from litreview.run_validation import _sanitize_path_in_str
+                baseline_status = "check_error"
+                baseline_summary = "基线检查异常"
+                baseline_error = _sanitize_path_in_str(str(b_exc))
+                log(f"⚠️ 自动基线检查异常: {baseline_error}")
+
         with _jobs_lock:
             job["status"] = "partial" if (section_result.failed_sections or manifest_err) else "done"
             job["output"] = out_path
             job["docx"] = docx_path
             job["manifest"] = manifest_path or ""
             job["manifest_error"] = manifest_err or ""
+            job["baseline_verdict"] = baseline_verdict
+            job["baseline_status"] = baseline_status
+            job["baseline_summary"] = baseline_summary
+            job["baseline_error"] = baseline_error
             job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             job["summary"] = (f"《{review.title}》：{len(review.sections)} 章节、"
                               f"引用 {review.doc_count} 篇、证据 {review.evidence_count} 条")
@@ -1167,6 +1221,10 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
             _persist_review_job(job)
         if section_result.failed_sections or manifest_err:
             log(f"⚠️ 部分完成（存在未完成章节或清单异常）：输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else "") + (f"，清单警告: {manifest_err}" if manifest_err else ""))
+        elif baseline_verdict == "FAIL":
+            log(f"⚠️ 完成（基线检查发现质量退化或基线损坏），输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else "") + (f"，清单: {manifest_path}" if manifest_path else ""))
+        elif baseline_status == "check_error":
+            log(f"⚠️ 完成（自动基线检查异常），输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else "") + (f"，清单: {manifest_path}" if manifest_path else ""))
         else:
             log(f"✅ 完成，输出: {out_path}" + (f"，Word: {docx_path}" if docx_path else "") + (f"，清单: {manifest_path}" if manifest_path else ""))
         status_tag = "partial" if (section_result.failed_sections or manifest_err) else "success"
@@ -1174,7 +1232,11 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                       status=status_tag, extra={"topic": topic, "via": "mcp",
                                                "output": out_path, "docx": docx_path,
                                                "manifest": manifest_path,
-                                               "manifest_error": manifest_err})
+                                               "manifest_error": manifest_err,
+                                               "baseline_verdict": baseline_verdict,
+                                               "baseline_status": baseline_status,
+                                               "baseline_summary": baseline_summary,
+                                               "baseline_error": baseline_error})
     except Exception as e:
         with _jobs_lock:
             job["status"] = "failed"
@@ -1214,6 +1276,7 @@ def start_review(topic: str, focus: str = "", words: int = 0,
         "sections": sections, "outline_json": outline_json, "status": "queued",
         "log": [f"[{datetime.now().strftime('%H:%M:%S')}] {check_msg}"], "output": "", "docx": "",
         "manifest": "", "manifest_error": "", "error": "", "summary": "",
+        "baseline_verdict": None, "baseline_status": None, "baseline_summary": None, "baseline_error": None,
         "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "started_at": "", "completed_at": "", "heartbeat_at": "", "checkpoint_json": "",
         "research_gap": research_gap, "thesis": thesis,
@@ -1248,6 +1311,10 @@ def resume_review(job_id: str) -> str:
     job["error"] = ""
     job["manifest"] = ""
     job["manifest_error"] = ""
+    job["baseline_verdict"] = None
+    job["baseline_status"] = None
+    job["baseline_summary"] = None
+    job["baseline_error"] = None
     job["completed_at"] = ""
     job["started_at"] = ""
     job["heartbeat_at"] = now_str
@@ -1303,6 +1370,22 @@ def review_status(job_id: str = "") -> str:
             lines.append(f"Word docx URI: {loc.sanitize_path_for_remote(raw_docx)} (文件: {raw_docx})")
         if raw_manifest:
             lines.append(f"Manifest URI: {loc.sanitize_path_for_remote(raw_manifest)}")
+        if job.get("baseline_status"):
+            b_verdict = job.get("baseline_verdict")
+            b_status = job.get("baseline_status")
+            b_sum = job.get("baseline_summary") or ""
+            b_err = job.get("baseline_error")
+            if b_status == "no_baseline":
+                lines.append(f"基线检查: WARN ({b_sum or '无已注册基线/首次生成'})")
+            elif b_verdict == "PASS":
+                lines.append(f"基线检查: PASS ({b_sum})")
+            elif b_verdict == "WARN":
+                lines.append(f"基线检查: WARN ({b_sum})")
+            elif b_verdict == "FAIL":
+                lines.append(f"基线检查: FAIL ({b_sum})")
+            elif b_status == "check_error":
+                safe_b_err = loc.sanitize_path_for_remote(b_err) if b_err else "检查异常"
+                lines.append(f"基线检查: 不可用 ({b_sum or '基线检查异常'}: {safe_b_err})")
         if job.get("manifest_error"):
             err_msg = str(job["manifest_error"])
             for p in (raw_out, raw_docx, raw_manifest):

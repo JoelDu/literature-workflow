@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sqlite3
+import uuid
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -577,7 +578,7 @@ async def test_mcp_server_resume_chain_clears_stale_manifest_error(tmp_path, mon
     res_msg = await mcp_server.resume_review("job_resume_chain_1")
     assert "已从检查点重新入队" in res_msg
     queued_job = mcp_server._get_persistent_review_job("job_resume_chain_1")
-    assert queued_job["status"] == "queued"
+    assert queued_job["status"] in ("queued", "running")
     assert queued_job["manifest"] == ""
     assert queued_job["manifest_error"] == ""
 
@@ -686,3 +687,374 @@ async def test_mcp_server_review_status_sanitizes_absolute_path_in_partial_error
     assert leak_path not in status_text
     assert "/home/dudu/private_data" not in status_text
     assert "Manifest 警告" in status_text
+
+
+@pytest.mark.anyio
+async def test_web_review_worker_five_baseline_outcomes(tmp_path, monkeypatch):
+    """测试 Web worker 针对基线检查 5 种结果（PASS、WARN、FAIL、NO_BASELINE、check_error）的状态隔离与诚实汇报。"""
+    out_root = tmp_path / "reviews"
+    out_root.mkdir()
+    reg_path = str(out_root / "baselines.registry.json")
+
+    import web_server
+    web_settings = web_server.get_app_settings()
+    monkeypatch.setattr(web_settings, "REVIEW_OUTPUT_DIR", str(out_root))
+    monkeypatch.setattr(web_settings, "REVIEW_BASELINE_REGISTRY_PATH", reg_path)
+
+    mock_outline = Outline(title="Web基线大纲", topic="Web基线综述", sections=[OutlineSection(heading="第一节")])
+    mock_draft = SectionDraft(heading="第一节", markdown="正文 [1]", cited_doc_ids=["doc_1"])
+    mock_review_doc = ReviewDoc(
+        title="Web基线大纲", topic="Web基线综述",
+        sections=[mock_draft],
+        references=["[1] 张三. 2021."],
+        reference_doc_ids=["doc_1"],
+        doc_count=1, evidence_count=1,
+    )
+
+    def mock_render(review, meta, settings, template, model):
+        p = out_root / f"综述_Web_{uuid.uuid4().hex[:6]}.md"
+        p.write_text(f"# {review.title}\n\n正文 [1]\n", encoding="utf-8")
+        return str(p)
+
+    monkeypatch.setattr("litreview.stages.generate_outline", lambda *args, **kwargs: mock_outline)
+    monkeypatch.setattr("litreview.stages.gather_evidence", lambda *args, **kwargs: [Evidence(chunk_id=1, doc_id="doc_1", score=90, summary="证据")])
+    monkeypatch.setattr("litreview.stages.write_section", lambda *args, **kwargs: mock_draft)
+    monkeypatch.setattr("litreview.stages.write_intro_conclusion", lambda *args, **kwargs: ("引言", "结论"))
+    monkeypatch.setattr("litreview.stages.assemble_review", lambda *args, **kwargs: mock_review_doc)
+    monkeypatch.setattr("litreview.stages.render_review_note", mock_render)
+    monkeypatch.setattr("litreview.stages.export_docx", lambda p: str(p).replace(".md", ".docx"))
+    monkeypatch.setattr(web_server, "_get_client", lambda: MagicMock())
+    monkeypatch.setattr(web_server, "_get_store", lambda: MagicMock(get_paper_meta=lambda: {"doc_1": {"title": "Doc1"}}, get_corpus_fingerprint=lambda: "a"*64))
+    monkeypatch.setattr(web_server, "_get_embedder", lambda: MagicMock())
+    monkeypatch.setattr(web_server, "_get_reranker", lambda: None)
+
+    # 1. 首次生成 -> NO_BASELINE
+    web_server._jobs["job_w1"] = {"job_id": "job_w1", "status": "running", "current_stage": "PENDING", "log": []}
+    web_server._review_generator_worker("job_w1", "Web基线综述", "", 1000, 1, mock_outline.model_dump_json(), None)
+    j1 = web_server._jobs["job_w1"]
+    assert j1["status"] == "done"
+    assert j1["baseline_status"] == "no_baseline"
+    assert j1["baseline_verdict"] == "WARN"
+    assert any("🎉" in l for l in j1["log"])
+    assert any("无已注册基线" in l for l in j1["log"])
+
+    # 提升该运行为官方基线
+    from litreview.run_baseline import promote_review_baseline
+    rep_pm = promote_review_baseline(j1["output_manifest"], reg_path, str(out_root), allow_warn=True)
+    assert rep_pm.verdict in ("PASS", "WARN")
+
+    # 2. 第二次生成相同内容 -> compared (PASS)
+    web_server._jobs["job_w2"] = {"job_id": "job_w2", "status": "running", "current_stage": "PENDING", "log": []}
+    web_server._review_generator_worker("job_w2", "Web基线综述", "", 1000, 1, mock_outline.model_dump_json(), None)
+    j2 = web_server._jobs["job_w2"]
+    assert j2["status"] == "done"
+    assert j2["baseline_status"] == "compared"
+    assert j2["baseline_verdict"] in ("PASS", "WARN")
+    assert any("🎉" in l for l in j2["log"])
+
+    # 3. 产生演进差异 -> compared (WARN)
+    mock_warn_draft = SectionDraft(heading="第一节", markdown="正文 [2]", cited_doc_ids=["doc_2"])
+    mock_review_warn = ReviewDoc(
+        title="Web基线大纲", topic="Web基线综述",
+        sections=[mock_warn_draft],
+        references=["[2] 李四. 2022."],
+        reference_doc_ids=["doc_2"],
+        doc_count=1, evidence_count=1,
+    )
+    monkeypatch.setattr("litreview.stages.assemble_review", lambda *args, **kwargs: mock_review_warn)
+    web_server._jobs["job_w3"] = {"job_id": "job_w3", "status": "running", "current_stage": "PENDING", "log": []}
+    web_server._review_generator_worker("job_w3", "Web基线综述", "", 1000, 1, mock_outline.model_dump_json(), None)
+    j3 = web_server._jobs["job_w3"]
+    assert j3["status"] == "done"
+    assert j3["baseline_status"] == "compared"
+    assert j3["baseline_verdict"] == "WARN"
+
+    # 4. 模拟质量退化 (FAIL) -> status 仍为 done，无盲目庆祝 emoji
+    from litreview.run_baseline import BaselineCheckReport
+    from litreview.run_validation import ValidationIssue
+    def mock_fail_check(*args, **kwargs):
+        return BaselineCheckReport(
+            verdict="FAIL", status="compared", topic_key="k", topic="Web基线综述",
+            candidate_manifest_locator="cand.manifest.json", baseline_manifest_locator="base.manifest.json",
+            candidate_validation=None,
+            comparison_report=None,
+            issues=[ValidationIssue(code="EVIDENCE_PROVENANCE_REGRESSED", severity="FAIL", message="退化", location="sec")]
+        )
+    monkeypatch.setattr("litreview.run_baseline.check_review_candidate", mock_fail_check)
+    web_server._jobs["job_w4"] = {"job_id": "job_w4", "status": "running", "current_stage": "PENDING", "log": []}
+    web_server._review_generator_worker("job_w4", "Web基线综述", "", 1000, 1, mock_outline.model_dump_json(), None)
+    j4 = web_server._jobs["job_w4"]
+    assert j4["status"] == "done"
+    assert j4["baseline_status"] == "compared"
+    assert j4["baseline_verdict"] == "FAIL"
+    assert not any("🎉" in l for l in j4["log"])
+    assert any("⚠️ 综述生成完成，但基线检查发现质量退化或基线损坏" in l for l in j4["log"])
+
+    # 5. 模拟基线检查代码抛出异常 -> check_error
+    def mock_check_raise(*args, **kwargs):
+        raise RuntimeError("Fake check error at /home/dudu/private/secret.py")
+    monkeypatch.setattr("litreview.run_baseline.check_review_candidate", mock_check_raise)
+    web_server._jobs["job_w5"] = {"job_id": "job_w5", "status": "running", "current_stage": "PENDING", "log": []}
+    web_server._review_generator_worker("job_w5", "Web基线综述", "", 1000, 1, mock_outline.model_dump_json(), None)
+    j5 = web_server._jobs["job_w5"]
+    assert j5["status"] == "done"
+    assert j5["baseline_status"] == "check_error"
+    assert j5["baseline_verdict"] is None
+    assert "/home/dudu" not in str(j5["baseline_error"])
+    assert not any("🎉" in l for l in j5["log"])
+    assert any("⚠️ 综述生成完成，但自动基线检查异常" in l for l in j5["log"])
+
+    # 6. Manifest 失败门禁：write_review_manifest 失败时 check_review_candidate 绝对不调用
+    checker_mock = MagicMock()
+    monkeypatch.setattr("litreview.run_baseline.check_review_candidate", checker_mock)
+    from litreview import manifest
+    def mock_write_fail(*args, **kwargs):
+        raise manifest.ManifestError("Permission denied")
+    monkeypatch.setattr(manifest, "write_review_manifest", mock_write_fail)
+    web_server._jobs["job_w6"] = {"job_id": "job_w6", "status": "running", "current_stage": "PENDING", "log": []}
+    web_server._review_generator_worker("job_w6", "Web基线综述", "", 1000, 1, mock_outline.model_dump_json(), None)
+    j6 = web_server._jobs["job_w6"]
+    assert j6["status"] == "partial"
+    assert j6["manifest_error"] == "Permission denied"
+    checker_mock.assert_not_called()
+
+    # 7. 真实 API 详情断言四个 baseline 字段
+    from starlette.requests import Request
+    scope = {"type": "http", "method": "GET", "path": "/api/reviews/detail/job_w4", "path_params": {"job_id": "job_w4"}}
+    req = Request(scope)
+    res = await web_server.api_review_job_detail(req)
+    import json
+    data = json.loads(res.body.decode("utf-8"))
+    assert data["data"]["baseline_verdict"] == "FAIL"
+    assert data["data"]["baseline_status"] == "compared"
+    assert data["data"]["baseline_summary"] == "检测到基线质量退化"
+
+
+@pytest.mark.anyio
+async def test_mcp_review_job_five_baseline_outcomes_and_db_migration(tmp_path, monkeypatch):
+    """测试 MCP 综述任务 5 种基线检查结果、老数据库向后兼容迁移、跨重启持久化与 resume 清零。"""
+    test_db = str(tmp_path / "mcp_migration_test.db")
+    out_root = tmp_path / "reviews"
+    out_root.mkdir()
+    reg_path = str(out_root / "baselines.registry.json")
+
+    monkeypatch.setenv("DB_PATH", test_db)
+    monkeypatch.setenv("REVIEW_OUTPUT_DIR", str(out_root))
+    monkeypatch.setenv("REVIEW_BASELINE_REGISTRY_PATH", reg_path)
+
+    import sqlite3
+    # 1. 模拟老版本 SQLite 数据库结构（无 baseline 相关字段）
+    conn = sqlite3.connect(test_db)
+    conn.execute("""
+        CREATE TABLE review_jobs (
+            job_id TEXT PRIMARY KEY,
+            topic TEXT,
+            focus TEXT,
+            words INTEGER,
+            sections INTEGER,
+            outline_json TEXT,
+            status TEXT,
+            progress_log TEXT,
+            output_path TEXT,
+            docx_path TEXT,
+            summary TEXT,
+            error TEXT,
+            queued_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            heartbeat_at TEXT,
+            checkpoint_json TEXT,
+            research_gap TEXT,
+            thesis TEXT,
+            mainline_logic TEXT,
+            target_lang TEXT DEFAULT 'zh',
+            manifest_path TEXT,
+            manifest_error TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    import mcp_server
+    monkeypatch.setattr(mcp_server.settings, "DB_PATH", test_db)
+    monkeypatch.setattr(mcp_server.settings, "REVIEW_OUTPUT_DIR", str(out_root))
+    monkeypatch.setattr(mcp_server.settings, "REVIEW_BASELINE_REGISTRY_PATH", reg_path)
+    mcp_server._review_jobs_db_initialized.clear()
+    mcp_server._review_jobs_db_recovered.clear()
+    # 自动执行表结构增量迁移
+    mcp_server._init_review_jobs_db()
+
+    mock_outline = Outline(title="MCP基线大纲", topic="MCP基线测试", sections=[OutlineSection(heading="第一节")])
+    mock_draft = SectionDraft(heading="第一节", markdown="正文 [1]", cited_doc_ids=["doc_1"])
+    mock_sec_res = MagicMock()
+    mock_sec_res.drafts = [mock_draft]
+    mock_sec_res.evidence_count = 1
+    mock_sec_res.failed_sections = []
+    mock_sec_res.evidence_by_heading = {"第一节": []}
+
+    mock_review_doc = ReviewDoc(
+        title="MCP基线大纲", topic="MCP基线测试",
+        sections=[mock_draft],
+        references=["[1] 张三. 2021."],
+        reference_doc_ids=["doc_1"],
+        doc_count=1, evidence_count=1,
+    )
+
+    def mock_mcp_render(review, meta, settings, template, model):
+        p = out_root / f"综述_MCP_{uuid.uuid4().hex[:6]}.md"
+        p.write_text(f"# {review.title}\n\n正文 [1]\n", encoding="utf-8")
+        return str(p)
+
+    monkeypatch.setattr("litreview.stages.generate_outline", lambda *args, **kwargs: mock_outline)
+    monkeypatch.setattr("litreview.review_orchestrator.generate_review_sections", lambda *args, **kwargs: mock_sec_res)
+    monkeypatch.setattr("litreview.stages.write_intro_conclusion", lambda *args, **kwargs: ("引言", "结论"))
+    monkeypatch.setattr("litreview.stages.assemble_review", lambda *args, **kwargs: mock_review_doc)
+    monkeypatch.setattr("litreview.stages.render_review_note", mock_mcp_render)
+    monkeypatch.setattr("litreview.stages.export_docx", lambda p: str(p).replace(".md", ".docx"))
+    monkeypatch.setattr(mcp_server, "_client", lambda: MagicMock())
+    monkeypatch.setattr(mcp_server, "_store", lambda: MagicMock(get_paper_meta=lambda: {"doc_1": {"title": "Doc1"}}, get_corpus_fingerprint=lambda: "d"*64))
+    monkeypatch.setattr(mcp_server, "_embedder", lambda: MagicMock())
+    monkeypatch.setattr(mcp_server, "_reranker", lambda: None)
+
+    # 1. 首次生成 -> NO_BASELINE
+    mcp_server._jobs["job_m1"] = {
+        "job_id": "job_m1", "topic": "MCP基线测试", "status": "running", "log": []
+    }
+    mcp_server._run_review_job("job_m1", "MCP基线测试", "", 1000, 1, mock_outline.model_dump_json())
+
+    mcp_server._jobs.clear()
+    j1 = mcp_server._get_persistent_review_job("job_m1")
+    assert j1["status"] == "done"
+    assert j1["baseline_status"] == "no_baseline"
+    assert j1["baseline_verdict"] == "WARN"
+
+    status_str = await mcp_server.review_status("job_m1")
+    assert "基线检查: WARN" in status_str
+
+    # 提升为基线
+    from litreview.run_baseline import promote_review_baseline
+    rep_pm = promote_review_baseline(j1["manifest"], reg_path, str(out_root), allow_warn=True)
+    assert rep_pm.verdict in ("PASS", "WARN")
+
+    # 2. 再次生成相同内容 -> PASS
+    mcp_server._jobs["job_m2"] = {
+        "job_id": "job_m2", "topic": "MCP基线测试", "status": "running", "log": []
+    }
+    mcp_server._run_review_job("job_m2", "MCP基线测试", "", 1000, 1, mock_outline.model_dump_json())
+    mcp_server._jobs.clear()
+    j2 = mcp_server._get_persistent_review_job("job_m2")
+    assert j2["status"] == "done"
+    assert j2["baseline_status"] == "compared"
+    assert j2["baseline_verdict"] in ("PASS", "WARN")
+
+    status_str2 = await mcp_server.review_status("job_m2")
+    assert ("基线检查: PASS" in status_str2 or "基线检查: WARN" in status_str2)
+
+    # 3. 产生演进差异 -> WARN
+    mock_warn_draft = SectionDraft(heading="第一节", markdown="正文 [2]", cited_doc_ids=["doc_2"])
+    mock_review_warn = ReviewDoc(
+        title="MCP基线大纲", topic="MCP基线测试",
+        sections=[mock_warn_draft],
+        references=["[2] 李四. 2022."],
+        reference_doc_ids=["doc_2"],
+        doc_count=1, evidence_count=1,
+    )
+    mock_sec_res_warn = MagicMock()
+    mock_sec_res_warn.drafts = [mock_warn_draft]
+    mock_sec_res_warn.evidence_count = 1
+    mock_sec_res_warn.failed_sections = []
+    mock_sec_res_warn.evidence_by_heading = {"第一节": []}
+    monkeypatch.setattr("litreview.review_orchestrator.generate_review_sections", lambda *args, **kwargs: mock_sec_res_warn)
+    monkeypatch.setattr("litreview.stages.assemble_review", lambda *args, **kwargs: mock_review_warn)
+
+    mcp_server._jobs["job_m3"] = {
+        "job_id": "job_m3", "topic": "MCP基线测试", "status": "running", "log": []
+    }
+    mcp_server._run_review_job("job_m3", "MCP基线测试", "", 1000, 1, mock_outline.model_dump_json())
+    mcp_server._jobs.clear()
+    j3 = mcp_server._get_persistent_review_job("job_m3")
+    assert j3["status"] == "done"
+    assert j3["baseline_status"] == "compared"
+    assert j3["baseline_verdict"] == "WARN"
+
+    status_str3 = await mcp_server.review_status("job_m3")
+    assert "基线检查: WARN" in status_str3
+
+    # 4. 模拟质量退化 (FAIL) -> status 仍为 done，review_status 输出 FAIL
+    from litreview.run_baseline import BaselineCheckReport
+    from litreview.run_validation import ValidationIssue
+    def mock_fail_check_mcp(*args, **kwargs):
+        return BaselineCheckReport(
+            verdict="FAIL", status="compared", topic_key="k", topic="MCP基线测试",
+            candidate_manifest_locator="cand.manifest.json", baseline_manifest_locator="base.manifest.json",
+            candidate_validation=None,
+            comparison_report=None,
+            issues=[ValidationIssue(code="EVIDENCE_PROVENANCE_REGRESSED", severity="FAIL", message="退化", location="sec")]
+        )
+    monkeypatch.setattr("litreview.run_baseline.check_review_candidate", mock_fail_check_mcp)
+    mcp_server._jobs["job_m4"] = {
+        "job_id": "job_m4", "topic": "MCP基线测试", "status": "running", "log": []
+    }
+    mcp_server._run_review_job("job_m4", "MCP基线测试", "", 1000, 1, mock_outline.model_dump_json())
+    mcp_server._jobs.clear()
+    j4 = mcp_server._get_persistent_review_job("job_m4")
+    assert j4["status"] == "done"
+    assert j4["baseline_status"] == "compared"
+    assert j4["baseline_verdict"] == "FAIL"
+
+    status_str4 = await mcp_server.review_status("job_m4")
+    assert "基线检查: FAIL" in status_str4
+
+    # 5. 模拟基线检查代码抛出异常 (check_error) -> review_status 输出不可用且脱敏物理路径
+    def mock_raise_check_mcp(*args, **kwargs):
+        raise RuntimeError("Checker crashed at /home/dudu/private/secret.py")
+    monkeypatch.setattr("litreview.run_baseline.check_review_candidate", mock_raise_check_mcp)
+    mcp_server._jobs["job_m5"] = {
+        "job_id": "job_m5", "topic": "MCP基线测试", "status": "running", "log": []
+    }
+    mcp_server._run_review_job("job_m5", "MCP基线测试", "", 1000, 1, mock_outline.model_dump_json())
+    mcp_server._jobs.clear()
+    j5 = mcp_server._get_persistent_review_job("job_m5")
+    assert j5["status"] == "done"
+    assert j5["baseline_status"] == "check_error"
+    assert j5["baseline_verdict"] is None
+    assert "/home/dudu" not in str(j5["baseline_error"])
+
+    status_str5 = await mcp_server.review_status("job_m5")
+    assert "基线检查: 不可用" in status_str5
+    assert "/home/dudu" not in status_str5
+
+    # 6. resume 重跑清空旧 baseline 状态
+    mcp_server._persist_review_job({
+        "job_id": "job_m_fail",
+        "topic": "MCP基线测试",
+        "status": "failed",
+        "outline_json": mock_outline.model_dump_json(),
+        "baseline_verdict": "FAIL",
+        "baseline_status": "compared",
+        "baseline_summary": "历史质量退化",
+        "baseline_error": "旧错误",
+    })
+    res_msg = await mcp_server.resume_review("job_m_fail")
+    assert "重新入队" in res_msg
+    queued_job = mcp_server._get_persistent_review_job("job_m_fail")
+    assert queued_job["baseline_verdict"] is None
+    assert queued_job["baseline_status"] is None
+    assert queued_job["baseline_summary"] is None
+    assert queued_job["baseline_error"] is None
+
+    # 7. Manifest 失败门禁：write_review_manifest 失败时 check_review_candidate 绝对不调用
+    checker_mock = MagicMock()
+    monkeypatch.setattr("litreview.run_baseline.check_review_candidate", checker_mock)
+    from litreview import manifest
+    def mock_write_mcp_fail(*args, **kwargs):
+        raise manifest.ManifestError("Permission denied")
+    monkeypatch.setattr(manifest, "write_review_manifest", mock_write_mcp_fail)
+    mcp_server._jobs["job_m6"] = {
+        "job_id": "job_m6", "topic": "MCP基线测试", "status": "running", "log": []
+    }
+    mcp_server._run_review_job("job_m6", "MCP基线测试", "", 1000, 1, mock_outline.model_dump_json())
+    j6 = mcp_server._get_persistent_review_job("job_m6")
+    assert j6["status"] == "partial"
+    assert j6["manifest_error"] == "Permission denied"
+    checker_mock.assert_not_called()

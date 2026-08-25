@@ -948,6 +948,40 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             manifest_err = str(exc)
             log(f"⚠️ Manifest 运行清单生成失败 (Markdown 文件已正常保存): {exc}")
 
+        baseline_verdict = None
+        baseline_status = None
+        baseline_summary = None
+        baseline_error = None
+        if manifest_path and os.path.exists(manifest_path):
+            try:
+                from litreview.run_baseline import check_review_candidate
+                chk_report = check_review_candidate(
+                    candidate_manifest_path=manifest_path,
+                    registry_path=settings.REVIEW_BASELINE_REGISTRY_PATH,
+                    output_root=settings.REVIEW_OUTPUT_DIR,
+                )
+                baseline_verdict = chk_report.verdict
+                baseline_status = chk_report.status
+                if chk_report.status == "no_baseline":
+                    baseline_summary = "无已注册基线（首次生成）"
+                elif chk_report.verdict == "PASS":
+                    baseline_summary = "基线比对通过"
+                elif chk_report.verdict == "WARN":
+                    baseline_summary = "基线比对存在演进差异"
+                elif chk_report.status == "candidate_invalid":
+                    baseline_summary = "候选清单校验未通过"
+                elif chk_report.status == "baseline_invalid":
+                    baseline_summary = "基线注册表或基线文件损坏"
+                else:
+                    baseline_summary = "检测到基线质量退化"
+                log(f"🛡️ 自动基线检查完成: {chk_report.verdict} ({chk_report.status}) - {baseline_summary}")
+            except Exception as b_exc:
+                from litreview.run_validation import _sanitize_path_in_str
+                baseline_status = "check_error"
+                baseline_summary = "基线检查异常"
+                baseline_error = _sanitize_path_in_str(str(b_exc))
+                log(f"⚠️ 自动基线检查异常: {baseline_error}")
+
         elapsed = int(time.time() - t0)
         with _jobs_lock:
             job["status"] = "partial" if manifest_err else "done"
@@ -959,14 +993,21 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             job["filename_md"] = os.path.basename(out_path) if out_path else ""
             job["filename_docx"] = os.path.basename(docx_path) if docx_path else ""
             job["filename_manifest"] = os.path.basename(manifest_path) if manifest_path else ""
-            if manifest_err:
-                job["manifest_error"] = manifest_err
+            job["manifest_error"] = manifest_err
+            job["baseline_verdict"] = baseline_verdict
+            job["baseline_status"] = baseline_status
+            job["baseline_summary"] = baseline_summary
+            job["baseline_error"] = baseline_error
             job["doc_count"] = review.doc_count
             job["evidence_count"] = review.evidence_count
             job["elapsed_seconds"] = elapsed
             
         if manifest_err:
             log(f"⚠️ 综述正文与 Word 已生成，但运行清单生成失败: {manifest_err}")
+        elif baseline_verdict == "FAIL":
+            log(f"⚠️ 综述生成完成，但基线检查发现质量退化或基线损坏: {baseline_summary}")
+        elif baseline_status == "check_error":
+            log(f"⚠️ 综述生成完成，但自动基线检查异常: {baseline_error}")
         else:
             log(f"🎉 综述生成完毕！使用模型 {model}，引用文献 {review.doc_count} 篇，引用证据 {review.evidence_count} 条，总耗时 {elapsed} 秒。")
         status_tag = "partial" if manifest_err else "success"
@@ -974,7 +1015,11 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                       extra={"topic": topic, "sections": len(review.sections),
                              "cited_docs": review.doc_count, "elapsed_s": elapsed,
                              "output": out_path, "docx": docx_path, "manifest": manifest_path,
-                             "manifest_error": manifest_err, "model": model})
+                             "manifest_error": manifest_err, "model": model,
+                             "baseline_verdict": baseline_verdict,
+                             "baseline_status": baseline_status,
+                             "baseline_summary": baseline_summary,
+                             "baseline_error": baseline_error})
     except Exception as e:
         logger.error(f"综述生成失败: {e}\n{traceback.format_exc()}")
         with _jobs_lock:
@@ -1012,8 +1057,15 @@ async def api_review_generate(request: Request) -> JSONResponse:
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "output_md": "",
             "output_docx": "",
+            "output_manifest": "",
             "filename_md": "",
             "filename_docx": "",
+            "filename_manifest": "",
+            "manifest_error": None,
+            "baseline_verdict": None,
+            "baseline_status": None,
+            "baseline_summary": None,
+            "baseline_error": None,
             "error": ""
         }
         
@@ -1079,8 +1131,14 @@ async def api_review_job_stream(request: Request) -> StreamingResponse:
                 "new_logs": new_logs,
                 "output_md": job.get("output_md"),
                 "output_docx": job.get("output_docx"),
+                "output_manifest": job.get("output_manifest"),
                 "filename_md": job.get("filename_md"),
                 "filename_docx": job.get("filename_docx"),
+                "filename_manifest": job.get("filename_manifest"),
+                "baseline_verdict": job.get("baseline_verdict"),
+                "baseline_status": job.get("baseline_status"),
+                "baseline_summary": job.get("baseline_summary"),
+                "baseline_error": job.get("baseline_error"),
                 "error": job.get("error")
             }
             

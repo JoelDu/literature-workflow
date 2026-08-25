@@ -623,3 +623,263 @@ def test_canonical_topic_whitespace_casefold_nfkc_equivalence_in_check_and_compa
     assert rep_cmp_direct.verdict == "FAIL"
     assert rep_cmp_direct.same_topic is False
     assert any(iss.code == "TOPIC_MISMATCH" for iss in rep_cmp_direct.issues)
+
+
+def _worker_promote_helper(m_path: str, reg_path: str, out_root: str) -> str:
+    from litreview.run_baseline import promote_review_baseline
+    rep = promote_review_baseline(m_path, reg_path, out_root)
+    return rep.verdict
+
+
+def test_cross_process_concurrent_promote_preserves_both_topics(tmp_path):
+    """测试跨进程同时提升两个不同主题的基线：并发锁机制保证两项都在且注册表自洽无损。"""
+    out_root = tmp_path / "reviews"
+    out_root.mkdir()
+    reg_path = str(out_root / "baselines.registry.json")
+
+    m1, _, _ = _create_synthetic_run(out_root / "topic1", run_id="r1", topic="并发主题一")
+    m2, _, _ = _create_synthetic_run(out_root / "topic2", run_id="r2", topic="并发主题二")
+
+    import concurrent.futures
+    with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_worker_promote_helper, m1, reg_path, str(out_root))
+        f2 = executor.submit(_worker_promote_helper, m2, reg_path, str(out_root))
+        v1 = f1.result()
+        v2 = f2.result()
+
+    assert v1 == "PASS"
+    assert v2 == "PASS"
+
+    rep_ls = list_review_baselines(reg_path, str(out_root))
+    assert rep_ls.verdict == "PASS"
+    assert rep_ls.total_baselines == 2
+    topics = {b.topic for b in rep_ls.baselines}
+    assert "并发主题一" in topics
+    assert "并发主题二" in topics
+
+
+def test_promote_lock_timeout_fails_safely_and_preserves_registry(tmp_path):
+    """测试跨进程文件锁超时：安全早退 FAIL (REGISTRY_LOCK_TIMEOUT)，旧注册表完整无损坏。"""
+    import fcntl
+    import time
+    from litreview.run_baseline import _acquire_registry_lock
+
+    out_root = tmp_path / "reviews"
+    out_root.mkdir()
+    reg_path = str(out_root / "baselines.registry.json")
+
+    m1, _, _ = _create_synthetic_run(out_root / "topic1", run_id="r1", topic="主题一")
+    rep1 = promote_review_baseline(m1, reg_path, str(out_root))
+    assert rep1.verdict == "PASS"
+
+    m2, _, _ = _create_synthetic_run(out_root / "topic2", run_id="r2", topic="主题二")
+
+    # 手动持有跨进程排他锁模拟竞争
+    lock_path = reg_path + ".lock"
+    lock_f = open(lock_path, "a+", encoding="utf-8")
+    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    try:
+        # 1. 真实验证 _acquire_registry_lock 抛出 TimeoutError 且耗时有界
+        t_start = time.time()
+        with pytest.raises(TimeoutError):
+            with _acquire_registry_lock(reg_path, timeout_seconds=0.1):
+                pass
+        t_dur = time.time() - t_start
+        assert 0.08 <= t_dur < 1.0
+
+        # 2. 真实验证 promote_review_baseline 接收到锁超时安全返回 FAIL (REGISTRY_LOCK_TIMEOUT)
+        rep2 = promote_review_baseline(m2, reg_path, str(out_root), lock_timeout_seconds=0.1)
+        assert rep2.verdict == "FAIL"
+        assert any(iss.code == "REGISTRY_LOCK_TIMEOUT" for iss in rep2.issues)
+    finally:
+        # 释放锁
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        lock_f.close()
+
+    # 3. 验证锁释放后可立即正常获取锁并写入
+    with _acquire_registry_lock(reg_path, timeout_seconds=0.5):
+        pass
+
+    # 4. 验证原有注册表完好无损，仅有主题一
+    rep_ls = list_review_baselines(reg_path, str(out_root))
+    assert rep_ls.verdict == "PASS"
+    assert rep_ls.total_baselines == 1
+    assert rep_ls.baselines[0].topic == "主题一"
+
+
+def test_cli_generate_baseline_check_banners_and_exit_semantics(tmp_path, monkeypatch):
+    """测试 CLI cmd_generate 真实生成链路中 5 种基线检查结果的展示语义、事件记录及 Manifest 失败门禁。"""
+    import argparse
+    import time
+    from unittest.mock import MagicMock
+
+    out_root = tmp_path / "reviews"
+    out_root.mkdir()
+    reg_path = str(out_root / "baselines.registry.json")
+    db_path = str(tmp_path / "cli_test.db")
+
+    # 1. 在 import review 前隔离环境变量与单例缓存，彻底消除进程级 settings 污染
+    import utils
+    old_cached_settings = getattr(utils, "_settings", None)
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("REVIEW_OUTPUT_DIR", str(out_root))
+    monkeypatch.setenv("REVIEW_BASELINE_REGISTRY_PATH", reg_path)
+    utils._settings = None
+
+    try:
+        import review
+        from litreview.models import Outline, OutlineSection, SectionDraft, ReviewDoc
+
+        # review 可能已被更早的测试导入；同时覆盖其模块级 settings，避免复用旧注册表。
+        monkeypatch.setattr(review.settings, "DB_PATH", db_path)
+        monkeypatch.setattr(review.settings, "REVIEW_OUTPUT_DIR", str(out_root))
+        monkeypatch.setattr(review.settings, "REVIEW_BASELINE_REGISTRY_PATH", reg_path)
+
+        # cmd_generate 在函数内导入该符号；先替换模块属性，避免构造真实客户端。
+        monkeypatch.setattr("openai.OpenAI", lambda *args, **kwargs: MagicMock())
+
+        events = []
+        def mock_log_event(mode, event, title, status, extra=None):
+            events.append({"mode": mode, "event": event, "title": title, "status": status, "extra": extra or {}})
+        monkeypatch.setattr(review, "log_run_event", mock_log_event)
+
+        mock_store = MagicMock()
+        mock_store.get_corpus_fingerprint.return_value = "e" * 64
+        mock_store.get_paper_meta.return_value = {"doc_1": {"title": "Doc1"}}
+        monkeypatch.setattr("litreview.store.VectorStore", lambda path, dim=None: mock_store)
+        monkeypatch.setattr(review, "_make_client", lambda: (MagicMock(), "gpt-5.4"))
+        monkeypatch.setattr(review, "_require_siliconflow", lambda: None)
+        monkeypatch.setattr(review, "_make_embedder", lambda client: MagicMock())
+        monkeypatch.setattr(review, "_make_reranker", lambda: None)
+
+        mock_outline = Outline(title="CLI测试综述", topic="CLI测试主题", sections=[OutlineSection(heading="第一节")])
+        mock_draft = SectionDraft(heading="第一节", markdown="正文 [1]", cited_doc_ids=["doc_1"])
+        mock_sec_res = MagicMock()
+        mock_sec_res.drafts = [mock_draft]
+        mock_sec_res.evidence_count = 1
+        mock_sec_res.failed_sections = []
+        mock_sec_res.evidence_by_heading = {"第一节": []}
+
+        mock_review_doc = ReviewDoc(
+            title="CLI测试综述", topic="CLI测试主题",
+            sections=[mock_draft],
+            references=["[1] 张三. 2021."],
+            reference_doc_ids=["doc_1"],
+            doc_count=1, evidence_count=1,
+        )
+
+        def mock_render(rev, meta, settings, template, model):
+            p = out_root / f"综述_CLI_{time.time_ns()}.md"
+            p.write_text("# CLI测试综述\n\n正文 [1]\n", encoding="utf-8")
+            return str(p)
+
+        monkeypatch.setattr("litreview.stages.generate_outline", lambda *args, **kwargs: mock_outline)
+        monkeypatch.setattr("litreview.review_orchestrator.generate_review_sections", lambda *args, **kwargs: mock_sec_res)
+        monkeypatch.setattr("litreview.stages.write_intro_conclusion", lambda *args, **kwargs: ("引言", "结论"))
+        monkeypatch.setattr("litreview.stages.assemble_review", lambda *args, **kwargs: mock_review_doc)
+        monkeypatch.setattr("litreview.stages.render_review_note", mock_render)
+        monkeypatch.setattr("litreview.stages.export_docx", lambda p: str(p).replace(".md", ".docx"))
+
+        base_args = argparse.Namespace(
+            topic="CLI测试主题", focus="", words=1000, sections=1, lang="zh",
+            outline=None, dry_run=False, thesis="", gap="", logic=""
+        )
+
+        # 1. 首次运行 -> NO_BASELINE (WARN)
+        events.clear()
+        review.cmd_generate(base_args)
+        assert len(events) == 1
+        e1 = events[0]
+        assert e1["status"] == "success"
+        assert e1["extra"]["baseline_verdict"] == "WARN"
+        assert e1["extra"]["baseline_status"] == "no_baseline"
+        m1_path = e1["extra"]["manifest"]
+        assert os.path.exists(m1_path)
+
+        # 提升首次运行为基线
+        rep_pm = promote_review_baseline(m1_path, reg_path, str(out_root), allow_warn=True)
+        assert rep_pm.verdict in ("PASS", "WARN")
+
+        # 2. 再次运行相同内容 -> compared (PASS)
+        events.clear()
+        review.cmd_generate(base_args)
+        assert len(events) == 1
+        e2 = events[0]
+        assert e2["status"] == "success"
+        assert e2["extra"]["baseline_status"] == "compared"
+        assert e2["extra"]["baseline_verdict"] in ("PASS", "WARN")
+
+        # 3. 产生演进差异 (WARN)
+        mock_warn_draft = SectionDraft(heading="第一节", markdown="正文 [2]", cited_doc_ids=["doc_2"])
+        mock_sec_res_warn = MagicMock()
+        mock_sec_res_warn.drafts = [mock_warn_draft]
+        mock_sec_res_warn.evidence_count = 1
+        mock_sec_res_warn.failed_sections = []
+        mock_sec_res_warn.evidence_by_heading = {"第一节": []}
+        mock_review_warn = ReviewDoc(
+            title="CLI测试综述", topic="CLI测试主题",
+            sections=[mock_warn_draft],
+            references=["[2] 李四. 2022."],
+            reference_doc_ids=["doc_2"],
+            doc_count=1, evidence_count=1,
+        )
+        monkeypatch.setattr("litreview.review_orchestrator.generate_review_sections", lambda *args, **kwargs: mock_sec_res_warn)
+        monkeypatch.setattr("litreview.stages.assemble_review", lambda *args, **kwargs: mock_review_warn)
+        events.clear()
+        review.cmd_generate(base_args)
+        assert len(events) == 1
+        e3 = events[0]
+        assert e3["status"] == "success"
+        assert e3["extra"]["baseline_status"] == "compared"
+        assert e3["extra"]["baseline_verdict"] == "WARN"
+
+        # 4. 模拟质量退化 (FAIL) -> 生成本身仍 success，但 baseline_verdict=FAIL
+        def mock_fail_check(*args, **kwargs):
+            from litreview.run_baseline import BaselineCheckReport
+            from litreview.run_validation import ValidationIssue
+            return BaselineCheckReport(
+                verdict="FAIL", status="compared", topic_key="k", topic="CLI测试主题",
+                candidate_manifest_locator="cand.manifest.json", baseline_manifest_locator="base.manifest.json",
+                candidate_validation=None,
+                comparison_report=None,
+                issues=[ValidationIssue(code="EVIDENCE_PROVENANCE_REGRESSED", severity="FAIL", message="退化", location="sec")]
+            )
+        monkeypatch.setattr("litreview.run_baseline.check_review_candidate", mock_fail_check)
+        events.clear()
+        review.cmd_generate(base_args)
+        assert len(events) == 1
+        e4 = events[0]
+        assert e4["status"] == "success"
+        assert e4["extra"]["baseline_verdict"] == "FAIL"
+        assert e4["extra"]["baseline_status"] == "compared"
+
+        # 5. 模拟基线检查自身抛出异常 (check_error) -> 生成仍 success，baseline_status=check_error，路径脱敏
+        def mock_raise_check(*args, **kwargs):
+            raise RuntimeError("Fake checker crash at /home/dudu/private/secret.py")
+        monkeypatch.setattr("litreview.run_baseline.check_review_candidate", mock_raise_check)
+        events.clear()
+        review.cmd_generate(base_args)
+        assert len(events) == 1
+        e5 = events[0]
+        assert e5["status"] == "success"
+        assert e5["extra"]["baseline_status"] == "check_error"
+        assert e5["extra"]["baseline_verdict"] is None
+        assert "/home/dudu" not in str(e5["extra"]["baseline_error"])
+
+        # 6. 门禁验证：当 write_review_manifest 失败时，check_review_candidate 绝对不被调用 (0 调用)
+        checker_mock = MagicMock()
+        monkeypatch.setattr("litreview.run_baseline.check_review_candidate", checker_mock)
+        from litreview import manifest
+        def mock_write_manifest_fail(*args, **kwargs):
+            raise manifest.ManifestError("Permission denied")
+        monkeypatch.setattr(manifest, "write_review_manifest", mock_write_manifest_fail)
+        events.clear()
+        review.cmd_generate(base_args)
+        assert len(events) == 1
+        e6 = events[0]
+        assert e6["status"] == "partial"
+        assert e6["extra"]["manifest_error"] == "Permission denied"
+        checker_mock.assert_not_called()
+    finally:
+        utils._settings = old_cached_settings

@@ -192,7 +192,7 @@ python review.py baseline-list [--json] # 【基线列表】查看注册表中�
 生成参数与运行审计说明：
 - `validate-run`：严格只读校验单次综述 `.manifest.json` 侧车清单的完整性、产物哈希真实性与质量门状态（退出码 0=PASS, 1=WARN, 2=FAIL）；
 - `compare-runs`：对比两次综述运行清单（同主题），客观判定质量门退化与证据溯源降级，并输出引用集合 Jaccard 相似度与演进 Delta；
-- `baseline-promote` / `baseline-check` / `baseline-list`（Phase 1C-A）：可信基线注册表深模块与 CLI 闭环，支持主题指纹标准化（NFKC+casefold+SHA256）、基线原子替换、候选自动基线巡检与防路径逃逸。当前为深模块与 CLI 闭环，暂未自动接入 Web/MCP；
+- `baseline-promote` / `baseline-check` / `baseline-list`（Phase 1C）：可信基线注册表深模块与 CLI 闭环，支持主题指纹标准化（NFKC+casefold+SHA256）、跨进程并发锁 (`fcntl.flock`)、基线原子替换、候选自动基线巡检与防路径逃逸；已在 CLI `generate`、Web 生成工作流与 MCP `_run_review_job` 自动接入（Phase 1C-B），实现基线状态与生成状态解耦；
 - `propose`：大纲前置人机对齐，基于本地馆藏扫描 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 6 种主线分类逻辑）；
 - `--thesis`：一句话核心学术论点（作者要论证的核心判断，绝非进展流水账）；
 - `--gap`：一句话学术缺口/痛点（直击现有研究未做透、存在争议的关键矛盾）；
