@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 from litreview.ref_parser import normalize_title, extract_first_author_surname
+from litreview.sqlite_runtime import connect_sqlite
 
 
 @dataclass
@@ -126,7 +127,7 @@ END;
 def init_cache_db(cache_db_path: str) -> None:
     """初始化独立外部发现缓存数据库。"""
     os.makedirs(os.path.dirname(os.path.abspath(cache_db_path)), exist_ok=True)
-    conn = sqlite3.connect(cache_db_path)
+    conn = connect_sqlite(cache_db_path, foreign_keys=True)
     conn.executescript(CACHE_DB_DDL)
     conn.commit()
     conn.close()
@@ -807,7 +808,7 @@ def expand_citations(
 
     try:
         init_cache_db(cache_db_path)
-        conn = sqlite3.connect(cache_db_path)
+        conn = connect_sqlite(cache_db_path, foreign_keys=True)
         conn.execute("""
             INSERT INTO discovery_runs (
                 query_run_id, seeds_json, direction, depth,

@@ -13,6 +13,7 @@ from datetime import datetime
 import numpy as np
 
 from db_schema import ensure_papers_table
+from litreview.sqlite_runtime import connect_sqlite
 
 
 @dataclass
@@ -40,12 +41,7 @@ class VectorStore:
             self.ensure_schema()
 
     def _conn(self) -> sqlite3.Connection:
-        if self.readonly:
-            conn = sqlite3.connect(f"file:{os.path.abspath(self.db_path)}?mode=ro", uri=True)
-        else:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("PRAGMA busy_timeout=30000")  # 与守护进程并发写时等待而非报错
-        return conn
+        return connect_sqlite(self.db_path, readonly=self.readonly)
 
     def ensure_schema(self) -> None:
         conn = self._conn()

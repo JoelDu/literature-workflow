@@ -12,6 +12,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 
 from litreview.graph_schema import GRAPH_SCHEMA_DDL, init_graph_schema
+from litreview.sqlite_runtime import connect_sqlite
 from litreview.ref_parser import (
     parse_reference_mention,
     normalize_title,
@@ -28,10 +29,10 @@ def build_test_citation_network_db(
         os.remove(test_db_path)
     os.makedirs(os.path.dirname(os.path.abspath(test_db_path)), exist_ok=True)
 
-    test_conn = sqlite3.connect(test_db_path)
+    test_conn = connect_sqlite(test_db_path)
     init_graph_schema(test_conn)
 
-    prod_conn = sqlite3.connect(f"file:{prod_db_path}?mode=ro", uri=True)
+    prod_conn = connect_sqlite(prod_db_path, readonly=True)
     prod_c = prod_conn.cursor()
 
     now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

@@ -24,6 +24,7 @@ from dotenv import dotenv_values
 from litreview.ref_parser import parse_reference_mention, normalize_title, extract_first_author_surname
 from litreview.chunker import split_markdown
 from litreview.snowball import init_cache_db
+from litreview.sqlite_runtime import connect_sqlite
 
 
 def list_discovery_candidates(
@@ -516,8 +517,10 @@ def ingest_acquired_candidates(
     if not staging_dir:
         staging_dir = os.path.join(os.path.dirname(os.path.abspath(cache_db_path)), "staging_pdf")
 
-    cache_conn = sqlite3.connect(cache_db_path)
-    test_conn = sqlite3.connect(test_db_path)
+    cache_conn = connect_sqlite(cache_db_path, foreign_keys=True)
+    # Old graph snapshots can contain orphan assertions.  The shadow repair
+    # enables FK enforcement only after validating the replacement database.
+    test_conn = connect_sqlite(test_db_path, foreign_keys=False)
     _ensure_vector_tables_in_test_db(test_conn)
 
     now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

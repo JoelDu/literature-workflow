@@ -47,6 +47,7 @@ sys.stdout, sys.stderr = _real_stdout, _real_stderr
 from rich.console import Console
 from mcp.server.fastmcp import FastMCP
 from litreview.locator import get_locator
+from litreview.sqlite_runtime import connect_sqlite
 
 # 类型词表：工具描述里的类型名、corpus 校验、结果标签全部从这里取，
 # 加一种文献类型只改 doctype.py。纯正则模块，导入不带重依赖。
@@ -70,14 +71,7 @@ logger.info(f"MCP server 启动中 (pid={os.getpid()}, cwd={os.getcwd()}, "
 
 def _get_db_conn(db_path: str = None, readonly: bool = False) -> sqlite3.Connection:
     """获取配置了 WAL 并发模式与 30s 忙超时的健壮 SQLite 连接。"""
-    path = db_path or settings.DB_PATH
-    if readonly:
-        conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
-    else:
-        conn = sqlite3.connect(path, timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+    return connect_sqlite(db_path or settings.DB_PATH, readonly=readonly)
 
 
 def retry_on_db_locked(max_retries=5, initial_delay=0.1):

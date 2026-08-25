@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from litreview.graph_domain import CitationEdgeStatus
+from litreview.sqlite_runtime import connect_sqlite
 
 
 @dataclass(frozen=True)
@@ -49,10 +50,8 @@ class DatabaseHealthReport:
 
 
 def _readonly(path: str) -> sqlite3.Connection:
-    absolute = os.path.abspath(path)
-    conn = sqlite3.connect(f"file:{absolute}?mode=ro", uri=True)
+    conn = connect_sqlite(path, readonly=True)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -235,4 +234,3 @@ def inspect_databases(prod_db_path: str, graph_db_path: str,
         databases=tuple(summaries), issues=tuple(issues), metrics=metrics,
         generated_at=datetime.now(timezone.utc).isoformat(),
     )
-
