@@ -130,6 +130,17 @@ def cmd_db_repair_graph(args):
     console.print_json(report.to_json())
 
 
+def cmd_db_repair_production(args):
+    """Plan or explicitly apply a backed-up production micro-repair."""
+    from litreview.db_repair import repair_production_database
+
+    report = repair_production_database(
+        settings.DB_PATH, apply=args.apply, backup_path=args.backup_out,
+        excel_path=settings.EXCEL_OUTPUT_PATH,
+    )
+    console.print_json(report.to_json())
+
+
 def _make_embedder(client):
     from litreview.embedder import Embedder
     return Embedder(client, settings.EMBEDDING_MODEL, settings.EMBEDDING_DIM,
@@ -678,6 +689,11 @@ def main():
     p.add_argument("--apply", action="store_true", help="执行修复，但只写 --shadow-out 指定的新数据库")
     p.add_argument("--shadow-out", help="全新 Shadow DB 输出路径；禁止与现有图谱库相同")
     p.set_defaults(func=cmd_db_repair_graph)
+
+    p = sub.add_parser("db-repair-production", help="预演生产文本/索引/DOI 微创修复")
+    p.add_argument("--apply", action="store_true", help="显式执行；受影响正文会标为待重新嵌入")
+    p.add_argument("--backup-out", help="执行前生成的全新物理备份路径")
+    p.set_defaults(func=cmd_db_repair_production)
 
     p = sub.add_parser("search", help="检索调试")
     p.add_argument("query")

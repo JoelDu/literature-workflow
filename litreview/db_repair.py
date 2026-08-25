@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +32,23 @@ class RepairReport:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+
+
+_UNSAFE_C0 = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_DOI = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
+
+
+def sanitize_extracted_text(text: str | None) -> str:
+    """Remove unsafe C0 controls while retaining tabs and line boundaries."""
+    return _UNSAFE_C0.sub("", text or "")
+
+
+def normalize_doi(value: str | None) -> str:
+    """Normalize DOI wrappers conservatively; return empty for absent values."""
+    doi = str(value or "").strip()
+    doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*:\s*)", "", doi,
+                 flags=re.IGNORECASE)
+    return doi.rstrip(".,; ").lower()
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -96,6 +115,116 @@ def repair_graph_shadow(prod_db_path: str, graph_db_path: str, *, apply: bool = 
     finally:
         graph.close()
         prod.close()
+
+
+def repair_production_database(prod_db_path: str, *, apply: bool = False,
+                               backup_path: str | None = None,
+                               excel_path: str | None = None) -> RepairReport:
+    """Plan or perform a micro-repair that leaves affected texts pending reindex.
+
+    Apply mode requires a new physical backup path.  It never invents vectors:
+    sanitized documents lose stale chunks/cache entries and are explicitly
+    marked ``embedded=0`` for the normal indexer to rebuild later.
+    """
+    readonly = connect_sqlite(prod_db_path, readonly=True)
+    try:
+        metrics, nul_doc_ids, doi_updates = _production_plan(readonly)
+    finally:
+        readonly.close()
+    if not apply:
+        return RepairReport("production_micro_repair", False, prod_db_path, None, metrics)
+    if not backup_path:
+        raise ValueError("apply=True requires an explicit backup_path")
+    if doi_updates and not excel_path:
+        raise ValueError("DOI metadata would change; excel_path is required before apply")
+    source = os.path.realpath(prod_db_path)
+    backup = os.path.realpath(backup_path)
+    if source == backup:
+        raise ValueError("backup_path must differ from the production database")
+    if os.path.exists(backup):
+        raise FileExistsError(f"refusing to overwrite existing backup: {backup}")
+    os.makedirs(os.path.dirname(backup), exist_ok=True)
+
+    src = connect_sqlite(prod_db_path, readonly=True)
+    dst = sqlite3.connect(backup)
+    try:
+        src.backup(dst)
+        if str(dst.execute("PRAGMA quick_check").fetchone()[0]).lower() != "ok":
+            raise sqlite3.IntegrityError("physical backup quick_check failed")
+    except Exception:
+        dst.close()
+        src.close()
+        if os.path.exists(backup):
+            os.unlink(backup)
+        raise
+    dst.close()
+    src.close()
+
+    conn = connect_sqlite(prod_db_path, foreign_keys=False)
+    try:
+        with conn:
+            for doc_id in nul_doc_ids:
+                old = conn.execute("SELECT mineru_md FROM papers WHERE id=?", (doc_id,)).fetchone()[0]
+                cleaned = sanitize_extracted_text(old)
+                conn.execute("UPDATE papers SET mineru_md=? WHERE id=?", (cleaned, doc_id))
+                chunk_ids = [row[0] for row in conn.execute(
+                    "SELECT chunk_id FROM review_chunks WHERE doc_id=?", (doc_id,))]
+                if chunk_ids and "review_evidence_cache" in {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'")
+                }:
+                    marks = ",".join("?" for _ in chunk_ids)
+                    conn.execute(f"DELETE FROM review_evidence_cache WHERE chunk_id IN ({marks})",
+                                 chunk_ids)
+                conn.execute("DELETE FROM review_chunks WHERE doc_id=?", (doc_id,))
+                conn.execute("""INSERT OR REPLACE INTO review_index_meta
+                    (doc_id, md_hash, n_chunks, embedded, indexed_at)
+                    VALUES (?, ?, 0, 0, NULL)""",
+                    (doc_id, hashlib_sha256(cleaned)))
+            conn.execute("""UPDATE review_index_meta SET embedded=0
+                WHERE embedded=1 AND NOT EXISTS (
+                    SELECT 1 FROM review_chunks c
+                    WHERE c.doc_id=review_index_meta.doc_id AND c.embedding IS NOT NULL)""")
+            for doc_id, normalized in doi_updates:
+                conn.execute("UPDATE paper_details SET doi=? WHERE doc_id=?", (normalized, doc_id))
+        if str(conn.execute("PRAGMA quick_check").fetchone()[0]).lower() != "ok":
+            raise sqlite3.IntegrityError("production quick_check failed after repair")
+    finally:
+        conn.close()
+    if doi_updates:
+        from utils import sync_excel_with_db
+        metrics["excel_rows_synced"] = int(sync_excel_with_db(prod_db_path, excel_path))
+    metrics["documents_marked_pending_reindex"] = len(nul_doc_ids) + metrics["false_complete_index_docs"]
+    return RepairReport("production_micro_repair", True, prod_db_path, backup, metrics)
+
+
+def hashlib_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _production_plan(conn: sqlite3.Connection) -> tuple[dict[str, int], list[str], list[tuple[str, str]]]:
+    nul_doc_ids = [str(row[0]) for row in conn.execute(
+        "SELECT id FROM papers WHERE instr(mineru_md, char(0)) > 0")]
+    false_complete = int(conn.execute("""SELECT COUNT(*) FROM review_index_meta m
+        WHERE m.embedded=1 AND NOT EXISTS (
+            SELECT 1 FROM review_chunks c
+            WHERE c.doc_id=m.doc_id AND c.embedding IS NOT NULL)""").fetchone()[0])
+    doi_updates: list[tuple[str, str]] = []
+    invalid = 0
+    for doc_id, raw in conn.execute("""SELECT doc_id, doi FROM paper_details
+                                       WHERE doi IS NOT NULL AND trim(doi) != ''"""):
+        normalized = normalize_doi(raw)
+        if not _DOI.match(normalized):
+            invalid += 1
+        elif normalized != raw:
+            doi_updates.append((str(doc_id), normalized))
+    metrics = {
+        "documents_with_unsafe_text": len(nul_doc_ids),
+        "false_complete_index_docs": false_complete,
+        "doi_values_to_normalize": len(doi_updates),
+        "invalid_or_suspect_doi_values": invalid,
+    }
+    return metrics, nul_doc_ids, doi_updates
 
 
 def _apply_graph_repairs(prod: sqlite3.Connection, shadow: sqlite3.Connection,

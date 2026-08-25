@@ -3,7 +3,12 @@ import sqlite3
 
 import pytest
 
-from litreview.db_repair import repair_graph_shadow
+from litreview.db_repair import (
+    normalize_doi,
+    repair_graph_shadow,
+    repair_production_database,
+    sanitize_extracted_text,
+)
 from litreview.graph_schema import init_graph_schema
 
 
@@ -85,3 +90,66 @@ def test_graph_repair_refuses_live_path_or_overwrite(tmp_path):
     with pytest.raises(FileExistsError):
         repair_graph_shadow(str(prod), str(graph), apply=True, shadow_path=str(existing))
 
+
+def _production_repair_fixture(path):
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE papers(id TEXT PRIMARY KEY, mineru_md TEXT);
+        CREATE TABLE paper_details(doc_id TEXT PRIMARY KEY, doi TEXT);
+        CREATE TABLE review_chunks(
+            chunk_id INTEGER PRIMARY KEY, doc_id TEXT, content TEXT, embedding BLOB);
+        CREATE TABLE review_index_meta(
+            doc_id TEXT PRIMARY KEY, md_hash TEXT, n_chunks INTEGER,
+            embedded INTEGER, indexed_at TEXT);
+        CREATE TABLE review_evidence_cache(cache_key TEXT PRIMARY KEY, chunk_id INTEGER);
+        INSERT INTO papers VALUES ('dirty', 'a' || char(0) || char(1) || char(10) || 'b'),
+                                  ('false', 'clean');
+        INSERT INTO paper_details VALUES ('dirty','10.1000/clean'),('false','10.1000/other');
+        INSERT INTO review_chunks VALUES (1,'dirty','stale',X'00000000');
+        INSERT INTO review_index_meta VALUES ('dirty','old',1,1,'now'),('false','old',0,1,'now');
+        INSERT INTO review_evidence_cache VALUES ('cache',1);
+    """)
+    conn.commit()
+    conn.close()
+
+
+def test_sanitizers_are_deterministic_and_conservative():
+    assert sanitize_extracted_text("a\x00\x01\t\n\rb") == "a\t\n\rb"
+    assert normalize_doi(" https://doi.org/10.1000/ABC. ") == "10.1000/abc"
+
+
+def test_production_repair_is_dry_run_by_default(tmp_path):
+    prod = tmp_path / "prod.db"
+    _production_repair_fixture(prod)
+    before = prod.read_bytes()
+    report = repair_production_database(str(prod))
+    assert report.applied is False
+    assert report.metrics["documents_with_unsafe_text"] == 1
+    assert report.metrics["false_complete_index_docs"] == 1
+    assert prod.read_bytes() == before
+
+
+def test_production_repair_backs_up_and_marks_cleaned_text_pending(tmp_path):
+    prod = tmp_path / "prod.db"
+    backup = tmp_path / "prod.backup.db"
+    _production_repair_fixture(prod)
+
+    report = repair_production_database(str(prod), apply=True, backup_path=str(backup))
+
+    assert report.applied is True
+    assert backup.exists()
+    backup_conn = sqlite3.connect(backup)
+    try:
+        assert "\x00" in backup_conn.execute(
+            "SELECT mineru_md FROM papers WHERE id='dirty'").fetchone()[0]
+    finally:
+        backup_conn.close()
+    conn = sqlite3.connect(prod)
+    try:
+        assert conn.execute("SELECT mineru_md FROM papers WHERE id='dirty'").fetchone()[0] == "a\nb"
+        assert conn.execute("SELECT COUNT(*) FROM review_chunks WHERE doc_id='dirty'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM review_evidence_cache").fetchone()[0] == 0
+        assert conn.execute("SELECT embedded FROM review_index_meta WHERE doc_id='dirty'").fetchone()[0] == 0
+        assert conn.execute("SELECT embedded FROM review_index_meta WHERE doc_id='false'").fetchone()[0] == 0
+    finally:
+        conn.close()
