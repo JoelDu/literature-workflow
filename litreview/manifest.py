@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import uuid
 
 from .models import Outline, ReviewDoc, Evidence
+from .review_quality import normalize_heading
 
 
 class ManifestError(RuntimeError):
@@ -136,40 +137,66 @@ def _build_section_evidence_tree(
     sections: list[Any],
     evidence_by_heading: Mapping[str, list[Evidence] | None]
 ) -> list[dict[str, Any]]:
-    """装配按章节证据树；精细区分 missing_mapping、legacy_checkpoint 与 complete 状态。"""
+    """装配按章节证据树；精细区分 missing_mapping、legacy_checkpoint 与 complete 状态。
+    严格执行 Fail-Closed：规范化标题仅在唯一时 fallback 映射；若出现碰撞，拒绝猜测并标为 unavailable_missing_mapping。
+    """
+    evidence_map = evidence_by_heading or {}
+
+    # 1. 统计每个规范化标题对应的原始键集合
+    norm_to_raw_keys: dict[str, list[str]] = {}
+    for raw_k in evidence_map:
+        norm_k = normalize_heading(raw_k)
+        norm_to_raw_keys.setdefault(norm_k, []).append(raw_k)
+
+    # 2. 仅当规范化键唯一无歧义时才允许 fallback 映射
+    unique_norm_evidence_map: dict[str, list[Evidence] | None] = {}
+    for norm_k, raw_keys in norm_to_raw_keys.items():
+        if len(raw_keys) == 1:
+            unique_norm_evidence_map[norm_k] = evidence_map[raw_keys[0]]
+
     tree = []
     for sec in sections:
-        heading = getattr(sec, "heading", "") or ""
+        raw_heading = getattr(sec, "heading", "") or ""
+        norm_heading = normalize_heading(raw_heading)
         cited_ids = getattr(sec, "cited_doc_ids", []) or []
 
-        if heading not in evidence_by_heading:
+        # 优先精确原始标题命中；若无精确命中，仅在规范化键唯一时 fallback
+        if raw_heading in evidence_map:
+            has_mapping = True
+            ev_list = evidence_map[raw_heading]
+        elif norm_heading in unique_norm_evidence_map:
+            has_mapping = True
+            ev_list = unique_norm_evidence_map[norm_heading]
+        else:
+            has_mapping = False
+            ev_list = None
+
+        if not has_mapping:
             status = "unavailable_missing_mapping"
             chunks = []
+        elif ev_list is None:
+            status = "unavailable_legacy_checkpoint"
+            chunks = []
+        elif not ev_list:
+            status = "complete" if cited_ids else "empty"
+            chunks = []
         else:
-            ev_list = evidence_by_heading[heading]
-            if ev_list is None:
-                status = "unavailable_legacy_checkpoint"
-                chunks = []
-            elif not ev_list:
-                status = "complete" if cited_ids else "empty"
-                chunks = []
-            else:
-                status = "complete"
-                chunks = []
-                for ev in ev_list:
-                    summary_raw = str(getattr(ev, "summary", "") or "")
-                    summary_hash = hashlib.sha256(summary_raw.encode("utf-8")).hexdigest()
-                    chunks.append({
-                        "chunk_id": int(getattr(ev, "chunk_id", 0)),
-                        "doc_id": str(getattr(ev, "doc_id", "")),
-                        "score": int(getattr(ev, "score", 0)),
-                        "summary_hash": summary_hash,
-                        "retrieval_score": float(getattr(ev, "retrieval_score", 0.0) or 0.0),
-                        "section_title": str(getattr(ev, "section_title", "") or ""),
-                    })
+            status = "complete"
+            chunks = []
+            for ev in ev_list:
+                summary_raw = str(getattr(ev, "summary", "") or "")
+                summary_hash = hashlib.sha256(summary_raw.encode("utf-8")).hexdigest()
+                chunks.append({
+                    "chunk_id": int(getattr(ev, "chunk_id", 0)),
+                    "doc_id": str(getattr(ev, "doc_id", "")),
+                    "score": int(getattr(ev, "score", 0)),
+                    "summary_hash": summary_hash,
+                    "retrieval_score": float(getattr(ev, "retrieval_score", 0.0) or 0.0),
+                    "section_title": str(getattr(ev, "section_title", "") or ""),
+                })
 
         tree.append({
-            "heading": heading,
+            "heading": raw_heading,
             "evidence_status": status,
             "cited_doc_ids": list(cited_ids),
             "chunks": chunks,

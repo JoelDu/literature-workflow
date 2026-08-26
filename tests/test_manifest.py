@@ -367,11 +367,38 @@ def test_manifest_sha256_exact_match(tmp_path):
     assert data["artifacts"]["docx_sha256"] == expected_docx_sha256
 
 
+def _prepare_mcp_server(monkeypatch, tmp_path, test_db=None, out_root=None, reg_path=None):
+    """隔离 mcp_server 的环境与 settings 缓存，确保首次或重载导入时日志与数据库均落在 tmp_path。"""
+    if test_db is None:
+        test_db = str(tmp_path / "mcp_test.db")
+    if out_root is None:
+        out_root = str(tmp_path / "reviews")
+    if reg_path is None:
+        reg_path = str(tmp_path / "reviews" / "baselines.registry.json")
+
+    os.makedirs(os.path.dirname(os.path.abspath(test_db)), exist_ok=True)
+    os.makedirs(out_root if isinstance(out_root, str) else str(out_root), exist_ok=True)
+
+    monkeypatch.setenv("DB_PATH", str(test_db))
+    monkeypatch.setenv("REVIEW_OUTPUT_DIR", str(out_root))
+    monkeypatch.setenv("REVIEW_BASELINE_REGISTRY_PATH", str(reg_path))
+    monkeypatch.setattr("utils._settings", None, raising=False)
+
+    import mcp_server
+    if hasattr(mcp_server, "settings"):
+        monkeypatch.setattr(mcp_server.settings, "DB_PATH", str(test_db), raising=False)
+        monkeypatch.setattr(mcp_server.settings, "REVIEW_OUTPUT_DIR", str(out_root), raising=False)
+        monkeypatch.setattr(mcp_server.settings, "REVIEW_BASELINE_REGISTRY_PATH", str(reg_path), raising=False)
+
+    mcp_server._review_jobs_db_initialized.clear()
+    mcp_server._review_jobs_db_recovered.clear()
+    return mcp_server
+
+
 @pytest.mark.anyio
 async def test_mcp_server_review_jobs_persistence_and_recovery(tmp_path, monkeypatch):
     """测试 MCP review_jobs 数据库表的向后兼容迁移、持久化与跨重启回读（完全隔离在 tmp_path）。"""
     test_db = str(tmp_path / "mcp_isolated.db")
-    monkeypatch.setenv("DB_PATH", test_db)
 
     # 1. 模拟旧版本数据库（无 manifest_path 和 manifest_error 列）
     conn = sqlite3.connect(test_db)
@@ -404,11 +431,8 @@ async def test_mcp_server_review_jobs_persistence_and_recovery(tmp_path, monkeyp
     conn.commit()
     conn.close()
 
-    # 2. 导入并初始化 mcp_server（会触发安全增量 DDL 迁移）
-    import mcp_server
-    monkeypatch.setattr(mcp_server.settings, "DB_PATH", test_db)
-    mcp_server._review_jobs_db_initialized.clear()
-    mcp_server._review_jobs_db_recovered.clear()
+    # 2. 导入并初始化 mcp_server（隔离 settings，触发安全增量 DDL 迁移）
+    mcp_server = _prepare_mcp_server(monkeypatch, tmp_path, test_db=test_db)
     mcp_server._init_review_jobs_db()
 
     # 验证旧任务回读（manifest_path 为空字符串，不报错）
@@ -536,12 +560,7 @@ def test_rerank_model_settings_consistency():
 async def test_mcp_server_resume_chain_clears_stale_manifest_error(tmp_path, monkeypatch):
     """测试 MCP partial 任务带历史 manifest_error 时，resume 重跑成功后能彻底清除旧错误，并在跨重启回读后为 done 与新清单。"""
     test_db = str(tmp_path / "mcp_resume_test.db")
-    monkeypatch.setenv("DB_PATH", test_db)
-
-    import mcp_server
-    monkeypatch.setattr(mcp_server.settings, "DB_PATH", test_db)
-    mcp_server._review_jobs_db_initialized.clear()
-    mcp_server._review_jobs_db_recovered.clear()
+    mcp_server = _prepare_mcp_server(monkeypatch, tmp_path, test_db=test_db)
     mcp_server._init_review_jobs_db()
 
     mock_outline = Outline(title="续跑大纲", topic="续跑综述", sections=[OutlineSection(heading="第一节")])
@@ -625,12 +644,7 @@ async def test_mcp_server_resume_chain_clears_stale_manifest_error(tmp_path, mon
 async def test_mcp_server_review_status_sanitizes_absolute_path_in_partial_error(tmp_path, monkeypatch):
     """测试 MCP 任务在 manifest 生成失败时，review_status 输出全文脱敏，绝不泄露 /home/... 物理绝对路径。"""
     test_db = str(tmp_path / "mcp_sanitize_test.db")
-    monkeypatch.setenv("DB_PATH", test_db)
-
-    import mcp_server
-    monkeypatch.setattr(mcp_server.settings, "DB_PATH", test_db)
-    mcp_server._review_jobs_db_initialized.clear()
-    mcp_server._review_jobs_db_recovered.clear()
+    mcp_server = _prepare_mcp_server(monkeypatch, tmp_path, test_db=test_db)
     mcp_server._init_review_jobs_db()
 
     mock_outline = Outline(title="脱敏大纲", topic="脱敏测试", sections=[OutlineSection(heading="第一节")])
@@ -874,14 +888,8 @@ async def test_mcp_review_job_five_baseline_outcomes_and_db_migration(tmp_path, 
     """)
     conn.commit()
     conn.close()
-
-    import mcp_server
-    monkeypatch.setattr(mcp_server.settings, "DB_PATH", test_db)
-    monkeypatch.setattr(mcp_server.settings, "REVIEW_OUTPUT_DIR", str(out_root))
-    monkeypatch.setattr(mcp_server.settings, "REVIEW_BASELINE_REGISTRY_PATH", reg_path)
-    mcp_server._review_jobs_db_initialized.clear()
-    mcp_server._review_jobs_db_recovered.clear()
-    # 自动执行表结构增量迁移
+    # 2. 隔离环境并导入初始化 mcp_server（触发安全增量 DDL 迁移）
+    mcp_server = _prepare_mcp_server(monkeypatch, tmp_path, test_db=test_db, out_root=out_root, reg_path=reg_path)
     mcp_server._init_review_jobs_db()
 
     mock_outline = Outline(title="MCP基线大纲", topic="MCP基线测试", sections=[OutlineSection(heading="第一节")])
@@ -1058,3 +1066,160 @@ async def test_mcp_review_job_five_baseline_outcomes_and_db_migration(tmp_path, 
     assert j6["status"] == "partial"
     assert j6["manifest_error"] == "Permission denied"
     checker_mock.assert_not_called()
+
+
+def test_manifest_chinese_number_prefix_evidence_mapping_end_to_end(tmp_path):
+    """验证包含 一、二、 等中文/阿拉伯章节前缀时，质量清洗后的标题在 Manifest 中仍能精确映射证据。"""
+    md_file = tmp_path / "test_chinese_prefix.md"
+    md_file.write_text("正文", encoding="utf-8")
+
+    ev1 = Evidence(chunk_id=101, doc_id="doc_a", score=9, summary="改性机理总结A", section_title="1.1")
+    ev2 = Evidence(chunk_id=102, doc_id="doc_b", score=8, summary="改性机理总结B", section_title="1.2")
+    ev3 = Evidence(chunk_id=103, doc_id="doc_c", score=9, summary="性能指标横向对比", section_title="2.1")
+
+    # 1. 模拟生成阶段：evidence_by_heading 键带有大纲中的完整中文编号前缀
+    evidence_by_heading = {
+        "一、国内外研究现状与产业进展": [ev1, ev2],
+        "二、不同包膜材料性能横向对比": [ev3],
+        "三、断点恢复章节（历史遗留）": None,
+        # "四、缺失映射章节" 故意不放进 evidence_by_heading
+        "五、无引用描述章节": [],
+    }
+
+    # 2. 模拟 ReviewQuality 清洗后 ReviewDoc 中的章节标题（编号前缀已去除）
+    review = ReviewDoc(
+        title="包膜肥料综述",
+        topic="包膜肥料",
+        intro="引言完整内容",
+        conclusion="结论完整内容",
+        sections=[
+            SectionDraft(heading="国内外研究现状与产业进展", markdown="正文段落 [1][2]", cited_doc_ids=["doc_a", "doc_b"]),
+            SectionDraft(heading="不同包膜材料性能横向对比", markdown="正文对比 [3]", cited_doc_ids=["doc_c"]),
+            SectionDraft(heading="断点恢复章节（历史遗留）", markdown="正文恢复 [4]", cited_doc_ids=["doc_d"]),
+            SectionDraft(heading="缺失映射章节", markdown="正文未映射 [5]", cited_doc_ids=["doc_e"]),
+            SectionDraft(heading="无引用描述章节", markdown="纯文字阐述", cited_doc_ids=[]),
+        ],
+        references=["[1] A", "[2] B", "[3] C", "[4] D", "[5] E"],
+        reference_doc_ids=["doc_a", "doc_b", "doc_c", "doc_d", "doc_e"],
+    )
+
+    run_ctx = RunContext(
+        topic="包膜肥料", run_id="run_chinese_001", trigger_source="cli",
+        model_name="gpt-5.4", analysis_model="gpt-5.4", reranker_model="bge-reranker",
+        target_words=5000, target_lang="zh"
+    )
+
+    manifest_path = write_review_manifest(ManifestInput(
+        output_md_path=str(md_file),
+        review=review,
+        outline=Outline(title="包膜肥料综述", topic="包膜肥料"),
+        evidence_by_heading=evidence_by_heading,
+        paper_meta={
+            "doc_a": {"title": "Doc A"},
+            "doc_b": {"title": "Doc B"},
+            "doc_c": {"title": "Doc C"},
+            "doc_d": {"title": "Doc D"},
+            "doc_e": {"title": "Doc E"},
+        },
+        run_context=run_ctx,
+    ))
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+
+    tree = manifest_data["section_evidence"]
+    assert len(tree) == 5
+
+    # 第一章：清洗后标题成功映射到带编号的原始证据，状态为 complete，包含 2 个 chunk
+    assert tree[0]["heading"] == "国内外研究现状与产业进展"
+    assert tree[0]["evidence_status"] == "complete"
+    assert len(tree[0]["chunks"]) == 2
+    assert tree[0]["chunks"][0]["doc_id"] == "doc_a"
+    assert tree[0]["chunks"][1]["doc_id"] == "doc_b"
+
+    # 第二章：清洗后标题成功映射，状态为 complete，包含 1 个 chunk
+    assert tree[1]["heading"] == "不同包膜材料性能横向对比"
+    assert tree[1]["evidence_status"] == "complete"
+    assert len(tree[1]["chunks"]) == 1
+    assert tree[1]["chunks"][0]["doc_id"] == "doc_c"
+
+    # 第三章：None 映射保留为 unavailable_legacy_checkpoint
+    assert tree[2]["heading"] == "断点恢复章节（历史遗留）"
+    assert tree[2]["evidence_status"] == "unavailable_legacy_checkpoint"
+    assert tree[2]["chunks"] == []
+
+    # 第四章：真缺失映射保留为 unavailable_missing_mapping
+    assert tree[3]["heading"] == "缺失映射章节"
+    assert tree[3]["evidence_status"] == "unavailable_missing_mapping"
+    assert tree[3]["chunks"] == []
+
+    # 第五章：空列表且无引用保留为 empty
+    assert tree[4]["heading"] == "无引用描述章节"
+    assert tree[4]["evidence_status"] == "empty"
+    assert tree[4]["chunks"] == []
+
+
+def test_manifest_normalized_heading_collision_fails_closed(tmp_path):
+    """对抗测试：当多个原始键规范化后发生碰撞（如 '一、同名章节' 与 '二、同名章节'），
+    清洗后的同名章节必须 fail closed，标为 unavailable_missing_mapping 且 chunks 为空；
+    而原始精确键依然能精确命中。
+    """
+    md_file = tmp_path / "test_collision.md"
+    md_file.write_text("正文内容", encoding="utf-8")
+
+    ev_a = Evidence(chunk_id=201, doc_id="doc_a", score=9, summary="章节A证据")
+    ev_b = Evidence(chunk_id=202, doc_id="doc_b", score=8, summary="章节B证据")
+
+    # 1. 构造规范化后碰撞的 evidence_by_heading
+    evidence_by_heading = {
+        "一、同名章节": [ev_a],
+        "二、同名章节": [ev_b],
+    }
+
+    # 2. 构造两个章节：
+    #    章节1 使用清理后无前缀的标题 "同名章节"（遭遇碰撞）
+    #    章节2 使用精确带前缀的标题 "一、同名章节"（精确命中）
+    review = ReviewDoc(
+        title="碰撞测试综述",
+        topic="碰撞测试",
+        intro="引言内容",
+        conclusion="结论内容",
+        sections=[
+            SectionDraft(heading="同名章节", markdown="段落1 [@doc_a]", cited_doc_ids=["doc_a"]),
+            SectionDraft(heading="一、同名章节", markdown="段落2 [@doc_a]", cited_doc_ids=["doc_a"]),
+        ],
+        references=["[1] 文献A"],
+        reference_doc_ids=["doc_a"],
+    )
+
+    run_ctx = RunContext(
+        topic="碰撞测试", run_id="run_collision_001", trigger_source="cli",
+        model_name="gpt-5.4", analysis_model="gpt-5.4", reranker_model="bge-reranker",
+        target_words=3000, target_lang="zh"
+    )
+
+    manifest_path = write_review_manifest(ManifestInput(
+        output_md_path=str(md_file),
+        review=review,
+        outline=Outline(title="碰撞测试综述", topic="碰撞测试"),
+        evidence_by_heading=evidence_by_heading,
+        paper_meta={"doc_a": {"title": "Doc A"}, "doc_b": {"title": "Doc B"}},
+        run_context=run_ctx,
+    ))
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+
+    tree = manifest_data["section_evidence"]
+    assert len(tree) == 2
+
+    # 章节1（清理后标题 "同名章节"）：规范化键存在碰撞，必须 fail closed，不得绑定 ev_a 或 ev_b
+    assert tree[0]["heading"] == "同名章节"
+    assert tree[0]["evidence_status"] == "unavailable_missing_mapping"
+    assert tree[0]["chunks"] == []
+
+    # 章节2（原始精确标题 "一、同名章节"）：原始精确键不受规范化碰撞影响，正常匹配 ev_a
+    assert tree[1]["heading"] == "一、同名章节"
+    assert tree[1]["evidence_status"] == "complete"
+    assert len(tree[1]["chunks"]) == 1
+    assert tree[1]["chunks"][0]["doc_id"] == "doc_a"

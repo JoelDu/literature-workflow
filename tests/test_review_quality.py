@@ -6,6 +6,8 @@ def _review(markdown: str, heading: str = "一、释放机理") -> ReviewDoc:
     return ReviewDoc(
         title="测试综述",
         topic="包膜尿素",
+        intro="引言背景介绍与研究意义阐述，确保引言非空。",
+        conclusion="结论与展望分析，总结全文主要进展与未来方向。",
         sections=[SectionDraft(
             heading=heading,
             markdown=markdown,
@@ -69,6 +71,8 @@ def test_unknown_citation_and_empty_section_are_blocking_but_recoverable():
     review = ReviewDoc(
         title="测试综述",
         topic="测试",
+        intro="引言非空测试内容",
+        conclusion="结论非空测试内容",
         sections=[
             SectionDraft(heading="有效章节", markdown="正文 [99]", cited_doc_ids=[]),
             SectionDraft(heading="空章节", markdown="", cited_doc_ids=[]),
@@ -128,6 +132,8 @@ def test_track_b_only_quantitative_claim_is_warned_not_blocked():
     review = ReviewDoc(
         title="测试综述",
         topic="测试",
+        intro="引言非空测试内容",
+        conclusion="结论非空测试内容",
         sections=[SectionDraft(
             heading="数据边界",
             markdown="已有探索报道释放期达到 90 d [1]。",
@@ -146,6 +152,52 @@ def test_track_b_only_quantitative_claim_is_warned_not_blocked():
     assert result.blocking_issues == []
     assert any(issue.code == "track_b_quantitative_claim" for issue in result.report.issues)
     assert result.review.sections[0].track_b_doc_ids == ["background"]
+
+
+def test_empty_intro_or_conclusion_is_blocking():
+    review_no_intro = ReviewDoc(
+        title="测试综述",
+        topic="测试",
+        intro="",
+        conclusion="结论非空",
+        sections=[SectionDraft(heading="一、章节", markdown="正文 [1]", cited_doc_ids=["d1"])],
+    )
+    context = EvidenceContext(number_to_doc_id={1: "d1"})
+    res1 = audit_and_clean_review(review_no_intro, context, {"d1": {"title": "D1"}})
+    assert any(i.code == "empty_intro" and i.severity == "blocking" for i in res1.blocking_issues)
+
+    review_no_concl = ReviewDoc(
+        title="测试综述",
+        topic="测试",
+        intro="引言非空",
+        conclusion="",
+        sections=[SectionDraft(heading="一、章节", markdown="正文 [1]", cited_doc_ids=["d1"])],
+    )
+    res2 = audit_and_clean_review(review_no_concl, context, {"d1": {"title": "D1"}})
+    assert any(i.code == "empty_conclusion" and i.severity == "blocking" for i in res2.blocking_issues)
+
+
+def test_raw_json_intro_or_conclusion_is_blocking():
+    review_raw_json_intro = ReviewDoc(
+        title="测试综述",
+        topic="测试",
+        intro='{"intro": "未解析JSON"}',
+        conclusion="结论非空",
+        sections=[SectionDraft(heading="一、章节", markdown="正文 [1]", cited_doc_ids=["d1"])],
+    )
+    context = EvidenceContext(number_to_doc_id={1: "d1"})
+    res1 = audit_and_clean_review(review_raw_json_intro, context, {"d1": {"title": "D1"}})
+    assert any(i.code == "raw_json_intro" and i.severity == "blocking" for i in res1.blocking_issues)
+
+    review_raw_json_concl = ReviewDoc(
+        title="测试综述",
+        topic="测试",
+        intro="引言非空",
+        conclusion='{"conclusion": "未解析JSON"}',
+        sections=[SectionDraft(heading="一、章节", markdown="正文 [1]", cited_doc_ids=["d1"])],
+    )
+    res2 = audit_and_clean_review(review_raw_json_concl, context, {"d1": {"title": "D1"}})
+    assert any(i.code == "raw_json_conclusion" and i.severity == "blocking" for i in res2.blocking_issues)
 
 
 def test_journal_reference_formatting_with_volume_issue_pages():

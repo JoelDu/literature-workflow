@@ -12,7 +12,9 @@ import numpy as np
 from jinja2 import Template
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .models import Outline, OutlineSection, Evidence, SectionDraft, ReviewDoc
+from .models import (
+    Outline, OutlineSection, Evidence, SectionDraft, ReviewDoc, infer_table_suggested
+)
 from . import prompts
 from . import doctype as dt
 from .review_quality import (
@@ -66,10 +68,22 @@ def _chat(client, model: str, prompt: str, json_mode: bool = True,
     return _chat_once(client, model, prompt, json_mode, call_type=call_type, stage=stage, meta=meta)
 
 
+def _reject_duplicate_keys(pairs):
+    res = {}
+    for k, v in pairs:
+        if k in res:
+            raise ValueError(f"JSON 包含重复对象键: '{k}'")
+        res[k] = v
+    return res
+
+
 def parse_llm_json(text: str) -> dict:
-    """先直接 json.loads；失败则用括号计数提取最外层 {...} 再试。"""
+    """先直接 json.loads；失败则用括号计数提取最外层 {...} 再试。严格拒绝重复对象键。"""
     try:
-        return json.loads(text)
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except ValueError as e:
+        if "JSON 包含重复对象键" in str(e):
+            raise
     except Exception:
         pass
     start = text.find("{")
@@ -95,7 +109,7 @@ def parse_llm_json(text: str) -> dict:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return json.loads(text[start : i + 1])
+                return json.loads(text[start : i + 1], object_pairs_hook=_reject_duplicate_keys)
     raise ValueError(f"JSON 括号不闭合: {text[:200]}")
 
 
@@ -314,17 +328,24 @@ def load_outline_file(path: str, topic: str) -> Outline:
     if path.endswith(".json"):
         return Outline.from_dict(json.loads(raw), topic=topic)
     sections = []
-    cur = None
+    cur_heading = ""
+    cur_questions = []
     title = topic or "文献综述"
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("# ") and not line.startswith("## "):
             title = line[2:].strip()
         elif line.startswith("## "):
-            cur = OutlineSection(heading=line[3:].strip(), questions=[])
-            sections.append(cur)
-        elif line.startswith("- ") and cur is not None:
-            cur.questions.append(line[2:].strip())
+            if cur_heading:
+                table_sug = infer_table_suggested(cur_heading, cur_questions)
+                sections.append(OutlineSection(heading=cur_heading, questions=cur_questions, table_suggested=table_sug))
+            cur_heading = line[3:].strip()
+            cur_questions = []
+        elif line.startswith("- ") and cur_heading:
+            cur_questions.append(line[2:].strip())
+    if cur_heading:
+        table_sug = infer_table_suggested(cur_heading, cur_questions)
+        sections.append(OutlineSection(heading=cur_heading, questions=cur_questions, table_suggested=table_sug))
     if not sections:
         raise ValueError(f"无法从 {path} 解析出章节（需要 '## 标题' + '- 问题' 格式或 JSON）。")
     return Outline(title=title, topic=topic, sections=sections)
@@ -709,6 +730,60 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
     )
 
 
+INTRO_CONCL_LOWER_RATIO = 0.90
+INTRO_CONCL_UPPER_RATIO = 1.20
+
+
+def _intro_conclusion_validation_errors(data: object, intro_words: tuple, concl_words: tuple) -> list[str]:
+    errors = []
+    if not isinstance(data, dict):
+        return [f"输出必须为 JSON 对象，实际为 {type(data).__name__}"]
+
+    keys = set(data.keys())
+    if keys != {"intro", "conclusion"}:
+        missing = {"intro", "conclusion"} - keys
+        extra = keys - {"intro", "conclusion"}
+        if missing:
+            errors.append(f"缺少必填顶层字段: {', '.join(sorted(missing))}")
+        if extra:
+            errors.append(f"包含未知顶层字段: {', '.join(sorted(extra))}，顶层键必须严格仅为 'intro' 与 'conclusion'")
+
+    intro = data.get("intro")
+    conclusion = data.get("conclusion")
+
+    if intro is None or not isinstance(intro, str) or not intro.strip():
+        errors.append("缺少非空的 'intro' 文本字段")
+    if conclusion is None or not isinstance(conclusion, str) or not conclusion.strip():
+        errors.append("缺少非空的 'conclusion' 文本字段")
+
+    if errors:
+        return errors
+
+    intro_str = intro.strip()
+    concl_str = conclusion.strip()
+
+    # 确定性双向字数校验：下限为目标 min 的 90%，上限为目标 max 的 120%
+    intro_min_bound = int(intro_words[0] * INTRO_CONCL_LOWER_RATIO) if isinstance(intro_words, (tuple, list)) and len(intro_words) >= 1 else 200
+    intro_max_bound = int(intro_words[1] * INTRO_CONCL_UPPER_RATIO) if isinstance(intro_words, (tuple, list)) and len(intro_words) >= 2 else 1500
+
+    concl_min_bound = int(concl_words[0] * INTRO_CONCL_LOWER_RATIO) if isinstance(concl_words, (tuple, list)) and len(concl_words) >= 1 else 250
+    concl_max_bound = int(concl_words[1] * INTRO_CONCL_UPPER_RATIO) if isinstance(concl_words, (tuple, list)) and len(concl_words) >= 2 else 2000
+
+    len_intro = len(intro_str)
+    if len_intro < intro_min_bound:
+        errors.append(f"引言字数不足：实际 {len_intro} 字，低于下限 {intro_min_bound} 字（目标区间 {intro_words[0]}-{intro_words[1]} 字，允许 90% 容差）")
+    elif len_intro > intro_max_bound:
+        errors.append(f"引言字数超标：实际 {len_intro} 字，超过上限 {intro_max_bound} 字（目标区间 {intro_words[0]}-{intro_words[1]} 字，允许 120% 容差）")
+
+    len_concl = len(concl_str)
+    if len_concl < concl_min_bound:
+        errors.append(f"结论字数不足：实际 {len_concl} 字，低于下限 {concl_min_bound} 字（目标区间 {concl_words[0]}-{concl_words[1]} 字，允许 90% 容差）")
+    elif len_concl > concl_max_bound:
+        errors.append(f"结论字数超标：实际 {len_concl} 字，超过上限 {concl_max_bound} 字（目标区间 {concl_words[0]}-{concl_words[1]} 字，允许 120% 容差）")
+
+    return errors
+
+
 def write_intro_conclusion(outline: Outline, drafts: list, client, model,
                            intro_words: tuple = (300, 500),
                            concl_words: tuple = (400, 700), focus: str = "",
@@ -739,7 +814,19 @@ def write_intro_conclusion(outline: Outline, drafts: list, client, model,
     data = _chat_json(client, model, prompt,
                       call_type="write_intro_conclusion", stage="stage_C_intro_conclusion",
                       meta={"review_title": outline.title, "topic": outline.topic, "sections_count": len(drafts)})
-    return str(data.get("intro", "")), str(data.get("conclusion", ""))
+    validation_errors = _intro_conclusion_validation_errors(data, intro_words, concl_words)
+    if validation_errors:
+        repair_prompt = (
+            prompt + "\n\n上次引言与结论输出校验失败：\n- " + "\n- ".join(validation_errors)
+            + "\n请修正所有问题，确保 intro 与 conclusion 结构完整且字数达标，并重新严格只输出合法 JSON。"
+        )
+        data = _chat_json(client, model, repair_prompt,
+                          call_type="write_intro_conclusion", stage="stage_C_intro_conclusion_validation_retry",
+                          meta={"review_title": outline.title, "topic": outline.topic, "validation_errors": validation_errors})
+        validation_errors = _intro_conclusion_validation_errors(data, intro_words, concl_words)
+    if validation_errors:
+        raise ValueError(f"引言/结论结构或字数校验失败: {'；'.join(validation_errors)}")
+    return str(data["intro"]), str(data["conclusion"])
 
 
 # ── Stage D：装配与渲染 ───────────────────────────────────────────────────────

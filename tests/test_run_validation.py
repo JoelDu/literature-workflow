@@ -940,3 +940,141 @@ def test_db_repair_production_cli_regression(tmp_path, monkeypatch):
     with patch.object(review.console, "print_json") as mock_print:
         review.cmd_db_repair_production(Args())
         assert mock_print.called
+
+
+def test_write_intro_conclusion_failure_blocks_artifacts_manifest_and_marks_failed_across_entrypoints(tmp_path, monkeypatch):
+    """验证当 write_intro_conclusion 连续失败时，CLI、Web、MCP 三入口均严格拦截产物与清单生成，并诚实报告 failed 状态。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from litreview.models import Outline, OutlineSection, SectionDraft, Evidence
+    import litreview.stages as stages
+    import litreview.manifest as manifest_mod
+    import litreview.run_baseline as baseline_mod
+
+    # 1. 显式隔离环境配置与 settings 缓存（必须在任何 web_server / mcp_server 导入或使用前执行）
+    tmp_db = str(tmp_path / "test_prod.db")
+    tmp_reviews = str(tmp_path / "reviews")
+    tmp_baselines = str(tmp_path / "baselines.json")
+    os.makedirs(tmp_reviews, exist_ok=True)
+
+    monkeypatch.setenv("DB_PATH", tmp_db)
+    monkeypatch.setenv("REVIEW_OUTPUT_DIR", tmp_reviews)
+    monkeypatch.setenv("REVIEW_BASELINE_REGISTRY_PATH", tmp_baselines)
+    monkeypatch.setattr("utils._settings", None, raising=False)
+
+    # 2. 对 Manifest 生成与 Baseline 检查挂载 MagicMock 监听
+    mock_manifest = MagicMock()
+    mock_baseline = MagicMock()
+    monkeypatch.setattr(manifest_mod, "write_review_manifest", mock_manifest)
+    monkeypatch.setattr(baseline_mod, "check_review_candidate", mock_baseline)
+
+    outline = Outline(title="测试综述", topic="包膜材料", sections=[OutlineSection(heading="章节1")])
+    drafts = [SectionDraft(heading="章节1", markdown="正文 [@doc_a]", cited_doc_ids=["doc_a"])]
+    paper_meta = {"doc_a": {"title": "Doc A", "authors": ["Author"], "year": 2024}}
+
+    # 3. CLI 链路验证：引言/结论为空或生成失败时，render_review_note 触发 quality_blocking 异常，完全阻止导出
+    review_doc = stages.assemble_review(outline, drafts, intro="", conclusion="", paper_meta=paper_meta, evidence_total=1)
+    assert review_doc.quality_blocking is True
+    assert any(iss["code"] == "empty_intro" for iss in review_doc.quality_issues)
+    assert any(iss["code"] == "empty_conclusion" for iss in review_doc.quality_issues)
+
+    settings_mock = SimpleNamespace(
+        OBSIDIAN_VAULT_PATH="",
+        REVIEW_OUTPUT_DIR=tmp_reviews,
+        OUTPUT_DIR=tmp_reviews,
+    )
+    template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "review_template.md")
+
+    with pytest.raises(RuntimeError, match="综述质量门禁未通过"):
+        stages.render_review_note(review_doc, paper_meta, settings_mock, template_path, "gpt-5.4")
+
+    mock_manifest.assert_not_called()
+    mock_baseline.assert_not_called()
+
+    # 4. Web 链路验证：_review_generator_worker 捕获异常后标记 status="failed"，不得生成 Manifest，不得记录庆祝日志
+    import web_server
+    if hasattr(web_server, "settings"):
+        monkeypatch.setattr(web_server.settings, "REVIEW_OUTPUT_DIR", tmp_reviews, raising=False)
+        monkeypatch.setattr(web_server.settings, "DB_PATH", tmp_db, raising=False)
+
+    web_job_id = "job_web_fail_test"
+    web_server._jobs[web_job_id] = {
+        "job_id": web_job_id, "status": "running", "current_stage": "STARTED",
+        "progress": 0, "log": [], "error": None, "topic": "测试",
+        "output_md": None, "output_docx": None, "output_manifest": None,
+    }
+    monkeypatch.setattr(web_server, "_get_client", lambda: object())
+    monkeypatch.setattr(web_server, "_get_reranker", lambda: None)
+    monkeypatch.setattr(web_server, "_get_store", lambda: SimpleNamespace(
+        get_paper_meta=lambda: paper_meta,
+        count_valid_chunks=lambda: 10,
+    ))
+    monkeypatch.setattr(web_server, "_get_embedder", lambda: object())
+    monkeypatch.setattr(stages, "generate_outline", lambda *args, **kwargs: outline)
+    monkeypatch.setattr(stages, "gather_evidence", lambda *args, **kwargs: [Evidence(chunk_id=1, doc_id="doc_a", score=9, summary="S1")])
+    monkeypatch.setattr(stages, "write_section", lambda *args, **kwargs: SectionDraft(heading="章节1", markdown="正文 [@doc_a]", cited_doc_ids=["doc_a"]))
+
+    # 模拟 write_intro_conclusion 彻底失败
+    def failing_intro_concl(*args, **kwargs):
+        raise ValueError("引言/结论结构或字数校验失败")
+    monkeypatch.setattr(stages, "write_intro_conclusion", failing_intro_concl)
+
+    web_server._review_generator_worker(
+        job_id=web_job_id, topic="测试", focus="", words=5000,
+        n_sections=1, outline_json=""
+    )
+
+    job_res = web_server._jobs[web_job_id]
+    assert job_res["status"] == "failed"
+    assert job_res["current_stage"] == "FAILED"
+    assert "综述质量门禁未通过" in str(job_res["error"])
+    assert not job_res.get("output_md")
+    assert not job_res.get("output_manifest")
+    all_logs = " ".join(job_res.get("log", []))
+    assert "🎉" not in all_logs
+    assert "❌ 任务失败" in all_logs
+
+    mock_manifest.assert_not_called()
+    mock_baseline.assert_not_called()
+
+    # 5. MCP 链路验证：_run_review_job 捕获异常后标记 status="failed"，不得生成 Manifest，不得记录完成日志
+    import mcp_server
+    if hasattr(mcp_server, "settings"):
+        monkeypatch.setattr(mcp_server.settings, "REVIEW_OUTPUT_DIR", tmp_reviews, raising=False)
+        monkeypatch.setattr(mcp_server.settings, "DB_PATH", tmp_db, raising=False)
+    mcp_server._init_review_jobs_db(recover_interrupted=False)
+
+    mcp_job_id = "job_mcp_fail_test"
+    mcp_server._jobs[mcp_job_id] = {
+        "status": "running", "topic": "测试", "log": [],
+        "output": "", "docx": "", "manifest": "", "error": "", "summary": "",
+        "started_at": "now",
+    }
+    monkeypatch.setattr(mcp_server, "_client", lambda: object())
+    monkeypatch.setattr(mcp_server, "_store", lambda: SimpleNamespace(
+        get_paper_meta=lambda: paper_meta,
+        count_valid_chunks=lambda: 10,
+    ))
+    monkeypatch.setattr(mcp_server, "_embedder", lambda: object())
+    monkeypatch.setattr(mcp_server, "_persist_review_job", lambda job: None)
+
+    mcp_server._run_review_job(mcp_job_id, topic="测试", focus="", words=5000, n_sections=1, outline_json="")
+
+    mcp_res = mcp_server._jobs[mcp_job_id]
+    assert mcp_res["status"] == "failed"
+    assert "综述质量门禁未通过" in str(mcp_res["error"])
+    assert not mcp_res.get("output")
+    assert not mcp_res.get("manifest")
+    mcp_logs = " ".join(mcp_res.get("log", []))
+    assert "✅ 完成" not in mcp_logs
+    assert "❌ 失败" in mcp_logs
+
+    mock_manifest.assert_not_called()
+    mock_baseline.assert_not_called()
+
+    # 6. 递归断言产物目录中未生成任何 Markdown、Word 或 Manifest 文件
+    generated_artifacts = [
+        str(p) for p in tmp_path.rglob("*")
+        if p.is_file() and (p.suffix in (".md", ".docx") or p.name.endswith(".manifest.json"))
+    ]
+    assert generated_artifacts == []

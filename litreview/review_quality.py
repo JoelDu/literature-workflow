@@ -20,6 +20,12 @@ _CITE_RUN_RE = re.compile(r"(?:\[\d+\]\s*){2,}")
 _HEADING_PREFIX_RE = re.compile(
     r"^\s*(?:(?:第\s*)?(?:\d+(?:\.\d+)*|[一二三四五六七八九十百]+)(?:\s*[章节])?\s*[、.．:：\-]\s*)+"
 )
+
+
+def normalize_heading(heading: str) -> str:
+    """唯一、共享、确定性的章节标题规范化函数，去除中文/阿拉伯数字章节编号前缀与多余空白。"""
+    cleaned = _HEADING_PREFIX_RE.sub("", heading or "").strip()
+    return cleaned or (heading.strip() if heading else "未命名章节")
 _NOISE_RE = re.compile(
     r"^(?:unknown|none|null|暂无(?:全名)?|未知|未明确标注|年份不详|作者不详)$",
     re.I,
@@ -307,9 +313,14 @@ def audit_and_clean_review(
         return _dedupe_citation_runs(rewritten)
 
     intro = rewrite(review_doc.intro, "引言")
+    if not intro.strip():
+        report.add("empty_intro", "blocking", "引言正文为空", "引言")
+    elif _looks_like_json_dump(intro):
+        report.add("raw_json_intro", "blocking", "引言仍是未解析的 JSON 输出", "引言")
+
     new_sections = []
     for draft in review_doc.sections:
-        heading = _HEADING_PREFIX_RE.sub("", draft.heading or "").strip() or "未命名章节"
+        heading = normalize_heading(draft.heading)
         markdown = rewrite(draft.markdown, heading)
         if not markdown.strip():
             report.add("empty_section", "blocking", "章节正文为空", heading)
@@ -361,6 +372,10 @@ def audit_and_clean_review(
             source_evidence_count=draft.source_evidence_count,
         ))
     conclusion = rewrite(review_doc.conclusion, "结论与展望")
+    if not conclusion.strip():
+        report.add("empty_conclusion", "blocking", "结论正文为空", "结论与展望")
+    elif _looks_like_json_dump(conclusion):
+        report.add("raw_json_conclusion", "blocking", "结论仍是未解析的 JSON 输出", "结论与展望")
 
     sorted_ref_items = sorted(new_number_to_doc.items())
     references = [
