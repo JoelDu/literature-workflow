@@ -250,3 +250,131 @@ def test_journal_reference_formatting_with_volume_issue_pages():
         "doc_type": "paper",
     })
     assert "[4] 钱七. 早期综述[J]. 磷肥与复肥, 2020." in ref4
+
+
+def test_citation_cluster_continuous_compression():
+    # 连续 >=3 个压缩为起讫范围，如 [1-5], [6-8]；连续 2 个用逗号连接如 [1,2]
+    review = _review("连续引用测试段落 [1][2][3][4][5]，三连引用 [6][7][8]，两连引用 [9][10]。")
+    context = EvidenceContext(number_to_doc_id={i: f"doc-{i}" for i in range(1, 11)})
+    meta = {f"doc-{i}": {"title": f"文献{i}", "doc_type": "paper", "year": "2024"} for i in range(1, 11)}
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.blocking_issues == []
+    md = result.review.sections[0].markdown
+    assert "[1-5]" in md
+    assert "[6-8]" in md
+    assert "[9,10]" in md
+    assert "[1][2]" not in md
+    assert "[6][7]" not in md
+    assert len(result.review.references) == 10
+    assert len(result.review.reference_doc_ids) == 10
+
+
+def test_citation_cluster_non_continuous_and_mixed():
+    # 先按顺序引出 1..10 确立序号，再测试非连续、逆序重排与混合模式
+    prefix = "基础文献 " + " ".join(f"[{i}]" for i in range(1, 11)) + "。\n\n"
+    review = _review(prefix + "非连续 [1][3][5]，逆序 [10][7]，混合模式 [1][2][3][5][7][8][9]。")
+    context = EvidenceContext(number_to_doc_id={i: f"doc-{i}" for i in range(1, 11)})
+    meta = {f"doc-{i}": {"title": f"文献{i}", "doc_type": "paper", "year": "2024"} for i in range(1, 11)}
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.blocking_issues == []
+    md = result.review.sections[0].markdown
+    assert "[1-10]" in md
+    assert "[1,3,5]" in md
+    assert "[7,10]" in md
+    assert "[1-3,5,7-9]" in md
+
+
+def test_citation_cluster_existing_range_and_delimiters():
+    # 支持输入已有范围、中文逗号、各种连接号（如 [1-3]、[1，3，5–7]）
+    prefix = "基础文献 " + " ".join(f"[{i}]" for i in range(1, 8)) + "。\n\n"
+    review = _review(prefix + "已有范围 [1-3]，混合列表 [1, 3, 5-7]，中文标点 [1，3，5–7]。")
+    context = EvidenceContext(number_to_doc_id={i: f"doc-{i}" for i in range(1, 8)})
+    meta = {f"doc-{i}": {"title": f"文献{i}", "doc_type": "paper", "year": "2024"} for i in range(1, 8)}
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.blocking_issues == []
+    md = result.review.sections[0].markdown
+    assert "[1-7]" in md
+    assert "[1-3]" in md
+    assert "[1,3,5-7]" in md
+    assert "[1，" not in md  # 引用括号内统一输出 ASCII 逗号
+    assert "–" not in md  # 引用括号内统一输出 ASCII 连字符
+
+
+def test_unknown_citation_inside_range_is_blocking():
+    # 范围 [1-4] 中缺少文献 3，必须审计出 unknown_citation 且 blocking
+    review = _review("范围缺失测试 [1-4]。")
+    context = EvidenceContext(number_to_doc_id={1: "doc-1", 2: "doc-2", 4: "doc-4"})  # 缺少 3
+    meta = {f"doc-{i}": {"title": f"文献{i}", "doc_type": "paper"} for i in (1, 2, 4)}
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.review.quality_blocking is True
+    unknown_issues = [i for i in result.blocking_issues if i.code == "unknown_citation"]
+    assert len(unknown_issues) == 1
+    assert "引用 [3]" in unknown_issues[0].message
+
+
+def test_duplicate_docs_merged_before_cluster_compression():
+    # 重复文献合并后重新编号并再次压缩：doc-1与doc-2同DOI -> 1；doc-3与doc-4同DOI -> 2；doc-5 -> 3
+    # 输入 [1][2][3][4][5] 映射后变为 [1, 1, 2, 2, 3] -> 升序去重压缩为 [1-3]
+    review = _review("重复文献合并测试 [1][2][3][4][5]。")
+    context = EvidenceContext(number_to_doc_id={1: "d1", 2: "d2", 3: "d3", 4: "d4", 5: "d5"})
+    meta = {
+        "d1": {"title": "论文A", "doi": "10.1000/a", "doc_type": "paper"},
+        "d2": {"title": "论文A", "doi": "10.1000/a", "doc_type": "paper"},
+        "d3": {"title": "论文B", "doi": "10.1000/b", "doc_type": "paper"},
+        "d4": {"title": "论文B", "doi": "10.1000/b", "doc_type": "paper"},
+        "d5": {"title": "论文C", "doi": "10.1000/c", "doc_type": "paper"},
+    }
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.blocking_issues == []
+    md = result.review.sections[0].markdown
+    assert "[1-3]" in md
+    assert result.review.doc_count == 3
+    assert len(result.review.references) == 3
+    assert len(result.review.reference_doc_ids) == 3
+
+
+def test_citations_separated_by_text_or_punctuation_not_merged():
+    # 引用标记之间若存在正文文字、句号、逗号等标点，严禁擅自跨越合并
+    review = _review("文献 [1] 指出了机理，而文献 [2] 与文献 [3] 提出了工艺。数据 A 达 90% [4]，数据 B 达 80% [5]。")
+    context = EvidenceContext(number_to_doc_id={i: f"doc-{i}" for i in range(1, 6)})
+    meta = {f"doc-{i}": {"title": f"文献{i}", "doc_type": "paper"} for i in range(1, 6)}
+
+    result = audit_and_clean_review(review, context, meta)
+
+    assert result.blocking_issues == []
+    md = result.review.sections[0].markdown
+    assert "文献 [1] 指出了机理" in md
+    assert "文献 [2] 与文献 [3] 提出了工艺" in md
+    assert "达 90% [4]，数据 B 达 80% [5]" in md
+    assert "[1-3]" not in md
+    assert "[4,5]" not in md
+
+
+def test_malformed_and_huge_ranges_defensive_zero_crash():
+    # 1. 超大范围 [1-999999999]：安全拦截，不进行巨大展开或消耗内存
+    review_huge = _review("超大范围 [1-999999999]。")
+    res_huge = audit_and_clean_review(review_huge, EvidenceContext(), {})
+    assert res_huge.review.quality_blocking is True
+    assert any(i.code == "malformed_citation" and "超大引用范围" in i.message for i in res_huge.blocking_issues)
+
+    # 2. 倒置范围 [5-1]：安全拦截
+    review_inv = _review("倒置范围 [5-1]。")
+    res_inv = audit_and_clean_review(review_inv, EvidenceContext(), {})
+    assert res_inv.review.quality_blocking is True
+    assert any(i.code == "malformed_citation" and "倒置" in i.message for i in res_inv.blocking_issues)
+
+    # 3. 非法序号 [0-3]：安全拦截
+    review_zero = _review("非法序号 [0-3]。")
+    res_zero = audit_and_clean_review(review_zero, EvidenceContext(), {})
+    assert res_zero.review.quality_blocking is True
+    assert any(i.code == "malformed_citation" and "非法" in i.message for i in res_zero.blocking_issues)

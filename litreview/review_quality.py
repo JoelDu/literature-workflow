@@ -15,8 +15,13 @@ from . import doctype as dt
 from .models import ReviewDoc, SectionDraft
 
 
+_CITE_TOKEN_PATTERN = r"\[\s*\d+(?:(?:\s*[-–—~～]\s*|\s*[,，]\s*)\d+)*\s*\]"
+_CITE_CLUSTER_RE = re.compile(
+    rf"{_CITE_TOKEN_PATTERN}(?:[ \t]*{_CITE_TOKEN_PATTERN})*"
+)
+_BRACKET_CONTENT_RE = re.compile(r"\[(.*?)\]")
 _NUMERIC_CITE_RE = re.compile(r"\[(\d+)\]")
-_CITE_RUN_RE = re.compile(r"(?:\[\d+\]\s*){2,}")
+_MAX_RANGE_SPAN = 200
 _HEADING_PREFIX_RE = re.compile(
     r"^\s*(?:(?:第\s*)?(?:\d+(?:\.\d+)*|[一二三四五六七八九十百]+)(?:\s*[章节])?\s*[、.．:：\-]\s*)+"
 )
@@ -228,17 +233,107 @@ def _merge_meta(primary: Mapping, secondary: Mapping) -> dict:
     return result
 
 
-def _dedupe_citation_runs(text: str) -> str:
-    def replace(match: re.Match) -> str:
-        seen = set()
-        numbers = []
-        for number in _NUMERIC_CITE_RE.findall(match.group(0)):
-            if number not in seen:
-                seen.add(number)
-                numbers.append(number)
-        return "".join(f"[{number}]" for number in numbers)
+def _parse_citation_cluster(cluster_text: str) -> tuple[list[int], list[str]]:
+    """解析引用簇文本（如 '[1][2][3]', '[1-3, 5]', '[1，3，5-7]'）中的所有数字与范围。
 
-    return _CITE_RUN_RE.sub(replace, text)
+    返回 (numbers, errors)。若包含非法序号、倒置范围或超大跨度，在 errors 中记录并安全截断。
+    """
+    numbers: list[int] = []
+    errors: list[str] = []
+
+    for b_match in _BRACKET_CONTENT_RE.finditer(cluster_text):
+        content = b_match.group(1).strip()
+        if not content:
+            errors.append("空引用标记: []")
+            continue
+        parts = [p.strip() for p in re.split(r"[,，]", content) if p.strip()]
+        for part in parts:
+            range_parts = re.split(r"[-–—~～]", part)
+            if len(range_parts) == 1:
+                try:
+                    num = int(range_parts[0].strip())
+                    if num < 1:
+                        errors.append(f"非法引用序号: {num} (序号必须 >= 1)")
+                    else:
+                        numbers.append(num)
+                except ValueError:
+                    errors.append(f"无法解析的引用项: {part}")
+            elif len(range_parts) == 2:
+                start_str, end_str = range_parts[0].strip(), range_parts[1].strip()
+                if not start_str or not end_str:
+                    errors.append(f"畸形范围定义: {part}")
+                    continue
+                try:
+                    start, end = int(start_str), int(end_str)
+                    if start < 1 or end < 1:
+                        errors.append(f"非法范围序号: {part} (序号必须 >= 1)")
+                    elif start > end:
+                        errors.append(f"倒置的引用范围: {part} (起始序号大于终止序号)")
+                    elif end - start > _MAX_RANGE_SPAN:
+                        errors.append(
+                            f"超大引用范围: {part} (范围跨度 {end - start + 1} 超过安全上限 {_MAX_RANGE_SPAN})"
+                        )
+                    else:
+                        numbers.extend(range(start, end + 1))
+                except ValueError:
+                    errors.append(f"无法解析的范围项: {part}")
+            else:
+                errors.append(f"畸形范围标记包含过多分隔符: {part}")
+
+    return numbers, errors
+
+
+def _format_citation_cluster(sorted_unique_numbers: list[int], threshold: int = 3) -> str:
+    """将升序去重后的序号列表压缩为 GB/T 7714 顺序编码样式。
+
+    连续序号 >= threshold (默认 3) 压缩为起讫形式 (如 [1-3], [1-5])；
+    连续 2 个或不连续序号以逗号连接 (如 [1,2], [1,3,5], [1-3,5,7-9])。
+    """
+    if not sorted_unique_numbers:
+        return ""
+    if len(sorted_unique_numbers) == 1:
+        return f"[{sorted_unique_numbers[0]}]"
+
+    runs: list[list[int]] = []
+    curr_run = [sorted_unique_numbers[0]]
+    for num in sorted_unique_numbers[1:]:
+        if num == curr_run[-1] + 1:
+            curr_run.append(num)
+        else:
+            runs.append(curr_run)
+            curr_run = [num]
+    runs.append(curr_run)
+
+    parts: list[str] = []
+    for run in runs:
+        if len(run) >= threshold:
+            parts.append(f"{run[0]}-{run[-1]}")
+        else:
+            parts.append(",".join(str(n) for n in run))
+
+    inner = ",".join(parts)
+    return f"[{inner}]"
+
+
+def _extract_all_citation_numbers(text: str) -> list[int]:
+    """从文本中提取所有引用中的文献序号（支持 [1]、[1-5]、[1,3,5] 等）。"""
+    numbers: list[int] = []
+    for match in _CITE_CLUSTER_RE.finditer(text or ""):
+        nums, _ = _parse_citation_cluster(match.group(0))
+        numbers.extend(nums)
+    return numbers
+
+
+def _normalize_citation_cluster(raw_cluster: str) -> str:
+    numbers, errors = _parse_citation_cluster(raw_cluster)
+    if errors or not numbers:
+        return raw_cluster
+    return _format_citation_cluster(sorted(set(numbers)))
+
+
+def _dedupe_citation_runs(text: str) -> str:
+    """规范化文本中的所有引用簇（合并相邻方括号、去重、升序并按 GB/T 7714 压缩）。"""
+    return _CITE_CLUSTER_RE.sub(lambda m: _normalize_citation_cluster(m.group(0)), text or "")
 
 
 def _clean_markdown(text: str) -> str:
@@ -270,7 +365,7 @@ def audit_and_clean_review(
     warned_missing: set[str] = set()
     warned_duplicates: set[tuple[str, str]] = set()
 
-    def resolve(old_number: int, section: str) -> str | None:
+    def resolve(old_number: int, section: str) -> int | None:
         doc_id = allowed_evidence.number_to_doc_id.get(old_number)
         if not doc_id:
             report.add("unknown_citation", "blocking",
@@ -302,15 +397,39 @@ def audit_and_clean_review(
             new_number = len(canonical_numbers) + 1
             canonical_numbers[canonical] = new_number
             new_number_to_doc[new_number] = canonical
-        return f"[{canonical_numbers[canonical]}]"
+        return canonical_numbers[canonical]
 
     def rewrite(text: str, section: str) -> str:
         cleaned = _clean_markdown(text)
-        rewritten = _NUMERIC_CITE_RE.sub(
-            lambda match: resolve(int(match.group(1)), section) or match.group(0),
-            cleaned,
-        )
-        return _dedupe_citation_runs(rewritten)
+
+        def replace_cluster(match: re.Match) -> str:
+            raw_cluster = match.group(0)
+            numbers, errors = _parse_citation_cluster(raw_cluster)
+            if errors:
+                for err in errors:
+                    report.add("malformed_citation", "blocking", err, section)
+                return raw_cluster
+
+            resolved_nums: list[int] = []
+            has_unknown = False
+            for num in numbers:
+                new_n = resolve(num, section)
+                if new_n is not None:
+                    resolved_nums.append(new_n)
+                else:
+                    has_unknown = True
+
+            if has_unknown:
+                return raw_cluster
+
+            if not resolved_nums:
+                return ""
+
+            unique_sorted = sorted(set(resolved_nums))
+            return _format_citation_cluster(unique_sorted)
+
+        rewritten = _CITE_CLUSTER_RE.sub(replace_cluster, cleaned)
+        return rewritten
 
     intro = rewrite(review_doc.intro, "引言")
     if not intro.strip():
@@ -329,7 +448,7 @@ def audit_and_clean_review(
         if len(max(markdown.split("\n\n"), key=len, default="")) > 800:
             report.add("long_paragraph", "warning", "存在超过 800 字符的长段落", heading)
         cited_ids = []
-        for number in _NUMERIC_CITE_RE.findall(markdown):
+        for number in _extract_all_citation_numbers(markdown):
             doc_id = new_number_to_doc.get(int(number))
             if doc_id and doc_id not in cited_ids:
                 cited_ids.append(doc_id)
@@ -353,7 +472,7 @@ def audit_and_clean_review(
                 continue
             sentence_docs = {
                 new_number_to_doc[int(number)]
-                for number in _NUMERIC_CITE_RE.findall(sentence)
+                for number in _extract_all_citation_numbers(sentence)
                 if int(number) in new_number_to_doc
             }
             if sentence_docs and sentence_docs <= track_b_ids:
