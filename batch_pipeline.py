@@ -867,7 +867,9 @@ def _export_completed(c, conn) -> int:
     # 限制单次导出最多 BATCH_SIZE_LIMIT 篇以平抑速率，按文献唯一ID进行 Excel 导出及防重写。
     """
     c.execute(
-        f"SELECT id, title, pdf_path, language, images_dir, result_json, batch_provider, batch_job_id, mineru_md FROM papers WHERE status=? LIMIT {settings.BATCH_SIZE_LIMIT}",
+        f"SELECT id, title, pdf_path, language, images_dir, result_json, batch_provider, batch_job_id, mineru_md FROM papers WHERE status=? "
+        # 上轮导出出错（error_message 非空）的排在最后，不挡新完成的文献
+        f"ORDER BY (error_message IS NOT NULL) LIMIT {settings.BATCH_SIZE_LIMIT}",
         (STATUS_COMPLETED,),
     )
     completed = c.fetchall()
@@ -880,10 +882,10 @@ def _export_completed(c, conn) -> int:
     excel_rows = []
     exported = []  # (doc_id, title)：本轮笔记已生成、待 Excel 落盘后统一标 EXPORTED
     for doc_id, title, pdf_path, lang, images_dir, result_json, provider, job_id, md_text in completed:
-        # 单篇隔离：任何一篇出错只把它自己转入失败态，绝不拖累前后文献。
-        # 失败态用 RESULT_PARSE_FAILED —— 它在 RESUBMITTABLE_STATUSES 里，下一轮
-        # prepare_batch 会自动重新提交；若仍停在 COMPLETED，无 ORDER BY 的 LIMIT
-        # 查询会反复先取到它，后面的文献永远轮不到。
+        # 单篇隔离：任何一篇出错只影响它自己，绝不拖累前后文献。
+        # 只有 LLM 结果本身坏掉才转 RESULT_PARSE_FAILED 重新提交（重花额度才有意义）；
+        # 笔记/磁盘等环境异常重提交也修不好，保持 COMPLETED 并记 error_message，
+        # 下轮排在队尾重试导出，不再调用 LLM。
         try:
             note_meta = build_note_metadata(title, md_text or "", lang)
             analysis = PaperAnalysisRecord.from_llm_json(
@@ -893,7 +895,13 @@ def _export_completed(c, conn) -> int:
             )
             # 与实时管道一致：LLM 返回的 JSON 解析失败时绝不把垃圾内容导出为终态
             if analysis.error:
-                raise ValueError(f"分析结果解析失败: {analysis.error}")
+                err_msg = f"分析结果解析失败，已转入重提交队列: {str(analysis.error)[:500]}"
+                console.print(f"[yellow]⚠️ {title}: {err_msg}")
+                c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?",
+                          (STATUS_RESULT_PARSE_FAILED, err_msg, doc_id))
+                conn.commit()
+                log_run_event(mode="batch", event="paper_exported", title=title, doc_id=doc_id, status="failed", error=err_msg)
+                continue
 
             images = []
             if images_dir and os.path.exists(images_dir):
@@ -919,10 +927,9 @@ def _export_completed(c, conn) -> int:
             ))
             exported.append((doc_id, title))
         except Exception as e:
-            err_msg = f"导出失败，已转入重提交队列: {str(e)[:500]}"
+            err_msg = f"导出失败，保留 COMPLETED 待下轮重试导出: {str(e)[:500]}"
             console.print(f"[yellow]⚠️ {title}: {err_msg}")
-            c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?",
-                      (STATUS_RESULT_PARSE_FAILED, err_msg, doc_id))
+            c.execute("UPDATE papers SET error_message=? WHERE id=?", (err_msg, doc_id))
             conn.commit()
             log_run_event(mode="batch", event="paper_exported", title=title, doc_id=doc_id, status="failed", error=err_msg)
 

@@ -109,9 +109,21 @@ def test_exception_mid_loop_neither_strands_nor_blocks(env, monkeypatch):
     assert sorted(df["文献ID"]) == ["p1", "p2", "p4"]
     for doc_id in ("p1", "p2", "p4"):
         assert _status(env.conn, doc_id) == batch_pipeline.STATUS_EXPORTED
-    # 出错的那篇离开 COMPLETED，不会在下一轮 LIMIT 查询里反复挡路
-    assert _status(env.conn, "boom") == batch_pipeline.STATUS_RESULT_PARSE_FAILED
-    assert batch_pipeline._export_completed(env.conn.cursor(), env.conn) == 0
+    # 环境类异常不重提交 LLM（不重花额度）：保持 COMPLETED、记错误，排到队尾
+    assert _status(env.conn, "boom") == batch_pipeline.STATUS_COMPLETED
+    err = env.conn.execute("SELECT error_message FROM papers WHERE id='boom'").fetchone()[0]
+    assert "disk hiccup" in err
+
+    # 新完成的文献优先于上轮出错的那篇，即使 LIMIT 只剩一个名额
+    _insert(env.conn, "fresh", GOOD)
+    monkeypatch.setattr(env.settings, "BATCH_SIZE_LIMIT", 1)
+    assert batch_pipeline._export_completed(env.conn.cursor(), env.conn) == 1
+    assert _status(env.conn, "fresh") == batch_pipeline.STATUS_EXPORTED
+
+    # 故障排除后下一轮导出成功，错误信息清空
+    monkeypatch.setattr(batch_pipeline, "generate_obsidian_note", real_note)
+    assert batch_pipeline._export_completed(env.conn.cursor(), env.conn) == 1
+    assert _status(env.conn, "boom") == batch_pipeline.STATUS_EXPORTED
 
 
 def test_excel_failure_keeps_papers_completed_for_retry(env, monkeypatch):
