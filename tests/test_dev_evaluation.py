@@ -6,23 +6,28 @@ on the AI/Rule Silver Pre-label Baseline, and enforces zero False Merges and zer
 import json
 import pytest
 from pathlib import Path
-from litreview.ref_parser import (
-    parse_reference_mention,
-    generate_resolution_candidates,
-    make_resolution_decision
-)
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+def _data_file(name: str) -> Path:
+    """这些金/银标数据集只在作者本地的 tests/data/ 里（目录暂未纳入版本库），缺失时整条用例 skip。"""
+    path = DATA_DIR / name
+    if not path.exists():
+        pytest.skip(f"evaluation fixture tests/data/{name} not present (tests/data/ is not versioned)")
+    return path
 
 
 @pytest.fixture
 def dev_silver_data():
-    silver_path = Path(__file__).parent / "data" / "citation_dev_silver_v1.json"
+    silver_path = _data_file("citation_dev_silver_v1.json")
     with open(silver_path, encoding="utf-8") as f:
         return json.load(f)
 
 
 @pytest.fixture
 def candidate_set():
-    cand_path = Path(__file__).parent / "data" / "citation_gold_candidate_set_v0.json"
+    cand_path = _data_file("citation_gold_candidate_set_v0.json")
     with open(cand_path, encoding="utf-8") as f:
         return json.load(f)
 
@@ -68,7 +73,7 @@ def test_dev_partition_full_evaluation(dev_silver_data):
 
 def test_dev_partition_silver_v11_evaluation():
     """验证 Silver v1.1 数据集：36(5):122-129 完成续接拼合，REJECT 归零，AUTO_LINK 证据确凿。"""
-    silver_v11_path = Path(__file__).parent / "data" / "citation_dev_silver_v1.1.json"
+    silver_v11_path = _data_file("citation_dev_silver_v1.1.json")
     with open(silver_v11_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -93,7 +98,7 @@ def test_dev_partition_silver_v11_evaluation():
 
 def test_dev_partition_silver_v12_evaluation():
     """验证 Silver v1.2 数据集：四层记账模型 (984物理行, 2续接, 1附录项, 981有效逻辑mention, 777去重mention)，分母闭环。"""
-    silver_v12_path = Path(__file__).parent / "data" / "citation_dev_silver_v1.2.json"
+    silver_v12_path = _data_file("citation_dev_silver_v1.2.json")
     with open(silver_v12_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -120,7 +125,7 @@ def test_dev_partition_silver_v133_live_reparse_and_summary_assertion():
     import hashlib
     from litreview.ref_parser import parse_reference_mention, normalize_title, extract_first_author_surname
 
-    silver_v133_path = Path(__file__).parent / "data" / "citation_dev_silver_v1.3.3.json"
+    silver_v133_path = _data_file("citation_dev_silver_v1.3.3.json")
     with open(silver_v133_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -148,7 +153,6 @@ def test_dev_partition_silver_v133_live_reparse_and_summary_assertion():
     live_clean_texts = set()
 
     for doc in data["documents"]:
-        doc_id = doc["doc_id"][:8]
         for r in doc["references"]:
             live_physical += 1
             raw_t = r["raw_text"]

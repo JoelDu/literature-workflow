@@ -1,35 +1,18 @@
 """Tests for Local Citation Network MVP (Phase 2B)."""
 import os
-import json
 import sqlite3
 import pytest
-from pathlib import Path
 
 from litreview.citation_network import (
     build_test_citation_network_db,
     query_citation_network
 )
-from litreview.graph_schema import init_graph_schema
+
+import lit_seed as seed
 
 
-@pytest.fixture(scope="module")
-def network_db(tmp_path_factory):
-    """构建独立测试引文网络数据库用于单元测试。"""
-    prod_db = "/mnt/ripe/literature_analyzer_data/batch_tracking.db"
-    test_db = str(tmp_path_factory.mktemp("cit_net") / "test_citation_network.db")
-    
-    try:
-        stats = build_test_citation_network_db(prod_db, test_db)
-    except sqlite3.OperationalError as exc:
-        if "unable to open database file" in str(exc):
-            pytest.skip("production database is not readable in this environment")
-        raise
-    return test_db, stats
-
-
-def test_network_db_build_and_accounting(network_db):
+def _check_accounting(db_path, stats, expected_quarantined):
     """验证独立测试引文网络库的构建账本、实体解耦与数据闭环。"""
-    db_path, stats = network_db
     
     assert stats["total_canonical_in_library_works"] > 0
     assert stats["total_references_processed"] == (
@@ -49,7 +32,7 @@ def test_network_db_build_and_accounting(network_db):
     assert in_lib_works == stats["total_canonical_in_library_works"]
 
     quarantined = c.execute("SELECT COUNT(*) FROM works WHERE quarantine_status = 'QUARANTINED'").fetchone()[0]
-    assert quarantined == 3  # a93f1740, a5620039, 8d73f880
+    assert quarantined == expected_quarantined
 
     # 2. 验证外部临时 Work 状态均为 UNRESOLVED
     ext_works = c.execute("SELECT COUNT(*) FROM works WHERE in_library = 0").fetchone()[0]
@@ -75,6 +58,82 @@ def test_network_db_build_and_accounting(network_db):
     conn.close()
 
 
+PROD_DB = "/mnt/ripe/literature_analyzer_data/batch_tracking.db"
+
+
+@pytest.fixture(scope="module")
+def seeded_network_db(tmp_path_factory):
+    """用 tests/lit_seed.py 的最小馆藏构建引文网络库：4 篇（1 篇隔离）、5 条引用、3 条可解析。"""
+    root = tmp_path_factory.mktemp("cit_net_seed")
+    prod_db, test_db = str(root / "batch_tracking.db"), str(root / "test_citation_network.db")
+    seed.seed_prod_db(prod_db)
+    return test_db, build_test_citation_network_db(prod_db, test_db)
+
+
+@pytest.fixture(scope="module")
+def network_db(tmp_path_factory):
+    """作者机器上的真实生产库（只读）构建的引文网络库，仅 prod_readonly 用例使用。"""
+    if os.environ.get("LIT_ALLOW_PROD_READONLY") != "1":
+        pytest.skip("prod_readonly: set LIT_ALLOW_PROD_READONLY=1")
+    test_db = str(tmp_path_factory.mktemp("cit_net") / "test_citation_network.db")
+    try:
+        stats = build_test_citation_network_db(PROD_DB, test_db)
+    except sqlite3.OperationalError as exc:
+        if "unable to open database file" in str(exc):
+            pytest.skip("production database is not readable in this environment")
+        raise
+    return test_db, stats
+
+
+def test_seeded_network_exact_accounting(seeded_network_db):
+    db_path, stats = seeded_network_db
+    assert stats["total_canonical_in_library_works"] == 4
+    assert stats["total_references_processed"] == 5
+    assert stats["confirmed_in_library_links"] == 3
+    assert stats["unresolved_external_references"] == 2
+    assert stats["candidate_matches_count"] == 0
+    assert stats["total_works_in_db"] == 6
+    _check_accounting(db_path, stats, expected_quarantined=1)  # 只有 a93f1740 前缀被隔离
+
+
+def test_seeded_subgraphs(seeded_network_db):
+    db_path, _ = seeded_network_db
+
+    a = query_citation_network(db_path, seed.DOC_A[:8], include_candidates=True)
+    assert a["seed_work"]["work_id"] == seed.DOC_A
+    assert a["network_statistics"]["in_library_cited_by_count"] == 2
+    citing = {inc["citing_work_id"] for inc in a["incoming_citations"]["confirmed_in_library"]}
+    assert citing == {seed.DOC_B, seed.DOC_C}
+
+    b = query_citation_network(db_path, seed.DOC_B[:8], include_candidates=True)
+    st = b["network_statistics"]
+    assert (st["total_references_in_seed"], st["confirmed_in_library_outgoing_count"],
+            st["unresolved_external_references_count"], st["in_library_cited_by_count"]) == (3, 2, 1, 0)
+    assert {o["work_id"] for o in b["outgoing_citations"]["confirmed_in_library"]} == {seed.DOC_A, seed.DOC_C}
+    # B 与 C 都引用 A → 文献耦合
+    assert st["top_bibliographic_coupling_count"] == 1
+
+    c = query_citation_network(db_path, seed.DOC_C[:8], include_candidates=True)
+    assert c["network_statistics"]["in_library_cited_by_count"] == 1
+    assert c["network_statistics"]["confirmed_in_library_outgoing_count"] == 1
+
+
+def test_seeded_quarantined_doc_has_no_edges(seeded_network_db):
+    db_path, _ = seeded_network_db
+    q = query_citation_network(db_path, seed.DOC_Q[:8], include_candidates=True)
+    assert q["seed_work"]["quarantine_status"] == "QUARANTINED"
+    assert q["network_statistics"]["in_library_cited_by_count"] == 0
+    assert q["network_statistics"]["total_references_in_seed"] == 0
+
+
+@pytest.mark.prod_readonly
+def test_network_db_build_and_accounting(network_db):
+    db_path, stats = network_db
+    assert stats["total_canonical_in_library_works"] > 0
+    _check_accounting(db_path, stats, expected_quarantined=3)  # a93f1740, a5620039, 8d73f880
+
+
+@pytest.mark.prod_readonly
 def test_seed_1_cf693c6c_citation_subgraph(network_db):
     """实测种子文献 1: cf693c6c (Chen et al., Caking of crystals) 的入度与被引关系。"""
     db_path, _ = network_db
@@ -91,6 +150,7 @@ def test_seed_1_cf693c6c_citation_subgraph(network_db):
     assert "5324d9dd" in citing_ids
 
 
+@pytest.mark.prod_readonly
 def test_seed_2_bba4a59d_citation_subgraph(network_db):
     """实测种子文献 2: bba4a59d (Understanding caking phenomena) 的出度与共被引。"""
     db_path, _ = network_db
@@ -111,6 +171,7 @@ def test_seed_2_bba4a59d_citation_subgraph(network_db):
     assert res["network_statistics"]["top_bibliographic_coupling_count"] >= 1
 
 
+@pytest.mark.prod_readonly
 def test_seed_3_bab0f660_citation_subgraph(network_db):
     """实测种子文献 3: bab0f660 (包膜缓释肥料综述) 的出度引文网络。"""
     db_path, _ = network_db

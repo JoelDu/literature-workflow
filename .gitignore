@@ -9,6 +9,8 @@
 *.db-wal
 *.db.bak.*
 pdf.tmp
+.ruff_cache/
+.pytest_cache/
 # 环境/缓存
 .venv
 venv/
@@ -22,7 +24,25 @@ __pycache__/
 output/
 test_output/
 obsidian_vault/
-data/
+# 只忽略仓库根目录的运行时数据目录（DB_PATH 默认 ./data/...）；以前的 `data/` 会连带
+# 忽略任意层级下名为 data 的目录。
+/data/
+# tests/data/ 是引文解析的金/银标评测集（JSON），是否纳入版本库还没定，先显式忽略。
+# 缺失时 tests/test_dev_evaluation.py 等会带原因 skip。决定入库后删掉下面这一行即可。
+tests/data/
+# 本地运行时目录（pipeline / 书籍通道的输入输出，默认都相对仓库根）
+/input_pdfs/
+/mineru_output/
+/processed_books/
+/failed_books/
+book_output/
+failed_pdfs/
+processed_pdfs/
+input_books/
+# 临时脚本 / 草稿
+scratch/
+# 旧 .env.bak 里的 Windows 路径（F:\...）在 Linux 上被当成相对路径建出来的目录
+/F:*
 # 本地设置
 .claude/
 .vscode/

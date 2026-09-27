@@ -656,7 +656,17 @@ def _log_retention_days() -> int:
         return 30
 
 
+def _stdio_tee_disabled() -> bool:
+    """LIT_DISABLE_STDIO_TEE=1 时不在 import 期接管 stdout/stderr。
+
+    tests/conftest.py 会设置它：pytest 有自己的输出捕获，再叠一层 TeeLogger 只会把
+    测试输出写进 DB_PATH 所在目录——conftest 若哪天没隔离好，那就是生产数据盘。
+    """
+    return os.getenv("LIT_DISABLE_STDIO_TEE", "").strip().lower() in ("1", "true", "yes")
+
+
 # 自动重定向 stdout 和 stderr 到 <DB_PATH 所在目录>/app-YYYY-MM-DD.log（按天一份）
-_retention = _log_retention_days()
-sys.stdout = TeeLogger(_data_dir(), sys.stdout, retention_days=_retention)
-sys.stderr = TeeLogger(_data_dir(), sys.stderr, retention_days=_retention)
+if not _stdio_tee_disabled():
+    _retention = _log_retention_days()
+    sys.stdout = TeeLogger(_data_dir(), sys.stdout, retention_days=_retention)
+    sys.stderr = TeeLogger(_data_dir(), sys.stderr, retention_days=_retention)
