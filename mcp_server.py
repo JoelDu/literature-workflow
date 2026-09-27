@@ -852,6 +852,7 @@ def _init_review_jobs_db(recover_interrupted: bool = False):
                 ("baseline_status", "TEXT"),
                 ("baseline_summary", "TEXT"),
                 ("baseline_error", "TEXT"),
+                ("resume_after", "TEXT"),
             ):
                 if column not in existing_cols:
                     conn.execute(f"ALTER TABLE review_jobs ADD COLUMN {column} {ddl}")
@@ -882,8 +883,8 @@ def _persist_review_job(job_dict: dict):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""
             INSERT OR REPLACE INTO review_jobs
-            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error, baseline_verdict, baseline_status, baseline_summary, baseline_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error, baseline_verdict, baseline_status, baseline_summary, baseline_error, resume_after)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             job_dict["job_id"],
             job_dict.get("topic", ""),
@@ -912,6 +913,7 @@ def _persist_review_job(job_dict: dict):
             job_dict.get("baseline_status", None),
             job_dict.get("baseline_summary", None),
             job_dict.get("baseline_error", None),
+            job_dict.get("resume_after", "") or "",
         ))
         conn.commit()
     finally:
@@ -924,7 +926,7 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
     conn = _get_db_conn(readonly=True)
     try:
         c = conn.cursor()
-        select_cols = "job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error, baseline_verdict, baseline_status, baseline_summary, baseline_error"
+        select_cols = "job_id, topic, focus, words, sections, outline_json, status, progress_log, output_path, docx_path, summary, error, queued_at, started_at, completed_at, heartbeat_at, checkpoint_json, research_gap, thesis, mainline_logic, target_lang, manifest_path, manifest_error, baseline_verdict, baseline_status, baseline_summary, baseline_error, resume_after"
         if job_id:
             c.execute(f"SELECT {select_cols} FROM review_jobs WHERE job_id = ?", (job_id,))
         else:
@@ -959,6 +961,7 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
                 "baseline_status": row[24] if len(row) > 24 and row[24] is not None else None,
                 "baseline_summary": row[25] if len(row) > 25 and row[25] is not None else None,
                 "baseline_error": row[26] if len(row) > 26 and row[26] is not None else None,
+                "resume_after": row[27] or "" if len(row) > 27 else "",
             }
     finally:
         conn.close()
@@ -969,11 +972,53 @@ def _get_persistent_review_job(job_id: str = "") -> Optional[dict]:
 _init_review_jobs_db(recover_interrupted=True)
 
 
+def _pause_review_job_for_quota(job: dict, info: dict, log) -> None:
+    """额度耗尽 → paused_quota：保留检查点、记录下一个 UTC 重置时刻并布置自动续跑。"""
+    from litreview.review_jobs import PAUSED_QUOTA, schedule_quota_resume
+    with _jobs_lock:
+        job["status"] = PAUSED_QUOTA
+        job["resume_after"] = info.get("resume_at", "")
+        job["error"] = info.get("message", "")
+        job["completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _persist_review_job(job)
+    delay = schedule_quota_resume(job["job_id"], job["resume_after"], _auto_resume_review)
+    when = f"{job['resume_after']} (UTC)"
+    if delay is not None:
+        log(f"⏸ 额度耗尽，任务已暂停（非失败）；将于 {when} 后自动续跑，也可手动 resume_review(\"{job['job_id']}\")")
+    else:
+        log(f"⏸ 额度耗尽，任务已暂停（非失败）；请在 {when} 后调用 resume_review(\"{job['job_id']}\") 续跑")
+
+
+def _auto_resume_review(job_id: str) -> None:
+    try:
+        logger.info(f"额度已重置，自动续跑综述任务 {job_id}: {resume_review(job_id)}")
+    except Exception as exc:  # 定时器线程内不能抛出
+        logger.warning(f"自动续跑综述任务 {job_id} 失败: {exc}")
+
+
+def _rearm_quota_resumes() -> int:
+    """进程启动时为持久化的 paused_quota 任务重新布置自动续跑定时器。"""
+    from litreview.review_jobs import PAUSED_QUOTA, schedule_quota_resume
+    try:
+        conn = _get_db_conn(readonly=True)
+        try:
+            rows = conn.execute("SELECT job_id, resume_after FROM review_jobs WHERE status = ?",
+                                (PAUSED_QUOTA,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(f"读取额度暂停任务失败，跳过自动续跑布置: {exc}")
+        return 0
+    return sum(1 for job_id, resume_after in rows
+               if schedule_quota_resume(job_id, resume_after, _auto_resume_review) is not None)
+
+
 def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                     n_sections: int, outline_json: str,
                     research_gap: str = "", thesis: str = "", mainline_logic: str = "",
                     target_lang: str = "zh"):
     from litreview.models import Outline
+    from litreview.quota import QuotaExceededError
     from litreview.stages import (generate_outline as _gen, write_intro_conclusion,
                                   assemble_review, render_review_note, export_docx)
     
@@ -1027,6 +1072,11 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                            focus=focus, n_sections=n_sections, words=words, target_lang=target_lang,
                            research_gap=research_gap, thesis=thesis, mainline_logic=mainline_logic)
             log(f"大纲完成：{outline.title}（{len(outline.sections)} 章节）")
+        # 显式参数优先，否则沿用大纲 JSON 中的立论，保证每章写作都拿到同一套 thesis。
+        outline.apply_alignment(thesis, research_gap, mainline_logic)
+        thesis, research_gap, mainline_logic = outline.thesis, outline.research_gap, outline.mainline_logic
+        with _jobs_lock:
+            job["thesis"], job["research_gap"], job["mainline_logic"] = thesis, research_gap, mainline_logic
 
         # 无论大纲来自调用方还是模型，都持久化规范化结果，供检查点恢复使用。
         with _jobs_lock:
@@ -1076,11 +1126,16 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                 section_words=section_words, focus=focus, source_char_budget=18_000,
                 initial_drafts=initial_drafts,
                 review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"],
+                thesis=thesis, research_gap=research_gap, mainline_logic=mainline_logic,
             ),
             ReviewHooks(on_progress=log, on_checkpoint=persist_checkpoint),
         )
         drafts = section_result.drafts
         section_evidence = section_result.section_evidence
+
+        if isinstance(section_result.paused_quota, dict):
+            _pause_review_job_for_quota(job, section_result.paused_quota, log)
+            return
 
         if not drafts:
             raise RuntimeError("所有章节均无有效内容生成，请检查大纲或模型状态。")
@@ -1091,12 +1146,15 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                                                        intro_words=intro_words,
                                                        concl_words=concl_words, focus=focus,
                                                        thesis=thesis, research_gap=research_gap)
+        except QuotaExceededError:
+            raise
         except Exception as e:
             log(f"引言/结论生成异常（已安全降级，保留正文）: {e}")
             intro, conclusion = "", ""
 
         evidence_total = section_result.evidence_count
-        review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total)
+        review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total,
+                                 evidence_by_heading=section_result.evidence_by_heading)
         template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
         out_path = render_review_note(review, paper_meta, settings, template_path, model)
 
@@ -1226,6 +1284,9 @@ def _run_review_job(job_id: str, topic: str, focus: str, words: int,
                                                "baseline_status": baseline_status,
                                                "baseline_summary": baseline_summary,
                                                "baseline_error": baseline_error})
+    except QuotaExceededError as e:
+        from litreview.review_orchestrator import quota_pause_info
+        _pause_review_job_for_quota(job, quota_pause_info(e), log)
     except Exception as e:
         with _jobs_lock:
             job["status"] = "failed"
@@ -1286,12 +1347,19 @@ def start_review(topic: str, focus: str = "", words: int = 0,
 
 @_logged_tool()
 def resume_review(job_id: str) -> str:
-    """从 interrupted/failed 任务已持久化的章节检查点继续生成。"""
+    """从 interrupted/failed/partial/paused_quota 任务已持久化的章节检查点继续生成。
+
+    paused_quota（UTC 日额度耗尽而暂停）的任务会在 UTC 零点后自动续跑；也可手动提前调用，
+    若额度仍不足会再次暂停而不是失败。
+    """
+    from litreview.review_jobs import RESUMABLE_STATUSES, cancel_quota_resume
     job = _get_persistent_review_job(job_id)
     if not job:
         return f"未找到可恢复任务 {job_id}。"
-    if job["status"] not in ("interrupted", "failed", "partial"):
+    if job["status"] not in RESUMABLE_STATUSES:
         return f"任务 {job_id} 当前状态为 {job['status']}，无需或不能恢复。"
+    cancel_quota_resume(job_id)
+    job["resume_after"] = ""
     if not job.get("outline_json"):
         return "该历史任务没有持久化大纲，无法安全续跑；请重新调用 start_review。"
 
@@ -1382,6 +1450,16 @@ def review_status(job_id: str = "") -> str:
                     err_msg = err_msg.replace(p, loc.sanitize_path_for_remote(p))
             err_msg = re.sub(r'/(?:[a-zA-Z0-9_.-]+/)+[a-zA-Z0-9_.-]+', lambda m: loc.sanitize_path_for_remote(m.group(0)), err_msg)
             lines.append(f"Manifest 警告: {err_msg}")
+    elif job["status"] == "paused_quota":
+        lines.append(f"已暂停（UTC 日额度耗尽，非失败）: {job.get('error', '-')[:300]}")
+        if job.get("resume_after"):
+            lines.append(f"下一次额度重置: {job['resume_after']} (UTC)；届时自动续跑"
+                         "（REVIEW_AUTO_RESUME_QUOTA=0 时需手动）。")
+        try:
+            checkpoint_count = len(json.loads(job.get("checkpoint_json") or "[]"))
+        except Exception:
+            checkpoint_count = 0
+        lines.append(f"已保留 {checkpoint_count} 个章节检查点；可随时调用 resume_review(\"{jid}\") 续跑。")
     elif job["status"] in ("failed", "interrupted"):
         lines.append(f"错误: {job.get('error', '-')[:400]}")
         if job.get("checkpoint_json"):
@@ -1822,6 +1900,7 @@ def _ensure_review_worker():
 
 
 _ensure_review_worker()
+_rearm_quota_resumes()
 
 
 class McpServerHost:

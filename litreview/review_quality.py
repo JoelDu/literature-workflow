@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -351,13 +352,339 @@ def _looks_like_json_dump(text: str) -> bool:
         return False
 
 
+# ── 零 token 数值溯源 ─────────────────────────────────────────────────────────
+
+_NUMERIC_TRANSLATE = str.maketrans({
+    **{chr(0xFF10 + i): str(i) for i in range(10)},
+    "％": "%", "．": ".", "‰": "‰", " ": " ", " ": " ", " ": " ",
+    "−": "-", "﹪": "%",
+})
+# 数值 + 单位：只有带单位/百分号或带小数的数字才视为需要溯源的"量化断言"，
+# 年份、计数、章节号等纯整数不参与，避免误报。
+_UNIT_AFTER_RE = re.compile(
+    r"\s*(?:%|‰|°C|℃|°|K\b|倍|个百分点|wt\s*%|vol\s*%|ppm|ppb|"
+    r"kJ/mol|J/g|kJ|MPa|GPa|kPa|Pa\b|mPa·s|g/mol|kDa|g/L|mg/L|mg/kg|g/kg|mol/L|mmol|mol\b|"
+    r"r/min|rpm|μm|um\b|nm\b|mm\b|cm\b|m²|m2\b|mL|ml\b|L\b|mg\b|kg\b|g\b|t/a|"
+    r"d(?![A-Za-z])|天|周|个月|月|h(?![A-Za-z])|小时|min\b|分钟|mV|V\b|mA|N\b|kN|W\b|kW|Hz)",
+)
+_RANGE_SEP_RE = re.compile(r"\s*(?:-|–|—|~|～|至|到)\s*$")
+_NUM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:[.,]\d+)?(?![\d])")  # 中文字符后紧跟数字（"为25"）也要抽取
+_EVIDENCE_NUM_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_STRIP_FOR_CLAIMS_RE = re.compile(
+    rf"{_CITE_TOKEN_PATTERN}|\[@[A-Za-z0-9_\-]+\]|"
+    r"(?:图|表|Fig\.?|Figure|Table|Eq\.?|式)\s*[（(]?\d+(?:\s*[-–.]\s*\d+)*[)）]?",
+    re.I,
+)
+_CAPTION_LINE_RE = re.compile(r"^\s*(?:!\[|\*\s*(?:图|表)\s*\d)")
+
+
+def _canon_decimal(text: str) -> str | None:
+    from decimal import Decimal, InvalidOperation
+    try:
+        value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    out = format(value.normalize(), "f")
+    return out
+
+
+def _number_readings(token: str) -> list[set[str]]:
+    """一个数字 token 的候选读法；每个读法是一组必须全部命中的规范化数值。
+
+    '49,32' 优先读作小数 49.32，其次读作千分位 4932 或列举 {49, 32}。
+    """
+    if "," not in token:
+        value = _canon_decimal(token)
+        return [{value}] if value else []
+    head, _, tail = token.partition(",")
+    readings = []
+    for candidate in (f"{head}.{tail}", f"{head}{tail}"):
+        value = _canon_decimal(candidate)
+        if value:
+            readings.append({value})
+    parts = {_canon_decimal(head), _canon_decimal(tail)} - {None}
+    if parts:
+        readings.append(parts)
+    return readings
+
+
+def extract_evidence_numbers(text: str) -> set[str]:
+    """证据侧宽松抽取：所有数字及其各种合理读法（小数逗号、千分位、拆分）。"""
+    numbers: set[str] = set()
+    for match in _EVIDENCE_NUM_RE.finditer((text or "").translate(_NUMERIC_TRANSLATE)):
+        token = match.group(0)
+        pieces = token.split(",")
+        for reading in _number_readings(token) if len(pieces) == 2 else []:
+            numbers.update(reading)
+        if len(pieces) > 2:  # 1,234,567
+            value = _canon_decimal("".join(pieces))
+            if value:
+                numbers.add(value)
+        for piece in pieces:
+            value = _canon_decimal(piece)
+            if value:
+                numbers.add(value)
+    return numbers
+
+
+def extract_claim_numbers(sentence: str) -> list[str]:
+    """正文侧严格抽取需要溯源的数值 token（带单位/百分号，或含小数，或处于此类范围的起点）。"""
+    text = _STRIP_FOR_CLAIMS_RE.sub(" ", (sentence or "").translate(_NUMERIC_TRANSLATE))
+    tokens = list(_NUM_TOKEN_RE.finditer(text))
+    claims = [False] * len(tokens)
+    for index in range(len(tokens) - 1, -1, -1):
+        match = tokens[index]
+        token = match.group(0)
+        if "." in token or ("," in token and len(token.partition(",")[2]) != 3):
+            claims[index] = True
+        elif _UNIT_AFTER_RE.match(text, match.end()):
+            claims[index] = True
+        elif index + 1 < len(tokens) and claims[index + 1] and _RANGE_SEP_RE.search(
+            text[match.end():tokens[index + 1].start()] or "x"
+        ):
+            claims[index] = True
+    return [match.group(0) for match, is_claim in zip(tokens, claims) if is_claim]
+
+
+def _number_supported(token: str, available: set[str]) -> bool:
+    return any(reading and reading <= available for reading in _number_readings(token))
+
+
+@dataclass
+class NumericProvenance:
+    numeric_sentences: int = 0
+    unsupported: list[dict] = field(default_factory=list)
+
+    @property
+    def unsupported_ratio(self) -> float:
+        return len(self.unsupported) / self.numeric_sentences if self.numeric_sentences else 0.0
+
+
+def check_numeric_provenance(markdown: str, doc_numbers: Mapping[str, set],
+                             resolve_docs) -> NumericProvenance:
+    """逐句核对带引用的量化断言：每个数值必须出现在所引文献的写作输入中。
+
+    doc_numbers 仅包含"已知证据"的文献；所引文献全部未知时该句跳过（无法判定，不计分母）。
+    resolve_docs(sentence) -> 该句引用的 doc_id 集合。
+    """
+    result = NumericProvenance()
+    for line in (markdown or "").splitlines():
+        if not line.strip() or _CAPTION_LINE_RE.match(line):
+            continue
+        for sentence_match in _SENTENCE_RE.finditer(line):
+            sentence = sentence_match.group(0).strip()
+            claims = extract_claim_numbers(sentence)
+            if not claims:
+                continue
+            docs = set(resolve_docs(sentence))
+            known = [doc for doc in docs if doc in doc_numbers]
+            if not known:
+                continue
+            available: set[str] = set()
+            for doc in known:
+                available.update(doc_numbers.get(doc) or ())
+            result.numeric_sentences += 1
+            missing = [token for token in claims if not _number_supported(token, available)]
+            if missing:
+                result.unsupported.append({
+                    "sentence": sentence[:240],
+                    "numbers": missing,
+                    "doc_ids": sorted(docs),
+                })
+    return result
+
+
+def _env_ratio(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def numeric_unsupported_max() -> float:
+    """单章无法溯源的量化句占比上限，超过即阻塞（env REVIEW_NUMERIC_UNSUPPORTED_MAX，默认 0.2）。"""
+    return _env_ratio("REVIEW_NUMERIC_UNSUPPORTED_MAX", 0.2)
+
+
+def unsourced_claim_max() -> float:
+    """单章因幻觉引用被剥离而失去来源的句子占比上限（env REVIEW_UNSOURCED_CLAIM_MAX，默认 0.15）。"""
+    return _env_ratio("REVIEW_UNSOURCED_CLAIM_MAX", 0.15)
+
+
+def evidence_numbers_for(evidence: list, broad_bib: list | None = None) -> dict[str, list[str]]:
+    """把写作输入（第一轨摘要+原始片段、第二轨摘要）压缩为 doc_id -> 数值列表，供检查点持久化。"""
+    table: dict[str, set[str]] = {}
+    for item in evidence or []:
+        numbers = table.setdefault(str(getattr(item, "doc_id", "")), set())
+        numbers.update(extract_evidence_numbers(getattr(item, "summary", "") or ""))
+        numbers.update(extract_evidence_numbers(getattr(item, "chunk_text", "") or ""))
+    for item in broad_bib or []:
+        numbers = table.setdefault(str(item.get("doc_id", "")), set())
+        numbers.update(extract_evidence_numbers(str(item.get("tldr", "") or "")))
+    return {doc_id: sorted(values) for doc_id, values in table.items() if doc_id}
+
+
+def count_cited_sentences(markdown: str, cite_pattern: re.Pattern | None = None) -> int:
+    pattern = cite_pattern or _CITE_CLUSTER_RE
+    return sum(1 for match in _SENTENCE_RE.finditer(markdown or "") if pattern.search(match.group(0)))
+
+
+# ── 参考文献校验（DOI / 年份），纯本地、无网络 ───────────────────────────────
+
+DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+# 常见 Elsevier 期刊代码：仅用于在 OCR 混淆（i/j、l/1、O/0）下做唯一匹配修复。
+_ELSEVIER_CODES = frozenset({
+    "ijbiomac", "jclepro", "cej", "jhazmat", "scitotenv", "envpol", "chemosphere",
+    "carbpol", "polymer", "porgcoat", "indcrop", "apsusc", "jcis", "colsurfa",
+    "matdes", "compositesb", "compositesa", "eurpolymj", "polymdegradstab",
+    "jenvman", "biortech", "watres", "fcr", "still", "geoderma", "agwat", "jare",
+    "jece", "seppur", "powtec", "cherd", "fuel", "energy", "jiec", "reactfunctpolym",
+    "molliq", "jmrt", "ceramint", "jallcom", "conbuildmat", "foodchem", "ijpharm",
+    "jconrel", "msec", "actbio", "biomaterials", "susmat", "jsamd",
+})
+_OCR_CHAR_VARIANTS = {"i": "ij", "j": "ji", "l": "l1i", "1": "1l", "o": "o0", "0": "0o"}
+
+
+def _code_variants(code: str) -> set[str]:
+    variants = {""}
+    for ch in code:
+        options = _OCR_CHAR_VARIANTS.get(ch, ch)
+        variants = {prefix + option for prefix in variants for option in options}
+        if len(variants) > 4096:
+            return set()
+    return variants
+
+
+def normalize_doi(raw: str) -> tuple[str, str]:
+    """返回 (doi, status)；status ∈ empty / ok / fixed / invalid。
+
+    只做确定且唯一的本地修正：去掉 doi.org 前缀与尾随标点、注册号里的 O/l 混淆、
+    Elsevier 'i.' 前缀误识为 'j.'、以及期刊代码在 i/j、l/1、o/0 混淆下唯一命中已知代码。
+    """
+    import unicodedata
+    original = (raw or "").strip()
+    if not original:
+        return "", "empty"
+    doi = unicodedata.normalize("NFKC", original)
+    doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi\s*[:：]\s*)", "", doi, flags=re.I).strip()
+    doi = doi.rstrip(".,;。，；")
+    # 注册号部分只能是数字：'1O.1016' / '10. 1016' / '10.1O16'
+    match = re.match(r"^\s*1[0Oo]\s*\.\s*([0-9OolI]{4,9})\s*/\s*", doi)
+    if match:
+        registrant = match.group(1).translate(str.maketrans("OolI", "0011"))
+        doi = f"10.{registrant}/" + doi[match.end():]
+    if doi.startswith("10.1016/"):
+        suffix = doi[len("10.1016/"):]
+        if suffix.startswith("i."):
+            suffix = "j." + suffix[2:]
+        journal = re.match(r"^j\.([a-z0-9]+)\.", suffix)
+        if journal and journal.group(1) not in _ELSEVIER_CODES:
+            hits = _code_variants(journal.group(1)) & _ELSEVIER_CODES
+            if len(hits) == 1:
+                suffix = f"j.{hits.pop()}." + suffix[journal.end():]
+        doi = "10.1016/" + suffix
+    if not DOI_RE.match(doi):
+        return original, "invalid"
+    return doi, ("ok" if doi == original else "fixed")
+
+
+def _validate_references(sorted_ref_items, canonical_meta, paper_meta, report) -> None:
+    invalid, fixed, missing_year = [], [], []
+    for number, doc_id in sorted_ref_items:
+        meta = canonical_meta.setdefault(doc_id, clean_paper_meta(paper_meta.get(doc_id, {})))
+        doi, status = normalize_doi(meta.get("doi", ""))
+        if status == "invalid":
+            invalid.append(f"[{number}] {meta.get('doi')}")
+        elif status == "fixed":
+            fixed.append(f"[{number}] {meta.get('doi')} → {doi}")
+            meta["doi"] = doi
+        if meta.get("doc_type") != "web" and not (meta.get("year") or meta.get("filing_date")):
+            missing_year.append(f"[{number}] {_best_title(meta)[:40]}")
+    if invalid:
+        report.add("reference_doi_invalid", "warning",
+                   "以下参考文献 DOI 格式无效且无法唯一修复，请人工核对：" + "；".join(invalid), "参考文献")
+    if fixed:
+        report.add("reference_doi_normalized", "warning",
+                   "以下 DOI 疑似 OCR 错误，已按唯一规则本地修正（请复核）：" + "；".join(fixed), "参考文献")
+    if missing_year:
+        report.add("reference_year_missing", "warning",
+                   "以下参考文献缺少出版年份：" + "；".join(missing_year), "参考文献")
+
+
+def _audit_numeric_provenance(draft, heading, markdown, evidence_by_heading, paper_meta,
+                              identity_to_doc, new_number_to_doc, report, numeric_max) -> None:
+    raw_numbers: dict[str, set[str]] = {
+        doc_id: set(values or ()) for doc_id, values in (draft.evidence_numbers or {}).items()
+    }
+    evidence = evidence_by_heading.get(draft.heading)
+    if evidence is None:
+        evidence = evidence_by_heading.get(heading)
+    for doc_id, values in evidence_numbers_for(evidence or []).items():
+        raw_numbers.setdefault(doc_id, set()).update(values)
+    if not raw_numbers:
+        return
+    doc_numbers: dict[str, set[str]] = {}
+    for doc_id, values in raw_numbers.items():
+        identity = _identity(doc_id, clean_paper_meta(paper_meta.get(doc_id, {})))
+        doc_numbers.setdefault(identity_to_doc.get(identity, doc_id), set()).update(values)
+
+    def resolve_docs(sentence: str) -> set[str]:
+        return {
+            new_number_to_doc[int(number)]
+            for number in _extract_all_citation_numbers(sentence)
+            if int(number) in new_number_to_doc
+        }
+
+    result = check_numeric_provenance(markdown, doc_numbers, resolve_docs)
+    if not result.unsupported:
+        return
+    severity = "blocking" if result.unsupported_ratio > numeric_max else "warning"
+    for item in result.unsupported:
+        report.add(
+            "numeric_unsupported", severity,
+            f"数值 {', '.join(item['numbers'])} 未出现在所引文献 "
+            f"{', '.join(doc[:8] for doc in item['doc_ids'])} 的证据中：{item['sentence'][:120]}",
+            heading,
+        )
+    report.add(
+        "numeric_unsupported_ratio", severity,
+        f"本章 {len(result.unsupported)}/{result.numeric_sentences} 个量化句无法溯源"
+        f"（占比 {result.unsupported_ratio:.0%}，阈值 {numeric_max:.0%}）",
+        heading,
+    )
+
+
+def _audit_unsourced_sentences(draft, heading, markdown, report, unsourced_max) -> None:
+    unsourced = [s for s in (draft.unsourced_sentences or []) if str(s).strip()]
+    if not unsourced:
+        return
+    cited = count_cited_sentences(markdown)
+    ratio = len(unsourced) / (cited + len(unsourced))
+    severity = "blocking" if ratio > unsourced_max else "warning"
+    for sentence in unsourced:
+        report.add("unsourced_claim", severity,
+                   f"句子的幻觉引用已被剥离，现无来源支撑：{str(sentence)[:120]}", heading)
+    report.add("unsourced_claim_ratio", severity,
+               f"本章 {len(unsourced)} 句因幻觉引用被剥离而失去来源（占比 {ratio:.0%}，阈值 {unsourced_max:.0%}）",
+               heading)
+
+
 def audit_and_clean_review(
     review_doc: ReviewDoc,
     allowed_evidence: EvidenceContext,
     paper_meta: Mapping[str, Mapping],
+    *,
+    evidence_by_heading: Mapping[str, list | None] | None = None,
 ) -> ReviewQualityResult:
-    """通过单一接口审计并清洗综述副本；不产生 I/O 或远程调用。"""
+    """通过单一接口审计并清洗综述副本；不产生 I/O 或远程调用。
+
+    evidence_by_heading（可选）：章节写作时的证据列表，用于数值溯源；与 SectionDraft.evidence_numbers
+    （检查点持久化的数值表）取并集。两者皆缺失的章节跳过数值溯源。
+    """
     report = QualityReport()
+    evidence_by_heading = evidence_by_heading or {}
+    numeric_max = numeric_unsupported_max()
+    unsourced_max = unsourced_claim_max()
     identity_to_doc: dict[str, str] = {}
     canonical_meta: dict[str, dict] = {}
     canonical_numbers: dict[str, int] = {}
@@ -482,14 +809,18 @@ def audit_and_clean_review(
                     "含数值与单位的句子仅由第二轨背景文献支撑，建议改用第一轨直接证据",
                     heading,
                 )
-        new_sections.append(SectionDraft(
+        _audit_numeric_provenance(
+            draft, heading, markdown, evidence_by_heading, paper_meta,
+            identity_to_doc, new_number_to_doc, report, numeric_max,
+        )
+        _audit_unsourced_sentences(draft, heading, markdown, report, unsourced_max)
+        new_sections.append(draft.model_copy(update=dict(
             heading=heading,
             markdown=markdown,
             cited_doc_ids=cited_ids,
             track_a_doc_ids=[doc_id for doc_id in cited_ids if doc_id in track_a_ids],
             track_b_doc_ids=[doc_id for doc_id in cited_ids if doc_id in track_b_ids],
-            source_evidence_count=draft.source_evidence_count,
-        ))
+        )))
     conclusion = rewrite(review_doc.conclusion, "结论与展望")
     if not conclusion.strip():
         report.add("empty_conclusion", "blocking", "结论正文为空", "结论与展望")
@@ -497,6 +828,7 @@ def audit_and_clean_review(
         report.add("raw_json_conclusion", "blocking", "结论仍是未解析的 JSON 输出", "结论与展望")
 
     sorted_ref_items = sorted(new_number_to_doc.items())
+    _validate_references(sorted_ref_items, canonical_meta, paper_meta, report)
     references = [
         format_reference(number, doc_id, canonical_meta.get(doc_id, paper_meta.get(doc_id, {})))
         for number, doc_id in sorted_ref_items

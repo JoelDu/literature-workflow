@@ -777,13 +777,47 @@ def _load_review_jobs():
     with _jobs_lock:
         if _review_jobs_loaded_path == store.path:
             return
+        paused = []
         for job in store.load_all():
             if job["status"] in ("running", "queued"):
                 job["status"] = "interrupted"
                 job["current_stage"] = "INTERRUPTED"
                 store.save(job)
             _jobs.setdefault(job["job_id"], job)
+            if job["status"] == "paused_quota":
+                paused.append((job["job_id"], job.get("resume_after")))
         _review_jobs_loaded_path = store.path
+    # 新进程为额度暂停的任务重新布置 UTC 零点后的自动续跑定时器。
+    from litreview.review_jobs import schedule_quota_resume
+    for job_id, resume_after in paused:
+        schedule_quota_resume(job_id, resume_after, _auto_resume_review)
+
+
+def _resume_review_job(job_id: str) -> tuple[bool, str]:
+    """把可恢复任务切回 running 并启动 worker；返回 (是否启动, 错误信息)。"""
+    from litreview.review_jobs import RESUMABLE_STATUSES, cancel_quota_resume
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return False, "任务不存在"
+        if job["status"] not in RESUMABLE_STATUSES:
+            return False, "当前任务不能恢复"
+        cancel_quota_resume(job_id)
+        job.update(status="running", error="", current_stage="RESUMING", resume_after="")
+        for field in ("baseline_verdict", "baseline_status", "baseline_summary", "baseline_error"):
+            job[field] = None
+        job.setdefault("log", []).append("从已保存的章节检查点恢复")
+        _persist_web_review_job(job)
+    _start_review_thread(job)
+    return True, ""
+
+
+def _auto_resume_review(job_id: str) -> None:
+    try:
+        started, error = _resume_review_job(job_id)
+        logger.info(f"额度重置后自动续跑综述任务 {job_id}: {'已启动' if started else error}")
+    except Exception as exc:  # 定时器线程内不能抛出
+        logger.warning(f"自动续跑综述任务 {job_id} 失败: {exc}")
 
 
 def _persist_web_review_job(job):
@@ -801,19 +835,12 @@ def _start_review_thread(job):
 
 async def api_review_resume(request: Request) -> JSONResponse:
     _load_review_jobs()
-    with _jobs_lock:
-        job = _jobs.get(request.path_params["job_id"])
-        if not job:
-            return JSONResponse({"success": False, "error": "任务不存在"}, status_code=404)
-        if job["status"] not in ("interrupted", "failed", "partial"):
-            return JSONResponse({"success": False, "error": "当前任务不能恢复"}, status_code=409)
-        job.update(status="running", error="", current_stage="RESUMING")
-        for field in ("baseline_verdict", "baseline_status", "baseline_summary", "baseline_error"):
-            job[field] = None
-        job.setdefault("log", []).append("从已保存的章节检查点恢复")
-        _persist_web_review_job(job)
-    _start_review_thread(job)
-    return JSONResponse({"success": True, "data": {"job_id": job["job_id"], "status": "running"}})
+    job_id = request.path_params["job_id"]
+    started, error = _resume_review_job(job_id)
+    if not started:
+        return JSONResponse({"success": False, "error": error},
+                            status_code=404 if error == "任务不存在" else 409)
+    return JSONResponse({"success": True, "data": {"job_id": job_id, "status": "running"}})
 
 
 async def api_review_outline(request: Request) -> JSONResponse:
@@ -864,7 +891,9 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                                   write_intro_conclusion, assemble_review, render_review_note,
                                   export_docx)
     from litreview.review_orchestrator import (ReviewDependencies, ReviewHooks,
-        SectionGenerationConfig, allocate_review_words, generate_review_sections)
+        SectionGenerationConfig, allocate_review_words, generate_review_sections,
+        quota_pause_info)
+    from litreview.quota import QuotaExceededError
     from litreview.stages import get_scaling_config
     import copy
     from rich.console import Console
@@ -911,8 +940,13 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                            research_gap=job.get("research_gap", ""), thesis=job.get("thesis", ""),
                            mainline_logic=job.get("mainline_logic", ""))
             log(f"✔ 大纲完成：《{outline.title}》（共 {len(outline.sections)} 章节）", stage="A_OUTLINE", progress=15)
-            
+        # 显式参数优先，否则沿用大纲 JSON 中的立论，保证每章写作都拿到同一套 thesis。
+        outline.apply_alignment(job.get("thesis", ""), job.get("research_gap", ""),
+                                job.get("mainline_logic", ""))
+
         with _jobs_lock:
+            job["thesis"], job["research_gap"], job["mainline_logic"] = (
+                outline.thesis, outline.research_gap, outline.mainline_logic)
             job["outline"] = outline.model_dump()
 
             _persist_web_review_job(job)
@@ -935,9 +969,14 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             SectionGenerationConfig(
                 section_words=section_words, focus=focus,
                 initial_drafts=[SectionDraft(**item) for item in job.get("checkpoint", [])],
-                review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"]),
+                review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"],
+                thesis=outline.thesis, research_gap=outline.research_gap,
+                mainline_logic=outline.mainline_logic),
             ReviewHooks(on_progress=log, on_checkpoint=checkpoint),
         )
+        if isinstance(section_result.paused_quota, dict):
+            _pause_web_review_job(job, section_result.paused_quota, log)
+            return
         drafts = section_result.drafts
         # A resumed missing chapter belongs in its original outline position.
         order = {section.heading: i for i, section in enumerate(outline.sections)}
@@ -956,6 +995,8 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                                                        concl_words=concl_words, focus=focus,
                                                        thesis=job.get("thesis", ""),
                                                        research_gap=job.get("research_gap", ""))
+        except QuotaExceededError:
+            raise
         except Exception as e:
             log(f"⚠️ 引言/结论撰写异常（正文已保留）: {e}")
             intro, conclusion = "", ""
@@ -964,7 +1005,8 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
         # 5. 装配与渲染导出 (Stage D)
         log("📦 阶段 D：组装规范参考文献、生成 Markdown 与 Word 文档...", stage="D_ASSEMBLING", progress=92)
         evidence_total = section_result.evidence_count
-        review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total)
+        review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total,
+                                 evidence_by_heading=section_result.evidence_by_heading)
         
         template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
         out_path = render_review_note(review, paper_meta, settings, template_path, model)
@@ -1102,6 +1144,8 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                              "baseline_status": baseline_status,
                              "baseline_summary": baseline_summary,
                              "baseline_error": baseline_error})
+    except QuotaExceededError as e:
+        _pause_web_review_job(job, quota_pause_info(e), log)
     except Exception as e:
         logger.error(f"综述生成失败: {e}\n{traceback.format_exc()}")
         with _jobs_lock:
@@ -1110,6 +1154,21 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             job["error"] = str(e)
             job["log"].append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 任务失败: {e}")
             _persist_web_review_job(job)
+
+
+def _pause_web_review_job(job: dict, info: dict, log) -> None:
+    """额度耗尽 → paused_quota（非失败）：保留检查点、记录 UTC 重置时刻并布置自动续跑。"""
+    from litreview.review_jobs import PAUSED_QUOTA, schedule_quota_resume
+    with _jobs_lock:
+        job["status"] = PAUSED_QUOTA
+        job["current_stage"] = "PAUSED_QUOTA"
+        job["resume_after"] = info.get("resume_at", "")
+        job["error"] = info.get("message", "")
+        _persist_web_review_job(job)
+    delay = schedule_quota_resume(job["job_id"], job["resume_after"], _auto_resume_review)
+    suffix = "届时自动续跑" if delay is not None else "届时请手动恢复"
+    log(f"⏸ 额度耗尽，任务已暂停（非失败）；下一次 UTC 额度重置 {job['resume_after']}，{suffix}",
+        stage="PAUSED_QUOTA")
 
 
 async def api_review_generate(request: Request) -> JSONResponse:
@@ -1230,12 +1289,13 @@ async def api_review_job_stream(request: Request) -> StreamingResponse:
                 "baseline_status": job.get("baseline_status"),
                 "baseline_summary": job.get("baseline_summary"),
                 "baseline_error": job.get("baseline_error"),
+                "resume_after": job.get("resume_after"),
                 "error": job.get("error")
             }
             
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             
-            if job.get("status") in ("done", "failed", "partial", "interrupted"):
+            if job.get("status") in ("done", "failed", "partial", "interrupted", "paused_quota"):
                 break
                 
             await asyncio.sleep(1.0)

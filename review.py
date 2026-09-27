@@ -732,6 +732,30 @@ def cmd_outline(args):
         console.print(f"\n[green]✔ 大纲已保存至 {args.output}（可手工编辑后用 --outline 传入 generate）。")
 
 
+EXIT_PAUSED_QUOTA = 75  # EX_TEMPFAIL：额度暂停，可续跑，不是失败
+
+
+def _pause_cli_for_quota(args, outline, drafts, info) -> None:
+    """CLI 无后台调度：把大纲与已完成章节写入检查点文件，提示次日用 --resume-from 续跑。"""
+    from datetime import datetime
+    ckpt_dir = os.path.join(settings.REVIEW_OUTPUT_DIR, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = getattr(args, "resume_from", None) or os.path.join(
+        ckpt_dir, f"review_paused_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"status": "paused_quota", "topic": args.topic,
+                   "resume_after": info.get("resume_at", ""),
+                   "outline": outline.model_dump(),
+                   "drafts": [draft.model_dump() for draft in drafts]},
+                  fh, ensure_ascii=False, indent=2)
+    console.rule("[bold yellow]⏸ 综述已暂停（UTC 日额度耗尽，非失败）")
+    console.print(f"[yellow]{info.get('message', '')}")
+    console.print(f"已完成 {len(drafts)}/{len(outline.sections)} 章，检查点：{path}")
+    console.print(f"请在 {info.get('resume_at', '')} (UTC) 之后运行：\n"
+                  f"  python review.py generate \"{args.topic}\" --resume-from \"{path}\"")
+    sys.exit(EXIT_PAUSED_QUOTA)
+
+
 def cmd_generate(args):
     import time
     from litreview.retrieval_store import create_retrieval_store
@@ -751,9 +775,21 @@ def cmd_generate(args):
     t0 = time.time()
 
     focus = args.focus or ""
+    from litreview.models import Outline, SectionDraft
+    from litreview.quota import QuotaExceededError
+    from litreview.review_orchestrator import quota_pause_info
+
+    resume_state = None
+    if getattr(args, "resume_from", None):
+        with open(args.resume_from, "r", encoding="utf-8") as fh:
+            resume_state = json.load(fh)
 
     # Stage A
-    if args.outline:
+    if resume_state:
+        outline = Outline.from_dict(resume_state["outline"], topic=args.topic)
+        console.print(f"[cyan]从暂停检查点恢复: {outline.title}（已完成 "
+                      f"{len(resume_state.get('drafts', []))}/{len(outline.sections)} 章节）")
+    elif args.outline:
         outline = load_outline_file(args.outline, args.topic)
         console.print(f"[cyan]使用外部大纲: {outline.title}（{len(outline.sections)} 章节）")
     else:
@@ -765,6 +801,10 @@ def cmd_generate(args):
                                    thesis=getattr(args, 'thesis', '') or '',
                                    mainline_logic=getattr(args, 'logic', '') or '')
         console.print(f"[green]✔ 大纲: {outline.title}（{len(outline.sections)} 章节）")
+    # 显式参数优先，否则沿用大纲 JSON 中的立论；之后全程只读 outline 上的立论。
+    outline.apply_alignment(getattr(args, 'thesis', '') or '', getattr(args, 'gap', '') or '',
+                            getattr(args, 'logic', '') or '')
+    args.thesis, args.gap, args.logic = outline.thesis, outline.research_gap, outline.mainline_logic
 
     from litreview.review_orchestrator import allocate_review_words
     word_plan = allocate_review_words(args.words or 0, len(outline.sections))
@@ -807,9 +847,14 @@ def cmd_generate(args):
         SectionGenerationConfig(
             section_words=section_words, focus=focus,
             review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"],
+            initial_drafts=[SectionDraft(**item) for item in (resume_state or {}).get("drafts", [])],
+            thesis=outline.thesis, research_gap=outline.research_gap,
+            mainline_logic=outline.mainline_logic,
         ),
         ReviewHooks(on_progress=lambda message: console.print(message)),
     )
+    if isinstance(section_result.paused_quota, dict):
+        _pause_cli_for_quota(args, outline, section_result.drafts, section_result.paused_quota)
     drafts = section_result.drafts
     failed_sections = section_result.failed_sections
     section_evidence = section_result.section_evidence
@@ -823,13 +868,16 @@ def cmd_generate(args):
                                                    concl_words=concl_words, focus=focus,
                                                    thesis=getattr(args, 'thesis', '') or '',
                                                    research_gap=getattr(args, 'gap', '') or '')
+    except QuotaExceededError as e:
+        _pause_cli_for_quota(args, outline, drafts, quota_pause_info(e))
     except Exception as e:
         console.print(f"[yellow]⚠️ 引言/结论生成失败（正文保留）: {e}")
         intro, conclusion = "", ""
 
     # Stage D
     evidence_total = section_result.evidence_count
-    review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total)
+    review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total,
+                             evidence_by_heading=section_result.evidence_by_heading)
     template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
     out_path = render_review_note(review, paper_meta, settings, template_path, model)
 
@@ -1095,6 +1143,8 @@ def main():
     p.add_argument("--logic", help="选定单一主线分类逻辑")
     p.add_argument("--lang", choices=["zh", "en"], default="zh", help="目标语言（默认 zh）")
     p.add_argument("--dry-run", action="store_true", help="停在证据阶段，打印证据表")
+    p.add_argument("--resume-from", dest="resume_from",
+                   help="从额度暂停时写出的检查点 JSON 续跑（大纲+已完成章节）")
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("validate-run", help="校验单次综述运行清单的契约合规性、文件完整性与哈希真实性")
