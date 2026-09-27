@@ -2,7 +2,7 @@ import json, hashlib, openpyxl, re
 from pathlib import Path
 
 def build_silver_v131():
-    base_dir = Path('/home/dudu/GoogleDrive/Antigravity/literature_analyzer')
+    base_dir = Path(__file__).resolve().parent.parent
     excel_path = base_dir / 'tests/data/citation_user_minimal_review_pack_v1.2_ChatGPT审核版.xlsx'
     
     wb = openpyxl.load_workbook(excel_path)

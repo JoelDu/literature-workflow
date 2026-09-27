@@ -271,7 +271,7 @@ def list_library_documents(
 
 def get_document_full_detail(
     doc_id: str,
-    prod_db_path: str = "/mnt/ripe/literature_analyzer_data/batch_tracking.db",
+    prod_db_path: str = "./data/batch_tracking.db",
     test_citation_db_path: str = "data/test_citation_network.db"
 ) -> Dict[str, Any]:
     """获取单篇文献的完整详情：元数据、PDF资产、消歧引文及网络拓扑。"""
@@ -428,7 +428,7 @@ def list_discovery_candidates_paginated(
 
 def enrich_document_metadata(
     doc_id: str,
-    prod_db_path: str = "/mnt/ripe/literature_analyzer_data/batch_tracking.db",
+    prod_db_path: str = "./data/batch_tracking.db",
     test_citation_db_path: str = "data/test_citation_network.db",
     cache_db_path: str = "data/external_discovery_cache.db"
 ) -> Dict[str, Any]:

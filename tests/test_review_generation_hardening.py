@@ -520,3 +520,36 @@ def test_mcp_quota_exhaustion_pauses_job_and_resume_requeues(monkeypatch, tmp_pa
     assert "重新入队" in server.resume_review.__wrapped__("qjob")
     assert queued.get_nowait()[0] == "qjob"
     assert server._get_persistent_review_job("qjob")["status"] == "queued"
+
+
+def test_mcp_quota_during_outline_pauses_and_resume_regenerates(monkeypatch, tmp_path):
+    """大纲阶段就撞额度：没有大纲也没有章节检查点，续跑必须被允许（从头生成大纲）。"""
+    import queue
+    from litreview import review_jobs, stages
+    from litreview.quota import QuotaExceededError
+    server = _fresh_mcp(monkeypatch, tmp_path)
+    monkeypatch.setattr(review_jobs, "schedule_quota_resume", lambda *_a, **_k: 1.0)
+    monkeypatch.setattr(server, "_client", lambda: object())
+    monkeypatch.setattr(server, "_store", lambda: SimpleNamespace(get_paper_meta=lambda: {}))
+    monkeypatch.setattr(server, "_embedder", lambda: object())
+    monkeypatch.setattr(server, "_reranker", lambda: None)
+    monkeypatch.setattr(server, "log_run_event", lambda **_k: None)
+
+    def no_quota(*_a, **_k):
+        raise QuotaExceededError("额度不足", utc_date="2026-09-27", model="gpt-5.4")
+
+    monkeypatch.setattr(stages, "generate_outline", no_quota)
+    server._jobs["ojob"] = {"job_id": "ojob", "status": "running", "topic": "测试", "log": [],
+                            "output": "", "docx": "", "error": "", "summary": "",
+                            "started_at": "now"}
+
+    server._run_review_job("ojob", "测试", "", 0, 0, "")
+
+    persisted = server._get_persistent_review_job("ojob")
+    assert persisted["status"] == "paused_quota"
+    assert not persisted["outline_json"] and not persisted["checkpoint_json"]
+    queued = queue.Queue()
+    monkeypatch.setattr(server, "_review_queue", queued)
+    monkeypatch.setattr(server, "_ensure_review_worker", lambda: None)
+    assert "重新入队" in server.resume_review.__wrapped__("ojob")
+    assert queued.get_nowait()[0] == "ojob"

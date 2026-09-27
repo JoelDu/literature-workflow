@@ -1360,7 +1360,9 @@ def resume_review(job_id: str) -> str:
         return f"任务 {job_id} 当前状态为 {job['status']}，无需或不能恢复。"
     cancel_quota_resume(job_id)
     job["resume_after"] = ""
-    if not job.get("outline_json"):
+    # 没大纲又有章节检查点：重生成的大纲对不上已写章节，不能续跑。
+    # 两者都没有（额度在大纲阶段就耗尽）则从头生成大纲是安全的。
+    if not job.get("outline_json") and job.get("checkpoint_json"):
         return "该历史任务没有持久化大纲，无法安全续跑；请重新调用 start_review。"
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

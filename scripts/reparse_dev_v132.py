@@ -9,7 +9,7 @@ from litreview.ref_parser import (
 )
 
 def reparse_and_build_silver_v132():
-    base_dir = Path('/home/dudu/GoogleDrive/Antigravity/literature_analyzer')
+    base_dir = Path(__file__).resolve().parent.parent
     
     # 1. Load library known works
     # Load from citation_gold_candidate_set_v0.json and database/metadata

@@ -8,7 +8,7 @@ async function api(path, body) {
   if (!response.ok || !result.success) throw new Error(result.error || '请求失败');
   return result.data;
 }
-const labels = {running: '生成中', done: '已完成', partial: '部分完成', failed: '失败', interrupted: '已中断'};
+const labels = {running: '生成中', done: '已完成', partial: '部分完成', failed: '失败', interrupted: '已中断', paused_quota: '额度暂停'};
 async function refresh() {
   try {
     const jobs = await api('/api/review/jobs');
@@ -19,7 +19,13 @@ async function refresh() {
       const title = document.createElement('h3');
       title.textContent = `${job.topic} — ${labels[job.status] || job.status} (${job.progress || 0}%)`;
       card.append(title);
-      if (['partial', 'failed', 'interrupted'].includes(job.status)) {
+      if (job.status === 'paused_quota') {
+        const note = document.createElement('p');
+        const when = job.resume_after ? new Date(job.resume_after).toLocaleString() : '下一次 UTC 额度重置后';
+        note.textContent = `当日 token 额度已用尽，已完成章节已存检查点；将于 ${when} 自动续跑。`;
+        card.append(note);
+      }
+      if (['partial', 'failed', 'interrupted', 'paused_quota'].includes(job.status)) {
         const button = document.createElement('button');
         button.textContent = '从检查点继续';
         button.onclick = async () => {

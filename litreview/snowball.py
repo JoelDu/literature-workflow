@@ -354,7 +354,7 @@ def _resolve_seed_work(
     dbs_to_check = []
     if db_path and os.path.exists(db_path):
         dbs_to_check.append(db_path)
-    prod_env_db = os.getenv("DB_PATH", "/mnt/ripe/literature_analyzer_data/batch_tracking.db")
+    prod_env_db = os.getenv("DB_PATH", "./data/batch_tracking.db")
     if os.path.exists(prod_env_db) and prod_env_db not in dbs_to_check:
         dbs_to_check.append(prod_env_db)
     for default_path in ["data/test_citation_network.db", "data/batch_tracking.db"]:
@@ -466,7 +466,7 @@ def _load_in_library_index(db_path: Optional[str]) -> Tuple[Dict[str, Dict[str, 
     dbs_to_check = []
     if db_path and os.path.exists(db_path):
         dbs_to_check.append(db_path)
-    prod_env_db = os.getenv("DB_PATH", "/mnt/ripe/literature_analyzer_data/batch_tracking.db")
+    prod_env_db = os.getenv("DB_PATH", "./data/batch_tracking.db")
     if os.path.exists(prod_env_db) and prod_env_db not in dbs_to_check:
         dbs_to_check.append(prod_env_db)
     for default_path in ["data/test_citation_network.db", "data/batch_tracking.db"]:

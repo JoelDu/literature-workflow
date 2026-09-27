@@ -111,7 +111,7 @@ class LiteratureReviewFacade:
     ):
         self.prod_db_path = prod_db_path or os.getenv(
             "DB_PATH",
-            "/mnt/ripe/literature_analyzer_data/batch_tracking.db"
+            "./data/batch_tracking.db"
         )
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.test_citation_db_path = test_citation_db_path or os.getenv(

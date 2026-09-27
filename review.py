@@ -715,12 +715,16 @@ def cmd_outline(args):
     from openai import OpenAI
     embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))
     console.print(f"[cyan]正在为主题「{args.topic}」生成综述大纲...")
-    outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
-                               focus=args.focus or "", n_sections=args.sections or 0,
-                               words=args.words or 0, target_lang=args.lang or "zh",
-                               research_gap=getattr(args, 'gap', '') or '',
-                               thesis=getattr(args, 'thesis', '') or '',
-                               mainline_logic=getattr(args, 'logic', '') or '')
+    from litreview.quota import QuotaExceededError
+    try:
+        outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
+                                   focus=args.focus or "", n_sections=args.sections or 0,
+                                   words=args.words or 0, target_lang=args.lang or "zh",
+                                   research_gap=getattr(args, 'gap', '') or '',
+                                   thesis=getattr(args, 'thesis', '') or '',
+                                   mainline_logic=getattr(args, 'logic', '') or '')
+    except QuotaExceededError as exc:
+        _exit_quota_before_outline(exc)
     console.rule(f"[bold green]📋 {outline.title}")
     for i, sec in enumerate(outline.sections, 1):
         console.print(f"[bold]{i}. {sec.heading}[/bold]")
@@ -753,6 +757,16 @@ def _pause_cli_for_quota(args, outline, drafts, info) -> None:
     console.print(f"已完成 {len(drafts)}/{len(outline.sections)} 章，检查点：{path}")
     console.print(f"请在 {info.get('resume_at', '')} (UTC) 之后运行：\n"
                   f"  python review.py generate \"{args.topic}\" --resume-from \"{path}\"")
+    sys.exit(EXIT_PAUSED_QUOTA)
+
+
+def _exit_quota_before_outline(exc) -> None:
+    """大纲阶段就撞额度：还没有任何可保存的产出，只提示何时重跑并以暂停码退出。"""
+    from litreview.review_orchestrator import quota_pause_info
+    info = quota_pause_info(exc)
+    console.rule("[bold yellow]⏸ 大纲阶段额度耗尽（UTC 日额度，非失败）")
+    console.print(f"[yellow]{info.get('message', '')}")
+    console.print(f"请在 {info.get('resume_at', '')} (UTC) 之后重新运行同一命令。")
     sys.exit(EXIT_PAUSED_QUOTA)
 
 
@@ -794,12 +808,15 @@ def cmd_generate(args):
         console.print(f"[cyan]使用外部大纲: {outline.title}（{len(outline.sections)} 章节）")
     else:
         console.print(f"[cyan]阶段 A：生成大纲（结合立论与痛点）...")
-        outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
-                                   focus=focus, n_sections=args.sections or 0,
-                                   words=args.words or 0, target_lang=args.lang or "zh",
-                                   research_gap=getattr(args, 'gap', '') or '',
-                                   thesis=getattr(args, 'thesis', '') or '',
-                                   mainline_logic=getattr(args, 'logic', '') or '')
+        try:
+            outline = generate_outline(args.topic, store, embedder, client, model, settings, console,
+                                       focus=focus, n_sections=args.sections or 0,
+                                       words=args.words or 0, target_lang=args.lang or "zh",
+                                       research_gap=getattr(args, 'gap', '') or '',
+                                       thesis=getattr(args, 'thesis', '') or '',
+                                       mainline_logic=getattr(args, 'logic', '') or '')
+        except QuotaExceededError as exc:
+            _exit_quota_before_outline(exc)
         console.print(f"[green]✔ 大纲: {outline.title}（{len(outline.sections)} 章节）")
     # 显式参数优先，否则沿用大纲 JSON 中的立论；之后全程只读 outline 上的立论。
     outline.apply_alignment(getattr(args, 'thesis', '') or '', getattr(args, 'gap', '') or '',

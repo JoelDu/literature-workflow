@@ -7,8 +7,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from litreview.citation_network import build_test_citation_network_db
 
 def main():
-    prod_db = "/mnt/ripe/literature_analyzer_data/batch_tracking.db"
-    test_db = "/home/dudu/GoogleDrive/Antigravity/literature_analyzer/data/test_citation_network.db"
+    from dotenv import load_dotenv
+    load_dotenv()
+    prod_db = os.getenv("DB_PATH", "./data/batch_tracking.db")
+    test_db = os.getenv("TEST_CITATION_DB_PATH",
+                        str(Path(__file__).parent.parent / "data" / "test_citation_network.db"))
     
     print(f"Starting Local Citation Network MVP build...")
     print(f"  Source Production DB (read-only): {prod_db}")
