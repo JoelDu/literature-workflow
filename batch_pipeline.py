@@ -49,11 +49,27 @@ STATUS_BATCH_FAILED = "BATCH_FAILED"               # 云端 Batch 本身失败�
 STATUS_RESULT_PARSE_FAILED = "RESULT_PARSE_FAILED" # 云端成功但下载或解析结果失败
 STATUS_COMPLETED = "COMPLETED"
 STATUS_EXPORTED = "EXPORTED"
+# 已送进 LLM 分析 BATCH_MAX_ANALYSIS_ATTEMPTS 次仍拿不到可用结果的终态：
+# 不在自动重提交名单里，需人工排查后手动重置（status='PARSED', analysis_attempts=0）。
+STATUS_ANALYSIS_FAILED = "ANALYSIS_FAILED"
 
 # 自动重试重提交补偿状态集
 RESUBMITTABLE_STATUSES = (STATUS_PARSED, STATUS_SUBMIT_FAILED, STATUS_BATCH_FAILED, STATUS_RESULT_PARSE_FAILED)
 # 已在处理中/已完成，必须跳过的状态集
 SKIP_STATUSES = (STATUS_SUBMITTED, STATUS_COMPLETED, STATUS_EXPORTED)
+
+
+
+def _max_analysis_attempts() -> int:
+    """单篇文献最多送进 LLM Batch 的次数（环境变量 BATCH_MAX_ANALYSIS_ATTEMPTS，默认 3）。"""
+    try:
+        return max(1, int(os.getenv("BATCH_MAX_ANALYSIS_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+# 测试可替换的休眠入口（避免 monkeypatch 全局 time.sleep）
+_sleep = time.sleep
 
 
 # ── 数据库 ──────────────────────────────────────────────────────────────────
@@ -65,7 +81,9 @@ def init_db() -> sqlite3.Connection:
     同一份，好让主管道没跑过的新库里 review.py / MCP 不至于撞 no such table。
     """
     os.makedirs(os.path.dirname(settings.DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(settings.DB_PATH)
+    # 统一连接策略：busy_timeout + WAL，避免与实时/综述进程抢锁时立刻 database is locked
+    from litreview.sqlite_runtime import connect_sqlite
+    conn = connect_sqlite(settings.DB_PATH)
     ensure_papers_table(
         conn,
         on_upgrade=lambda col: console.print(f"[yellow]⚠️ 数据库结构升级：已添加 {col} 列。"),
@@ -94,7 +112,10 @@ def prepare_batch() -> dict:
     
     conn = init_db()
     c = conn.cursor()
-    
+
+    # 先把重试次数耗尽的文献转入终态，下面的两处拾起逻辑就都不会再捡到它们
+    _retire_exhausted_papers(c, conn)
+
     # 自动创建所需要的临时及输出文件夹
     init_dirs(
         settings.INPUT_PDF_DIR,
@@ -108,7 +129,6 @@ def prepare_batch() -> dict:
     llm_router = LLMRouter()
 
     deepseek_requests = []
-    gemini_requests = []
 
     # CAJ 预转换：在扫描 PDF 之前把 input_pdfs 下的 .caj 转成 .pdf，
     # 转换成功的文件会被下面的 glob("*.pdf") 自动捡起进入正常流程
@@ -117,7 +137,8 @@ def prepare_batch() -> dict:
         console.print(f"[cyan]🔄 检测到 {len(caj_files)} 个 CAJ 文件，开始转换为 PDF...")
         try:
             from caj_converter import convert_caj_files
-            convert_caj_files()
+            convert_caj_files(settings.INPUT_PDF_DIR,
+                              os.path.join(os.path.dirname(settings.DB_PATH), "caj_originals"))
         except Exception as e:
             console.print(f"[red]CAJ 转换模块运行异常，本轮跳过: {e}")
 
@@ -142,6 +163,16 @@ def prepare_batch() -> dict:
         row = c.fetchone()
         if row:
             status, mineru_md, lang = row
+            if status == STATUS_ANALYSIS_FAILED:
+                # 重试次数已耗尽的文献被重新放回输入目录：不再自动重解析/重提交，
+                # 移到失败目录等人工处理，避免每轮扫描都重算哈希。
+                failed_path = os.path.join(settings.FAILED_PDF_DIR, os.path.basename(pdf_path))
+                console.print(f"[yellow]⚠️ {os.path.basename(pdf_path)} 已判定分析失败（ANALYSIS_FAILED），移入失败目录；"
+                              f"如需重试请手动重置 status='PARSED', analysis_attempts=0。")
+                shutil.move(pdf_path, failed_path)
+                c.execute("UPDATE papers SET pdf_path=? WHERE id=?", (failed_path, doc_id))
+                conn.commit()
+                continue
             if status in SKIP_STATUSES:
                 # 若已入库（COMPLETED/EXPORTED）但仍留在输入目录，自动移动到归档目录防止堆积
                 new_pdf_path = os.path.join(settings.PROCESSED_PDF_DIR, os.path.basename(pdf_path))
@@ -201,9 +232,13 @@ def prepare_batch() -> dict:
 
                     docx_path = mineru_res.get("docx_path")
                     if docx_path and os.path.exists(docx_path):
-                        docx_dir = os.path.join(os.path.dirname(settings.INPUT_PDF_DIR), "word_exports")
-                        os.makedirs(docx_dir, exist_ok=True)
-                        shutil.copy(docx_path, os.path.join(docx_dir, f"{title}.docx"))
+                        # Word 副本只是附带产物：复制失败不能被下面的 except 当成「解析永久失败」
+                        try:
+                            docx_dir = os.path.join(os.path.dirname(settings.INPUT_PDF_DIR), "word_exports")
+                            os.makedirs(docx_dir, exist_ok=True)
+                            shutil.copy(docx_path, os.path.join(docx_dir, f"{title}.docx"))
+                        except Exception as e:
+                            console.print(f"[yellow]⚠️ 复制 Word 导出失败（不影响入库）{title}: {e}")
 
                     lang = llm_router.detect_language(md_text)
 
@@ -243,13 +278,13 @@ def prepare_batch() -> dict:
     # 自动拾起数据库中残留的已解析 (PARSED) 或提交失败 (SUBMIT_FAILED, BATCH_FAILED, RESULT_PARSE_FAILED) 记录进行补充提交
     # 这对守护进程中途崩溃/重启后的自动错峰重试至关重要，且对空扫描时的数据恢复极其重要！
     c.execute(
-        "SELECT id, title, language, mineru_md FROM papers WHERE status IN (?, ?, ?, ?)",
-        (STATUS_PARSED, STATUS_SUBMIT_FAILED, STATUS_BATCH_FAILED, STATUS_RESULT_PARSE_FAILED)
+        f"SELECT id, title, language, mineru_md FROM papers WHERE status IN ({','.join('?' * len(RESUBMITTABLE_STATUSES))})",
+        RESUBMITTABLE_STATUSES,
     )
     db_records = c.fetchall()
     
     # 过滤出当前尚未加入请求队列的记录
-    existing_custom_ids = set(r["custom_id"] for r in deepseek_requests) | set(r["id"] for r in gemini_requests)
+    existing_custom_ids = set(r["custom_id"] for r in deepseek_requests)
     
     added_from_db = 0
     for doc_id, title, lang, mineru_md in db_records:
@@ -278,30 +313,47 @@ def prepare_batch() -> dict:
         report["submitted"] += sub_cnt
         report["submit_failed"] += fail_cnt
 
-    # 统一提交 Gemini Batch
-    if gemini_requests:
-        sub_cnt, fail_cnt = _submit_gemini_batch(gemini_requests, llm_router, c, conn)
-        report["submitted"] += sub_cnt
-        report["submit_failed"] += fail_cnt
-
     conn.close()
     return report
+
+
+def _retire_exhausted_papers(c, conn) -> int:
+    """把已送进 LLM 分析达到上限次数仍失败的文献转入 ANALYSIS_FAILED 终态。
+
+    RESULT_PARSE_FAILED / BATCH_FAILED 都在自动重提交名单里；若 LLM 对某篇文献
+    稳定地产出坏 JSON，没有上限就会每轮重提交、无限烧额度。
+    """
+    limit = _max_analysis_attempts()
+    placeholders = ",".join("?" * len(RESUBMITTABLE_STATUSES))
+    c.execute(
+        f"SELECT id, title, error_message, analysis_attempts FROM papers "
+        f"WHERE status IN ({placeholders}) AND COALESCE(analysis_attempts, 0) >= ?",
+        (*RESUBMITTABLE_STATUSES, limit),
+    )
+    rows = c.fetchall()
+    for doc_id, title, last_err, attempts in rows:
+        err_msg = (f"已提交 LLM 分析 {attempts} 次（上限 BATCH_MAX_ANALYSIS_ATTEMPTS={limit}）仍失败，"
+                   f"停止自动重提交。最近一次错误: {(last_err or '')[:400]}")
+        c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?",
+                  (STATUS_ANALYSIS_FAILED, err_msg, doc_id))
+        console.print(f"[red]✖ {title or doc_id[:8]} 分析重试次数耗尽，转入 {STATUS_ANALYSIS_FAILED}。")
+        log_run_event(mode="batch", event="paper_analysis_failed", title=title or "", doc_id=doc_id,
+                      status="failed", error=err_msg, extra={"attempts": attempts, "limit": limit})
+    conn.commit()
+    return len(rows)
 
 
 def _utc_date() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _quota_available(c) -> int:
-    today = _utc_date()
-    now = datetime.now(timezone.utc).isoformat()
-    # 与同步的元数据/证据调用共用同一模型账本。否则两条路径各自跑满 200 万，
-    # 实际会超过 gpt-5.4-mini 的项目日上限。
-    c.execute("INSERT OR IGNORE INTO llm_usage_model_daily (utc_date, model, updated_at) VALUES (?, ?, ?)",
-              (today, settings.ANALYSIS_MODEL, now))
+def _quota_available(c, model: str | None = None) -> int:
+    """只读查询当日剩余额度（不写账本、不开写事务）。"""
+    model = model or settings.ANALYSIS_MODEL
     c.execute("SELECT reserved_tokens, actual_total_tokens FROM llm_usage_model_daily WHERE utc_date=? AND model=?",
-              (today, settings.ANALYSIS_MODEL))
-    reserved, actual = c.fetchone()
+              (_utc_date(), model))
+    row = c.fetchone()
+    reserved, actual = row if row else (0, 0)
     return max(0, settings.LLM_DAILY_TOKEN_CAP - reserved - actual)
 
 
@@ -326,148 +378,231 @@ def _split_for_quota(requests: list, available: int) -> list[list]:
     return batches
 
 
+# ── Batch 额度预留（短事务） ──────────────────────────────────────────────────
+# litreview/quota.py 的 reserve() 按「单个 prompt」预留，没有「按剩余额度切组」的能力，
+# 也暂无撤销预留的 API，所以 Batch 的预留/释放在这里用同一张 llm_usage_model_daily 账本
+# 自行实现。关键约束：每一步都是 BEGIN IMMEDIATE … COMMIT 的短事务，绝不把写锁带进
+# 文件上传、就绪轮询、建单重试这些网络操作里 —— 否则其它进程的 reserve() 会撞 database is locked。
+
+def _reserve_batch_quota(conn, requests: list, model: str):
+    """在一个短写事务里完成「查余额 → 切组 → 预留」，立即提交。
+
+    返回 (本次提交的请求列表, (utc_date, reserved_tokens, model))；额度不足返回 None。
+    """
+    conn.commit()  # 结束调用方可能遗留的隐式事务，BEGIN IMMEDIATE 才不会报嵌套事务
+    utc_date = _utc_date()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("INSERT OR IGNORE INTO llm_usage_daily (utc_date, updated_at) VALUES (?, ?)", (utc_date, now))
+        # 与同步的元数据/证据调用共用同一模型账本。否则两条路径各自跑满 200 万，
+        # 实际会超过 gpt-5.4-mini 的项目日上限。
+        conn.execute("INSERT OR IGNORE INTO llm_usage_model_daily (utc_date, model, updated_at) VALUES (?, ?, ?)",
+                     (utc_date, model, now))
+        reserved, actual = conn.execute(
+            "SELECT reserved_tokens, actual_total_tokens FROM llm_usage_model_daily WHERE utc_date=? AND model=?",
+            (utc_date, model)).fetchone()
+        available = max(0, settings.LLM_DAILY_TOKEN_CAP - reserved - actual)
+        batches = _split_for_quota(requests, available)
+        if not batches:
+            conn.rollback()
+            return None
+        # 每次只提交一个批次：必须等取回真实 usage 后才允许递推下一批。
+        picked = batches[0]
+        tokens = sum(request_reserved_tokens(r) for r in picked)
+        conn.execute("UPDATE llm_usage_daily SET reserved_tokens=reserved_tokens+?, updated_at=? WHERE utc_date=?",
+                     (tokens, now, utc_date))
+        conn.execute("UPDATE llm_usage_model_daily SET reserved_tokens=reserved_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
+                     (tokens, now, utc_date, model))
+        conn.commit()
+        return picked, (utc_date, tokens, model)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _release_batch_quota(conn, reservation) -> None:
+    """云端确认没有建单时撤销预留（短事务）。失败只告警：多留预留只会少跑，不会超额。"""
+    utc_date, tokens, model = reservation
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE llm_usage_daily SET reserved_tokens=MAX(0, reserved_tokens-?), updated_at=? WHERE utc_date=?",
+                     (tokens, now, utc_date))
+        conn.execute("UPDATE llm_usage_model_daily SET reserved_tokens=MAX(0, reserved_tokens-?), updated_at=? WHERE utc_date=? AND model=?",
+                     (tokens, now, utc_date, model))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        console.print(f"[yellow]⚠️ 释放 Batch 额度预留失败（预留保留为安全余量）: {e}")
+
+
 def _submit_openai_batches(requests: list, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
-    available = _quota_available(c)
-    batches = _split_for_quota(requests, available)
-    if not batches:
+    model = getattr(llm_router, "openai_model", None) or settings.ANALYSIS_MODEL
+    picked = _reserve_batch_quota(conn, requests, model)
+    if picked is None:
         console.print(f"[yellow]UTC {_utc_date()} 可用生成额度不足；等待下一次 UTC 00:00 重置。")
         return 0, 0
-    # 每次只提交一个批次：必须等取回真实 usage 后才允许递推下一批。
-    return _submit_openai_batch(batches[0], llm_router, c, conn)
+    batch_requests, reservation = picked
+    return _submit_openai_batch(batch_requests, llm_router, c, conn, reservation)
 
 
-def _submit_openai_batch(requests: list, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
-    reserved_tokens = sum(request_reserved_tokens(r) for r in requests)
-    console.print(f"[green]提交 {len(requests)} 个任务到 OpenAI Batch（预留 {reserved_tokens} token）...")
-    ds_file = "openai_batch.jsonl"
-    with open(ds_file, "w", encoding="utf-8") as f:
-        for r in requests:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            
+# ── 云端建单（防孤儿/防重复） ─────────────────────────────────────────────────
+
+_DEAD_BATCH_STATUSES = ("failed", "cancelled", "cancelling", "expired")
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+def _upload_batch_file(client, path: str) -> str:
+    """上传 JSONL（可安全重试：重复上传只会多一个无人引用的文件，不会多花额度）。"""
+    with open(path, "rb") as fh:
+        file_obj = client.files.create(file=fh, purpose="batch")
+    file_id = getattr(file_obj, "id", None)
+    if not file_id:
+        raise ValueError(f"无法从 FileObject 提取 file_id: {file_obj}")
+    return file_id
+
+
+def _wait_file_processed(client, file_id: str, attempts: int = 8) -> None:
+    # 🛡️ 针对 OpenAI 分布式存储最终一致性的就绪等待与轮询校验 (防 Cannot find file 异步竞态)
+    for _ in range(attempts):
+        try:
+            finfo = client.files.retrieve(file_id)
+            if getattr(finfo, "status", None) == "processed":
+                return
+        except Exception:
+            pass
+        _sleep(1.5)
+
+
+def _find_batch_for_input_file(client, file_id: str):
+    """在最近的 Batch 里找以 file_id 为输入、仍存活的任务（建单超时但云端其实已建成的情形）。"""
     try:
-        ds_client = llm_router.openai_client
-        
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-        def do_submit():
-            with open(ds_file, "rb") as fh:
-                file_obj = ds_client.files.create(file=fh, purpose="batch")
-            
-            file_id = getattr(file_obj, "id", None)
-            if not file_id:
-                raise ValueError(f"无法从 FileObject 提取 file_id: {file_obj}")
-            
-            # 🛡️ 针对 OpenAI 分布式存储最终一致性的就绪等待与轮询校验 (防 Cannot find file 异步竞态)
-            for attempt in range(8):
-                try:
-                    finfo = ds_client.files.retrieve(file_id)
-                    fstatus = getattr(finfo, "status", None)
-                    if fstatus == "processed":
-                        break
-                except Exception:
-                    pass
-                time.sleep(1.5)
-                
-            return ds_client.batches.create(
+        page = client.batches.list(limit=20)
+    except Exception as e:
+        console.print(f"[yellow]⚠️ 查询已有 Batch 列表失败: {e}")
+        return None
+    for b in getattr(page, "data", page) or []:
+        if getattr(b, "input_file_id", None) == file_id and getattr(b, "status", None) not in _DEAD_BATCH_STATUSES:
+            return b
+    return None
+
+
+def _create_batch_deduped(client, file_id: str, attempts: int = 3):
+    """建单；失败后先按 input_file_id 查重再重试。
+
+    batches.create 不是幂等的：客户端超时时云端可能已经建好了。此前整个「上传+建单」
+    被 tenacity 包起来重跑，一次超时就会在云端留下一个无人认领的孤儿 Batch，
+    并对同一批文献重复计费。
+    """
+    last_exc = None
+    for attempt in range(attempts):
+        if attempt:
+            existing = _find_batch_for_input_file(client, file_id)
+            if existing is not None:
+                console.print(f"[yellow]建单调用报错，但云端已存在同输入文件的 Batch {getattr(existing, 'id', '?')}，直接复用。")
+                return existing
+            _sleep(min(2 ** attempt, 10))
+        try:
+            return client.batches.create(
                 input_file_id=file_id,
                 endpoint="/v1/chat/completions",
                 completion_window="24h",
             )
-            
-        batch_job = do_submit()
+        except Exception as e:
+            last_exc = e
+            console.print(f"[yellow]⚠️ Batch 建单第 {attempt + 1} 次失败: {e}")
+    existing = _find_batch_for_input_file(client, file_id)
+    if existing is not None:
+        console.print(f"[yellow]建单调用报错，但云端已存在同输入文件的 Batch {getattr(existing, 'id', '?')}，直接复用。")
+        return existing
+    raise last_exc
+
+
+def _persist_submitted_batch(conn, batch_id: str, requests: list, reservation, attempts: int = 5) -> bool:
+    """云端建单成功后第一时间把 batch_id 落库（独立短事务，带锁重试）。
+
+    落库失败意味着云端有一个本地不知道的 Batch —— 这里多等几次锁，最终仍失败时
+    把 batch_id 与文献 ID 写进 pipeline_history.jsonl（event=batch_orphaned）供人工认领。
+    """
+    utc_date, reserved_tokens, model = reservation
+    last_exc = None
+    for attempt in range(attempts):
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO llm_batches (batch_id, model, utc_date, reserved_tokens, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'submitted', ?, ?)",
+                (batch_id, model, utc_date, reserved_tokens, now, now))
+            conn.execute("UPDATE llm_usage_daily SET submitted_batches=submitted_batches+1, updated_at=? WHERE utc_date=?",
+                         (now, utc_date))
+            conn.executemany(
+                "UPDATE papers SET status=?, batch_provider='openai', batch_job_id=?, error_message=NULL, "
+                "analysis_attempts=COALESCE(analysis_attempts, 0)+1 WHERE id=?",
+                [(STATUS_SUBMITTED, batch_id, req["custom_id"]) for req in requests])
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            conn.rollback()
+            last_exc = e
+            console.print(f"[yellow]⚠️ Batch {batch_id} 落库第 {attempt + 1} 次失败（{e}），稍后重试...")
+            _sleep(min(2 * (attempt + 1), 10))
+    err = f"云端 Batch {batch_id} 已建成但落库失败: {last_exc}"
+    console.print(f"[bold red]{err}。请人工在 llm_batches/papers 中登记该 batch_id，否则会重复提交。")
+    log_run_event(mode="batch", event="batch_orphaned", status="failed", error=err,
+                  extra={"batch_id": batch_id, "provider": "openai", "model": model,
+                         "reserved_tokens": reserved_tokens, "utc_date": utc_date,
+                         "custom_ids": [r["custom_id"] for r in requests]})
+    return False
+
+
+def _submit_openai_batch(requests: list, llm_router: LLMRouter, c, conn, reservation) -> tuple[int, int]:
+    """提交一个已完成额度预留的批次。调用前 reservation 已在短事务里提交。"""
+    import tempfile
+    reserved_tokens = reservation[1]
+    console.print(f"[green]提交 {len(requests)} 个任务到 OpenAI Batch（预留 {reserved_tokens} token）...")
+    work_dir = os.path.dirname(os.path.abspath(settings.DB_PATH))
+    os.makedirs(work_dir, exist_ok=True)
+    fd, ds_file = tempfile.mkstemp(prefix="openai_batch_", suffix=".jsonl", dir=work_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for r in requests:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    # 以下全部是网络操作，此时连接上没有任何未提交的事务、不持有写锁
+    try:
+        ds_client = llm_router.openai_client
+        file_id = _upload_batch_file(ds_client, ds_file)
+        _wait_file_processed(ds_client, file_id)
+        batch_job = _create_batch_deduped(ds_client, file_id)
         batch_id = getattr(batch_job, "id", None)
         if not batch_id:
             raise ValueError(f"无法从 Batch 提取 batch_id: {batch_job}")
-        now = datetime.now(timezone.utc).isoformat()
-        utc_date = _utc_date()
-        c.execute("INSERT INTO llm_batches (batch_id, model, utc_date, reserved_tokens, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'submitted', ?, ?)",
-                  (batch_id, llm_router.openai_model, utc_date, reserved_tokens, now, now))
-        c.execute("INSERT OR IGNORE INTO llm_usage_daily (utc_date, updated_at) VALUES (?, ?)", (utc_date, now))
-        c.execute("INSERT OR IGNORE INTO llm_usage_model_daily (utc_date, model, updated_at) VALUES (?, ?, ?)",
-                  (utc_date, llm_router.openai_model, now))
-        c.execute("UPDATE llm_usage_daily SET reserved_tokens=reserved_tokens+?, submitted_batches=submitted_batches+1, updated_at=? WHERE utc_date=?",
-                  (reserved_tokens, now, utc_date))
-        c.execute("UPDATE llm_usage_model_daily SET reserved_tokens=reserved_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
-                  (reserved_tokens, now, utc_date, llm_router.openai_model))
-        console.print(f"[bold green]OpenAI Batch 提交成功！ID: {batch_id}")
-        
-        for req in requests:
-            c.execute(
-                "UPDATE papers SET status=?, batch_provider='openai', batch_job_id=?, error_message=NULL WHERE id=?",
-                (STATUS_SUBMITTED, batch_id, req["custom_id"]),
-            )
-        conn.commit()
-        log_run_event(mode="batch", event="batch_submitted", status="success", extra={"batch_id": batch_id, "provider": "openai", "model": llm_router.openai_model, "count": len(requests), "reserved_tokens": reserved_tokens})
-        
-        # 成功后移除临时 jsonl
-        if os.path.exists(ds_file):
-            os.remove(ds_file)
-        return len(requests), 0
-        
     except Exception as e:
         err_msg = f"OpenAI Batch 提交失败: {str(e)}"
         console.print(f"[bold red]{err_msg}")
-        
-        # 将本轮队列中的文献在 DB 中全部标为 SUBMIT_FAILED 并保存错误原因以防卡死
-        for req in requests:
-            c.execute(
-                "UPDATE papers SET status=?, error_message=? WHERE id=?",
-                (STATUS_SUBMIT_FAILED, err_msg, req["custom_id"]),
-            )
+        # 云端没有建单：撤销额度预留，文献标 SUBMIT_FAILED 以便下一轮重试
+        _release_batch_quota(conn, reservation)
+        c.executemany("UPDATE papers SET status=?, error_message=? WHERE id=?",
+                      [(STATUS_SUBMIT_FAILED, err_msg, req["custom_id"]) for req in requests])
         conn.commit()
-        log_run_event(mode="batch", event="batch_submitted", status="failed", error=err_msg, extra={"provider": "openai", "count": len(requests)})
-        
+        log_run_event(mode="batch", event="batch_submitted", status="failed", error=err_msg,
+                      extra={"provider": "openai", "count": len(requests)})
+        return 0, len(requests)
+    finally:
         if os.path.exists(ds_file):
             os.remove(ds_file)
-        return 0, len(requests)
 
-
-def _submit_gemini_batch(requests: list, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
-    console.print(f"[green]提交 {len(requests)} 个任务到 Gemini Batch API...")
-    gm_file = "gemini_batch.jsonl"
-    with open(gm_file, "w", encoding="utf-8") as f:
-        for r in requests:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            
-    try:
-        gm_client = llm_router.gemini_client
-        if gm_client is None:
-            raise ValueError("拉取或提交历史 Gemini Batch 任务需要配置 GEMINI_API_KEY")
-        
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-        def do_submit():
-            uploaded_file = gm_client.files.upload(file=gm_file, config={"mimeType": "text/plain"})
-            return gm_client.batches.create(model="gemini-2.5-pro", src=uploaded_file.name)
-            
-        batch_job = do_submit()
-        batch_name = batch_job.name
-        console.print(f"[bold green]Gemini Batch 提交成功！Name: {batch_name}")
-        
-        for req in requests:
-            c.execute(
-                "UPDATE papers SET status=?, batch_provider='gemini', batch_job_id=?, error_message=NULL WHERE id=?",
-                (STATUS_SUBMITTED, batch_name, req["id"]),
-            )
-        conn.commit()
-        
-        if os.path.exists(gm_file):
-            os.remove(gm_file)
-        return len(requests), 0
-        
-    except Exception as e:
-        err_msg = f"Gemini Batch 提交失败: {str(e)}"
-        console.print(f"[bold red]{err_msg}")
-        
-        # 记录提交异常，转为提交失败状态
-        for req in requests:
-            c.execute(
-                "UPDATE papers SET status=?, error_message=? WHERE id=?",
-                (STATUS_SUBMIT_FAILED, err_msg, req["id"]),
-            )
-        conn.commit()
-        
-        if os.path.exists(gm_file):
-            os.remove(gm_file)
+    # 云端已建成：立即单独落库，之后任何环节出错都不会再丢 batch_id
+    if not _persist_submitted_batch(conn, batch_id, requests, reservation):
         return 0, len(requests)
+    console.print(f"[bold green]OpenAI Batch 提交成功！ID: {batch_id}")
+    log_run_event(mode="batch", event="batch_submitted", status="success",
+                  extra={"batch_id": batch_id, "provider": "openai", "model": reservation[2],
+                         "count": len(requests), "reserved_tokens": reserved_tokens})
+    return len(requests), 0
 
 
 # ── 阶段 2：获取 Batch 结果并导出 ────────────────────────────────────────────
@@ -506,8 +641,14 @@ def fetch_batch() -> dict:
                     from llm_router import make_legacy_siliconflow_client
                     comp_cnt, fail_cnt = _fetch_deepseek_results(job_id, make_legacy_siliconflow_client(), c, conn)
                 elif provider == "gemini":
-                    comp_cnt, fail_cnt = _fetch_gemini_results(job_id, llm_router, c, conn)
+                    # Gemini Batch 通道已下线（从未真正可用：LLMRouter 没有 gemini_client）。
+                    # 历史遗留的 gemini 批次跳过而不是抛 AttributeError。
+                    console.print(f"[yellow]  跳过历史 Gemini Batch {job_id}：Gemini 通道已下线，无法拉取。"
+                                  f"如需重新分析，请把这些文献的 status 手动改为 {STATUS_BATCH_FAILED}，"
+                                  f"下一轮会自动经 OpenAI 重提交。")
+                    comp_cnt, fail_cnt = 0, 0
                 else:
+                    console.print(f"[yellow]  跳过未知 provider={provider!r} 的 Batch {job_id}。")
                     comp_cnt, fail_cnt = 0, 0
                 report["completed"] += comp_cnt
                 report["failed"] += fail_cnt
@@ -545,11 +686,12 @@ def _record_batch_usage(job_id: str, usage, c, conn, status: str) -> None:
     if not batch or batch[3]:
         return
     utc_date, model, reserved, _ = batch
+    failed_states = ("failed", "expired")
     inp, out, reasoning, total = usage_totals(usage)
     now = datetime.now(timezone.utc).isoformat()
     # 预留只用于防止并发超额。真实 usage 到账后释放预留并累计实际 total。
     c.execute("UPDATE llm_usage_daily SET reserved_tokens=MAX(0, reserved_tokens-?), actual_input_tokens=actual_input_tokens+?, actual_output_tokens=actual_output_tokens+?, actual_reasoning_tokens=actual_reasoning_tokens+?, actual_total_tokens=actual_total_tokens+?, completed_batches=completed_batches+?, failed_batches=failed_batches+?, updated_at=? WHERE utc_date=?",
-              (reserved, inp, out, reasoning, total, int(status != 'failed'), int(status == 'failed'), now, utc_date))
+              (reserved, inp, out, reasoning, total, int(status not in failed_states), int(status in failed_states), now, utc_date))
     c.execute("UPDATE llm_usage_model_daily SET reserved_tokens=MAX(0, reserved_tokens-?), actual_input_tokens=actual_input_tokens+?, actual_output_tokens=actual_output_tokens+?, actual_reasoning_tokens=actual_reasoning_tokens+?, actual_total_tokens=actual_total_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
               (reserved, inp, out, reasoning, total, now, utc_date, model))
     c.execute("UPDATE llm_batches SET actual_tokens=?, status=?, usage_recorded=1, updated_at=? WHERE batch_id=?",
@@ -633,6 +775,75 @@ def _mark_failed_batch_lines(job_id: str, error_content: str, c, conn,
     return updated
 
 
+def _batch_attr(status, name: str):
+    """读取 SDK 对象或原始 dict（status.data）上的 Batch 字段。"""
+    value = getattr(status, name, None)
+    if not value and hasattr(status, "data") and isinstance(status.data, dict):
+        value = status.data.get(name)
+    return value
+
+
+def _apply_output_lines(result_content: str, c) -> tuple[int, int, dict]:
+    """逐行落库 Batch 输出，返回 (成功篇数, 失败篇数, 汇总 usage)。"""
+    success_count = 0
+    fail_count = 0
+    input_tokens = output_tokens = reasoning_tokens = total_tokens = 0
+    for line in result_content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as e:
+            console.print(f"[yellow]解析结果行失败: {e}")
+            fail_count += 1
+            continue
+        # Batch 输出 JSONL 每条都有 usage；汇总后一次性记入当天账本。
+        usage = (raw.get("response") or {}).get("body", {}).get("usage") if isinstance(raw, dict) else None
+        i, o, r, t = usage_totals(usage)
+        input_tokens += i; output_tokens += o; reasoning_tokens += r; total_tokens += t
+        try:
+            doc_id = raw["custom_id"]
+            content = raw["response"]["body"]["choices"][0]["message"]["content"]
+            c.execute("UPDATE papers SET status=?, result_json=?, error_message=NULL WHERE id=?", (STATUS_COMPLETED, content, doc_id))
+            success_count += 1
+        except Exception as e:
+            # 某一行的解析出错，设为 RESULT_PARSE_FAILED 防止整批卡住
+            doc_id = raw.get("custom_id") if isinstance(raw, dict) else None
+            if doc_id:
+                c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_RESULT_PARSE_FAILED, f"解析行失败: {str(e)}", doc_id))
+            console.print(f"[yellow]解析结果行失败: {e}")
+            fail_count += 1
+    usage = {"prompt_tokens": input_tokens, "completion_tokens": output_tokens, "total_tokens": total_tokens,
+             "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}}
+    return success_count, fail_count, usage
+
+
+def _apply_error_file(job_id: str, status, ds_client, c, conn) -> int:
+    """有 output_file 并不代表整批成功：失败请求会单独进入 error_file。
+    若不处理这里，混合批次中的失败文献会永久停在 BATCH_SUBMITTED。
+    """
+    error_file_id = _batch_attr(status, "error_file_id")
+    if not error_file_id:
+        return 0
+    try:
+        failed_content = _read_batch_file(error_file_id, ds_client)
+        return _mark_failed_batch_lines(
+            job_id, failed_content, c, conn,
+            fallback_count=_batch_request_count(status, "failed") or 0,
+        )
+    except Exception as e:
+        console.print(f"[yellow]读取 Batch 错误文件失败: {e}")
+        return 0
+
+
+def _mark_unfinished_failed(job_id: str, err_msg: str, c, conn) -> int:
+    """只把本批次里仍停在 BATCH_SUBMITTED 的文献标成 BATCH_FAILED（已拿到结果的不动）。"""
+    cursor = c.execute("UPDATE papers SET status=?, error_message=? WHERE batch_job_id=? AND status=?",
+                       (STATUS_BATCH_FAILED, err_msg, job_id, STATUS_SUBMITTED))
+    conn.commit()
+    return cursor.rowcount
+
+
 def _fetch_openai_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
     ds_client = getattr(llm_router, "openai_client", None) or llm_router.deepseek_client
 
@@ -641,18 +852,16 @@ def _fetch_openai_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[
         return ds_client.batches.retrieve(job_id)
         
     status = do_fetch_status()
-    status_val = getattr(status, "status", None)
-    if not status_val and hasattr(status, "data") and isinstance(status.data, dict):
-        status_val = status.data.get("status")
-        
+    status_val = _batch_attr(status, "status")
     console.print(f"  OpenAI 云端状态: {status_val}")
-    
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+    def do_download(file_ref):
+        return _read_batch_file(file_ref, ds_client)
+
     # 云端成功：正常解析
     if status_val == "completed":
-        output_file_id = getattr(status, "output_file_id", None)
-        if not output_file_id and hasattr(status, "data") and isinstance(status.data, dict):
-            output_file_id = status.data.get("output_file_id")
-            
+        output_file_id = _batch_attr(status, "output_file_id")
         if not output_file_id:
             # 云端说 completed 却没有输出文件，只有一种情形：这批里没有任何一条请求跑成功，
             # 结果全在 error_file 里（典型触发条件是模型本身不可用，如 2026-07 的 DeepSeek-V3）。
@@ -665,9 +874,7 @@ def _fetch_openai_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[
                 # 有成功条目却拿不到输出文件，那是另一回事，照旧抛出交给上层记录
                 raise ValueError(f"无法从 Batch 提取 output_file_id: {status}")
 
-            error_file_id = getattr(status, "error_file_id", None)
-            if not error_file_id and hasattr(status, "data") and isinstance(status.data, dict):
-                error_file_id = status.data.get("error_file_id")
+            error_file_id = _batch_attr(status, "error_file_id")
             detail = ""
             if error_file_id:
                 try:
@@ -679,73 +886,43 @@ def _fetch_openai_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[
             _record_batch_unknown_failure(job_id, c, conn)
             return 0, _mark_batch_failed(job_id, err_msg, c, conn)
 
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-        def do_download():
-            return _read_batch_file(output_file_id, ds_client)
-
-        result_content = do_download()
-        success_count = 0
-        fail_count = 0
-        
-        for line in result_content.splitlines():
-            if not line.strip():
-                continue
-            try:
-                res = json.loads(line)
-                doc_id = res["custom_id"]
-                body = res["response"]["body"]
-                content = body["choices"][0]["message"]["content"]
-                c.execute("UPDATE papers SET status=?, result_json=?, error_message=NULL WHERE id=?", (STATUS_COMPLETED, content, doc_id))
-                success_count += 1
-            except Exception as e:
-                # 某一行的解析/下载出错，设为 RESULT_PARSE_FAILED 防止整批卡住
-                try:
-                    res_raw = json.loads(line)
-                    doc_id = res_raw.get("custom_id")
-                    if doc_id:
-                        c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_RESULT_PARSE_FAILED, f"解析行失败: {str(e)}", doc_id))
-                except Exception:
-                    pass
-                console.print(f"[yellow]解析结果行失败: {e}")
-                fail_count += 1
-
-        # 有 output_file 并不代表整批成功：失败请求会单独进入 error_file。
-        # 若不处理这里，混合批次中的失败文献会永久停在 BATCH_SUBMITTED。
-        error_file_id = getattr(status, "error_file_id", None)
-        if not error_file_id and hasattr(status, "data") and isinstance(status.data, dict):
-            error_file_id = status.data.get("error_file_id")
-        if error_file_id:
-            try:
-                failed_content = _read_batch_file(error_file_id, ds_client)
-                failed_count = _mark_failed_batch_lines(
-                    job_id, failed_content, c, conn,
-                    fallback_count=_batch_request_count(status, "failed") or 0,
-                )
-                fail_count += failed_count
-            except Exception as e:
-                console.print(f"[yellow]读取 Batch 错误文件失败: {e}")
-        # Batch 输出 JSONL 每条都有 usage；汇总后一次性记入当天账本。
-        usages = []
-        for line in result_content.splitlines():
-            try:
-                raw = json.loads(line)
-                usages.append(raw.get("response", {}).get("body", {}).get("usage"))
-            except json.JSONDecodeError:
-                pass
-        input_tokens = output_tokens = reasoning_tokens = total_tokens = 0
-        for usage in usages:
-            i, o, r, t = usage_totals(usage)
-            input_tokens += i; output_tokens += o; reasoning_tokens += r; total_tokens += t
-        _record_batch_usage(job_id, {"prompt_tokens": input_tokens, "completion_tokens": output_tokens,
-                                     "total_tokens": total_tokens,
-                                     "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}}, c, conn, "completed")
+        result_content = do_download(output_file_id)
+        success_count, fail_count, usage = _apply_output_lines(result_content, c)
+        fail_count += _apply_error_file(job_id, status, ds_client, c, conn)
+        _record_batch_usage(job_id, usage, c, conn, "completed")
         conn.commit()
+        total_tokens = usage["total_tokens"]
         console.print(f"[green]OpenAI 结果拉取完毕，成功 {success_count} 篇，失败 {fail_count} 篇，实际 {total_tokens} token。")
         log_run_event(mode="batch", event="batch_fetched", status="success", extra={"batch_id": job_id, "provider": "openai", "completed": success_count, "failed": fail_count, "actual_tokens": total_tokens})
         return success_count, fail_count
-        
+
+    # 超时过期：OpenAI 的 expired 批次可能带着部分已完成结果（output_file_id）。
+    # 已完成的照常入库，只有没跑完的才标 BATCH_FAILED 重新提交，避免白花已计费的额度。
+    elif status_val == "expired":
+        output_file_id = _batch_attr(status, "output_file_id")
+        success_count = fail_count = 0
+        usage = None
+        if output_file_id:
+            result_content = do_download(output_file_id)
+            success_count, fail_count, usage = _apply_output_lines(result_content, c)
+            conn.commit()
+        fail_count += _apply_error_file(job_id, status, ds_client, c, conn)
+        err_msg = "OpenAI 任务在 24h 窗口内未跑完（expired），未完成部分已转入重提交队列"
+        fail_count += _mark_unfinished_failed(job_id, err_msg, c, conn)
+        if usage is not None:
+            _record_batch_usage(job_id, usage, c, conn, "expired")
+        else:
+            _record_batch_unknown_failure(job_id, c, conn)
+        conn.commit()
+        console.print(f"[yellow]  OpenAI Batch 已过期：保留部分结果 {success_count} 篇，未完成/失败 {fail_count} 篇。")
+        log_run_event(mode="batch", event="batch_fetched", status="partial",
+                      extra={"batch_id": job_id, "provider": "openai", "cloud_status": "expired",
+                             "completed": success_count, "failed": fail_count,
+                             "actual_tokens": usage["total_tokens"] if usage else None})
+        return success_count, fail_count
+
     # 云端失败：提取错误明细，并更新整批论文状态以便守护进程下一轮自动恢复重试
-    elif status_val in ("failed", "cancelled", "expired"):
+    elif status_val in ("failed", "cancelled"):
         err_details = []
         if hasattr(status, "errors") and getattr(status.errors, "data", None):
             for ed in status.errors.data:
@@ -767,99 +944,6 @@ def _fetch_deepseek_results(job_id: str, client, c, conn) -> tuple[int, int]:
     class _LegacyRouter:
         deepseek_client = getattr(client, "deepseek_client", client)
     return _fetch_openai_results(job_id, _LegacyRouter(), c, conn)
-
-
-def _fetch_gemini_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[int, int]:
-    gm_client = llm_router.gemini_client
-    if gm_client is None:
-        raise ValueError("拉取历史 Gemini Batch 任务需要配置 GEMINI_API_KEY")
-    
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-    def do_fetch_status():
-        return gm_client.batches.get(name=job_id)
-        
-    status = do_fetch_status()
-    state_name = status.state.name if hasattr(status.state, "name") else str(status.state)
-    console.print(f"  Gemini 云端状态: {state_name}")
-
-    if "SUCCEEDED" in state_name:
-        success_count = 0
-        fail_count = 0
-        try:
-            dest = getattr(status, "dest", None) or getattr(status, "output_resource", None)
-            file_name = getattr(dest, "file_name", None) or getattr(dest, "name", None)
-
-            if file_name:
-                import httpx
-                @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
-                def do_download():
-                    result_file = gm_client.files.get(name=file_name)
-                    resp = httpx.get(result_file.uri, timeout=120)
-                    resp.raise_for_status()
-                    return resp
-                
-                resp = do_download()
-                for line in resp.text.splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        res = json.loads(line)
-                        doc_id = res.get("id") or res.get("custom_id")
-                        content = res["response"]["candidates"][0]["content"]["parts"][0]["text"]
-                        c.execute(
-                            "UPDATE papers SET status=?, result_json=?, error_message=NULL WHERE id=?",
-                            (STATUS_COMPLETED, content, doc_id),
-                        )
-                        success_count += 1
-                    except Exception as e:
-                        try:
-                            res_raw = json.loads(line)
-                            doc_id = res_raw.get("id") or res_raw.get("custom_id")
-                            if doc_id:
-                                c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_RESULT_PARSE_FAILED, f"解析行失败: {str(e)}", doc_id))
-                        except Exception:
-                            pass
-                        console.print(f"[yellow]解析 Gemini 结果行失败: {e}")
-                        fail_count += 1
-                conn.commit()
-                console.print(f"[green]Gemini 结果拉取完毕，成功 {success_count} 篇，失败 {fail_count} 篇。")
-                log_run_event(mode="batch", event="batch_fetched", status="success", extra={"batch_id": job_id, "provider": "gemini", "completed": success_count, "failed": fail_count})
-                return success_count, fail_count
-            else:
-                err_msg = f"Gemini 云端完成，但 SDK 未返回文件名。请手动下载，output_uri: {getattr(status, 'output_uri', '未知')}"
-                console.print(f"[yellow]  {err_msg}")
-                # 这种情况也转入解析失败，避免卡住
-                c.execute("SELECT id FROM papers WHERE batch_job_id=?", (job_id,))
-                rows = c.fetchall()
-                for r in rows:
-                    c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_RESULT_PARSE_FAILED, err_msg, r[0]))
-                conn.commit()
-                log_run_event(mode="batch", event="batch_fetched", status="failed", error=err_msg, extra={"batch_id": job_id, "provider": "gemini", "count": len(rows)})
-                return 0, len(rows)
-
-        except Exception as e:
-            err_msg = f"自动下载并解析 Gemini 结果出现故障: {str(e)}"
-            console.print(f"[yellow]  {err_msg}")
-            c.execute("SELECT id FROM papers WHERE batch_job_id=?", (job_id,))
-            rows = c.fetchall()
-            for r in rows:
-                c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_RESULT_PARSE_FAILED, err_msg, r[0]))
-            conn.commit()
-            log_run_event(mode="batch", event="batch_fetched", status="failed", error=err_msg, extra={"batch_id": job_id, "provider": "gemini", "count": len(rows)})
-            return 0, len(rows)
-
-    elif state_name in ("FAILED", "CANCELED", "CANCELLED"):
-        err_msg = f"Gemini 任务在云端失效，返回状态: {state_name}"
-        console.print(f"[bold red]  {err_msg}")
-        c.execute("SELECT id FROM papers WHERE batch_job_id=?", (job_id,))
-        rows = c.fetchall()
-        for r in rows:
-            c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?", (STATUS_BATCH_FAILED, err_msg, r[0]))
-        conn.commit()
-        log_run_event(mode="batch", event="batch_fetched", status="failed", error=err_msg, extra={"batch_id": job_id, "provider": "gemini", "count": len(rows)})
-        return 0, len(rows)
-
-    return 0, 0
 
 
 def _export_completed(c, conn) -> int:

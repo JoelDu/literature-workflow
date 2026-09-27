@@ -93,7 +93,7 @@ def test_hot_upgrade_adds_missing_columns_to_old_db():
 
         added = ensure_papers_table(conn)
         conn.commit()
-        assert set(added) == {"error_message", "processed_at"}
+        assert set(added) == {"error_message", "processed_at", "analysis_attempts"}
 
         cols = {r[1] for r in conn.execute("PRAGMA table_info(papers)")}
         assert {"error_message", "processed_at"} <= cols

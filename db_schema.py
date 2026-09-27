@@ -10,8 +10,8 @@ MCP 的 `library_status` 全都会抛 `no such table: papers` 的原始 tracebac
 所以把 DDL 抽到这里，两边都 import：schema 只有一份，谁先碰数据库谁把表建上，
 空库也能正常显示"0 篇"而不是崩掉。
 
-⚠️ 改 papers 的列时只改这里。新增列走 `_HOT_COLS` 热升级，别直接改 `PAPERS_DDL`
-里的列清单 —— 老库已经存在，CREATE TABLE IF NOT EXISTS 对它是空操作，
+⚠️ 改 papers 的列时只改这里。新增列要同时写进 `PAPERS_DDL`（新库）和 `_HOT_COLS`
+（老库热升级）—— 老库已经存在，CREATE TABLE IF NOT EXISTS 对它是空操作，
 只有 ALTER 才补得上。
 """
 import sqlite3
@@ -28,13 +28,17 @@ PAPERS_DDL = """CREATE TABLE IF NOT EXISTS papers (
     batch_job_id TEXT,
     result_json TEXT,
     error_message TEXT,
-    processed_at TEXT
+    processed_at TEXT,
+    analysis_attempts INTEGER NOT NULL DEFAULT 0
 )"""
 
 # 老库热升级用：(列名, 类型)。列名会被拼进 SQL，只允许字面量，不接受外部输入。
 _HOT_COLS = (
     ("error_message", "TEXT"),
     ("processed_at", "TEXT"),
+    # 已真正送进 LLM Batch 的次数（云端建单成功才 +1）。达到 BATCH_MAX_ANALYSIS_ATTEMPTS
+    # 后转 ANALYSIS_FAILED 终态，防止解析永远失败的文献每轮重提交、无限烧额度。
+    ("analysis_attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 LLM_USAGE_DAILY_DDL = """CREATE TABLE IF NOT EXISTS llm_usage_daily (

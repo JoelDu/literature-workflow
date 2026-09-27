@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import os
 import sys
 import subprocess
@@ -47,16 +49,22 @@ def check_dependencies():
         except Exception as e:
             print(f"自动安装 mutool 失败。如果转换报错，请手动执行: sudo apt-get install mupdf-tools")
 
-def convert_caj_files():
-    """扫描并转换 CAJ 文件"""
+def convert_caj_files(input_dir: str | None = None, backup_dir: str | None = None) -> tuple[int, int]:
+    """扫描并转换 CAJ 文件，返回 (成功数, 失败数)。
+
+    input_dir / backup_dir 缺省取模块导入时的 settings；管道调用时显式传入当前
+    settings，避免导入早于配置（或测试替换 settings）时扫错目录。
+    """
+    INPUT_DIR = input_dir or globals()["INPUT_DIR"]
+    TEMP_DIR = backup_dir or globals()["TEMP_DIR"]
     if not os.path.exists(INPUT_DIR):
         print(f"错误: 输入目录不存在: {INPUT_DIR}")
-        return
+        return 0, 0
 
     caj_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith('.caj')]
     if not caj_files:
         print("没有在输入目录中找到任何 .caj 文件。")
-        return
+        return 0, 0
 
     print(f"共发现 {len(caj_files)} 个 .caj 文件，开始转换...")
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -103,6 +111,7 @@ def convert_caj_files():
         print(f"原 .caj 文件已安全备份至: {TEMP_DIR}")
         print("新生成的 PDF 文件已放入输入目录，容器会自动捡起进行解析！")
     print("====================================")
+    return success_count, fail_count
 
 if __name__ == "__main__":
     check_dependencies()

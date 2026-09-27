@@ -10,14 +10,32 @@ from .store import VectorStore, md_hash
 from .embedder import Embedder
 
 
-def _get_default_embed_client():
+_DEFAULT_SF_BASE = "https://api.siliconflow.cn/v1"
+_EMBED_TIMEOUT_SECONDS = 180  # 与 review.py / web_server.py 的 SiliconFlow 客户端保持一致
+
+
+def _siliconflow_base(settings=None) -> str:
+    """SiliconFlow 接口地址：与全项目统一读 SILICONFLOW_API_BASE。
+
+    优先 settings 对象（若将来加入该字段），其次环境变量 SILICONFLOW_API_BASE；
+    旧变量名 SILICONFLOW_BASE_URL 仅作向后兼容回退。
+    """
+    configured = getattr(settings, "SILICONFLOW_API_BASE", None)
+    return ((configured if isinstance(configured, str) else None)
+            or os.getenv("SILICONFLOW_API_BASE")
+            or os.getenv("SILICONFLOW_BASE_URL")
+            or _DEFAULT_SF_BASE)
+
+
+def _get_default_embed_client(settings=None):
     """内部自洽构造 SiliconFlow 嵌入客户端，隔离外部调用方依赖。"""
     from openai import OpenAI
-    sf_key = os.getenv("SILICONFLOW_API_KEY")
-    sf_base = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+    sf_key = getattr(settings, "SILICONFLOW_API_KEY", None)
+    if not isinstance(sf_key, str) or not sf_key:
+        sf_key = os.getenv("SILICONFLOW_API_KEY")
     if not sf_key:
         raise ValueError("未配置 SILICONFLOW_API_KEY，无法进行 4096 维 Qwen3 向量化。")
-    return OpenAI(api_key=sf_key, base_url=sf_base)
+    return OpenAI(api_key=sf_key, base_url=_siliconflow_base(settings), timeout=_EMBED_TIMEOUT_SECONDS)
 
 
 class LiteratureIndexer:
@@ -34,7 +52,7 @@ class LiteratureIndexer:
 
     def _ensure_embedder(self) -> Embedder:
         if not self.client:
-            self.client = _get_default_embed_client()
+            self.client = _get_default_embed_client(self.settings)
         return Embedder(self.client, self.settings.EMBEDDING_MODEL, self.settings.EMBEDDING_DIM,
                         self.settings.EMBEDDING_BATCH_SIZE)
 
