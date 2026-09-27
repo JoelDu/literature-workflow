@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from db_schema import ensure_llm_quota_tables
+from .sqlite_runtime import connect_sqlite
 from .token_budget import estimate_tokens, usage_totals
 
 MINI_MODEL = "gpt-5.4-mini"
@@ -20,16 +20,33 @@ REVIEW_MODEL = "gpt-5.4"
 class QuotaExceededError(RuntimeError):
     """UTC 当日额度不足；保留输入，等待之后的扫描重试。"""
 
-    def __init__(self, message: str, utc_date: str | None = None):
+    def __init__(self, message: str, utc_date: str | None = None, model: str = ""):
         super().__init__(message)
         self.utc_date = utc_date
+        self.model = model
+
+    @property
+    def resume_at(self) -> datetime:
+        """额度重置时刻：触发日之后的下一个 UTC 零点。"""
+        return next_utc_reset(self.utc_date)
+
+
+def next_utc_reset(utc_date: str | None = None) -> datetime:
+    """返回 utc_date（默认今天）之后的下一个 UTC 零点（带时区）。"""
+    day = datetime.fromisoformat(utc_date).date() if utc_date else datetime.now(timezone.utc).date()
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+
+def _connect(settings):
+    # 统一 busy_timeout/WAL 策略：综述、元数据与实时扫描可能并发扣量。
+    return connect_sqlite(settings.DB_PATH)
 
 
 def defer_realtime_until_next_day(settings, error: QuotaExceededError) -> str:
     """持久化实时扫描暂停日界线，避免守护进程重复调用 MinerU。"""
     today = error.utc_date or _now()[0]
     retry_date = (datetime.fromisoformat(today) + timedelta(days=1)).date().isoformat()
-    conn = sqlite3.connect(settings.DB_PATH)
+    conn = _connect(settings)
     try:
         conn.execute("""CREATE TABLE IF NOT EXISTS realtime_quota_deferral (
             scope TEXT PRIMARY KEY, retry_on_utc_date TEXT NOT NULL)""")
@@ -45,7 +62,7 @@ def realtime_deferred_until(settings) -> str | None:
     """返回尚未到期的 UTC 恢复日期；每次从磁盘读取，跨进程重启有效。"""
     if not os.path.isfile(settings.DB_PATH):
         return None
-    conn = sqlite3.connect(settings.DB_PATH)
+    conn = _connect(settings)
     try:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='realtime_quota_deferral'").fetchone():
             return None
@@ -72,7 +89,7 @@ def reserve(settings, model: str, prompt: str, max_output_tokens: int) -> tuple[
     """请求前保守预留。额度不足时失败，绝不靠 API 429 来限流。"""
     estimate = estimate_tokens(prompt) + max_output_tokens
     utc_date, now = _now()
-    conn = sqlite3.connect(settings.DB_PATH)
+    conn = _connect(settings)
     try:
         ensure_llm_quota_tables(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -81,7 +98,7 @@ def reserve(settings, model: str, prompt: str, max_output_tokens: int) -> tuple[
         row = conn.execute("SELECT reserved_tokens, actual_total_tokens FROM llm_usage_model_daily WHERE utc_date=? AND model=?",
                            (utc_date, model)).fetchone()
         if row[0] + row[1] + estimate > _cap(settings, model):
-            raise QuotaExceededError(f"{model} UTC 当日额度不足：已使用/预留 {row[0] + row[1]}，本次预留 {estimate}，上限 {_cap(settings, model)}", utc_date=utc_date)
+            raise QuotaExceededError(f"{model} UTC 当日额度不足：已使用/预留 {row[0] + row[1]}，本次预留 {estimate}，上限 {_cap(settings, model)}", utc_date=utc_date, model=model)
         conn.execute("UPDATE llm_usage_model_daily SET reserved_tokens=reserved_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
                      (estimate, now, utc_date, model))
         conn.commit()
@@ -95,7 +112,7 @@ def reconcile(settings, model: str, reservation: tuple[str, int], usage) -> None
     utc_date, reserved = reservation
     _today, now = _now()
     inp, out, reasoning, total = usage_totals(usage)
-    conn = sqlite3.connect(settings.DB_PATH)
+    conn = _connect(settings)
     try:
         ensure_llm_quota_tables(conn)
         conn.execute("UPDATE llm_usage_model_daily SET reserved_tokens=MAX(0, reserved_tokens-?), actual_input_tokens=actual_input_tokens+?, actual_output_tokens=actual_output_tokens+?, actual_reasoning_tokens=actual_reasoning_tokens+?, actual_total_tokens=actual_total_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
@@ -105,6 +122,40 @@ def reconcile(settings, model: str, reservation: tuple[str, int], usage) -> None
         conn.close()
 
 
+def release(settings, model: str, reservation: tuple[str, int]) -> None:
+    """请求在服务端消耗 token 之前就失败（连接失败、4xx 拒绝）时，归还整笔预留。
+
+    超时与 5xx 可能已在服务端计费，调用方不应释放，预留保留为安全余量。
+    """
+    utc_date, reserved = reservation
+    _today, now = _now()
+    conn = _connect(settings)
+    try:
+        ensure_llm_quota_tables(conn)
+        conn.execute("UPDATE llm_usage_model_daily SET reserved_tokens=MAX(0, reserved_tokens-?), updated_at=? WHERE utc_date=? AND model=?",
+                     (reserved, now, utc_date, model))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remaining(settings, model: str) -> int:
+    """当前 UTC 日该模型剩余可预留额度（上限 - 已用 - 已预留），不小于 0。"""
+    utc_date, _now_iso = _now()
+    cap = _cap(settings, model)
+    if not os.path.isfile(settings.DB_PATH):
+        return cap
+    conn = _connect(settings)
+    try:
+        ensure_llm_quota_tables(conn)
+        row = conn.execute("SELECT reserved_tokens, actual_total_tokens FROM llm_usage_model_daily WHERE utc_date=? AND model=?",
+                           (utc_date, model)).fetchone()
+    finally:
+        conn.close()
+    used = (row[0] + row[1]) if row else 0
+    return max(0, cap - used)
+
+
 def record_llm_call(settings, call_type: str, model: str, prompt: str,
                     response_text: str = "", stage: str = "", usage=None,
                     cost_seconds: float = 0.0, status: str = "SUCCESS",
@@ -112,7 +163,7 @@ def record_llm_call(settings, call_type: str, model: str, prompt: str,
     """持久化记录每一次 LLM 调用的完整 Prompt、响应、Token 消耗与元数据至 SQLite 数据库。"""
     inp, out, reasoning, total = usage_totals(usage) if usage else (0, 0, 0, 0)
     meta_str = json.dumps(meta, ensure_ascii=False) if meta else "{}"
-    conn = sqlite3.connect(settings.DB_PATH)
+    conn = _connect(settings)
     try:
         ensure_llm_quota_tables(conn)
         conn.execute("""
