@@ -4,6 +4,10 @@
 「章节标题+检索问题 vs 图题」重排 → 过阈值的 top-N 复制到
 REVIEW_OUTPUT_DIR/assets/ 并把图 markdown 追加到章节正文。
 图注末尾带 [@docid8] 引用标记，随全文统一编号为 [n]。
+
+编号：图、表分别按章编号为「图 n-m」「表 n-m」（n=章节号，m 章内序号，每章从 1 重新开始），
+图注以编号开头，并在正文末尾追加一句正文引用（"相关结果见图 n-1、图 n-2。"）。
+装配阶段 stages.renumber_figure_labels 会把 n 统一改写为最终章节号。
 """
 
 import os
@@ -11,6 +15,16 @@ import re
 import shutil
 
 _WS_RE = re.compile(r"\s+")
+# 原论文自带的图表编号前缀（Fig. 3 / Figure 2a: / 图3 / Table 1.），综述内重新编号后需去除。
+_SOURCE_LABEL_RE = re.compile(
+    r"^\s*(?:fig(?:ure)?s?\.?|table|tab\.|图|表)\s*[a-z]?\s*\d+[a-z]?(?:\s*[-–.]\s*\d+)?\s*[.:：、．)）]?\s*",
+    re.I,
+)
+
+
+def _strip_source_label(caption: str) -> str:
+    stripped = _SOURCE_LABEL_RE.sub("", caption, count=1).strip()
+    return stripped or caption
 
 
 def _clean_caption(caption: str) -> str:
@@ -37,7 +51,7 @@ def _resolve_asset_path(img_path: str, settings) -> str:
 
 
 def select_section_figures(store, reranker, section, draft, settings, console,
-                           used_paths: set) -> int:
+                           used_paths: set, chapter_no: int = 0) -> int:
     """为一个章节挑图并追加进 draft.markdown，返回插入的图数。
 
     reranker 缺失（--no-rerank）或 rerank 全部降级为 0 分时不插图，
@@ -71,6 +85,8 @@ def select_section_figures(store, reranker, section, draft, settings, console,
 
     assets_dir = os.path.join(settings.REVIEW_OUTPUT_DIR, "assets")
     blocks = []
+    counters = {"图": 0, "表": 0}
+    labels = []
     for idx, score in picked:
         a = assets[idx]
         src = _resolve_asset_path(a["img_path"], settings)
@@ -81,12 +97,16 @@ def select_section_figures(store, reranker, section, draft, settings, console,
         dest = os.path.join(assets_dir, dest_name)
         if not os.path.exists(dest):
             shutil.copy2(src, dest)
-        label = "表" if a["asset_type"] == "table" else "图"
-        caption = _clean_caption(a["caption"])
+        kind = "表" if a["asset_type"] == "table" else "图"
+        counters[kind] += 1
+        label = f"{kind} {chapter_no}-{counters[kind]}" if chapter_no else f"{kind} {counters[kind]}"
+        labels.append(label)
+        caption = _strip_source_label(_clean_caption(a["caption"]))
         blocks.append(f"![{label}]({'assets/' + dest_name})\n"
-                      f"*{label}：{caption}（源自 [@{a['doc_id'][:8]}]）*")
+                      f"*{label}　{caption}（源自 [@{a['doc_id'][:8]}]）*")
         used_paths.add(a["img_path"])
 
     if blocks:
-        draft.markdown = draft.markdown.rstrip() + "\n\n" + "\n\n".join(blocks)
+        reference = f"相关图表见{'、'.join(labels)}。"
+        draft.markdown = draft.markdown.rstrip() + "\n\n" + reference + "\n\n" + "\n\n".join(blocks)
     return len(blocks)
