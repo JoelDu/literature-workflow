@@ -78,6 +78,7 @@ class Settings(BaseModel):
     REVIEW_MAX_CHUNKS_PER_DOC: int = 2     # 单篇文献在初筛中最多保留 2 块，强制文献多样性
     REVIEW_MIN_SCORE: int = 6
     REVIEW_EVIDENCE_N: int = 32            # 每章最终保留的高分多样化证据数（覆盖 12-18 篇独立文献）
+    REVIEW_TRACK_A_MAX_DOCS: int = 12      # 每章 Track A 证据最多覆盖的文献数（单章总引用另受 MAX_SECTION_CITATIONS=18 约束）
     REVIEW_MAP_CONCURRENCY: int = 8
     REVIEW_OUTPUT_DIR: str = "./obsidian_vault/reviews"
     REVIEW_BASELINE_REGISTRY_PATH: str = "./obsidian_vault/reviews/baselines.registry.json"
@@ -149,6 +150,7 @@ def get_settings() -> Settings:
                 "REVIEW_MAX_CHUNKS_PER_DOC": int(os.getenv("REVIEW_MAX_CHUNKS_PER_DOC", "2")),
                 "REVIEW_MIN_SCORE": int(os.getenv("REVIEW_MIN_SCORE", "6")),
                 "REVIEW_EVIDENCE_N": int(os.getenv("REVIEW_EVIDENCE_N", "32")),
+                "REVIEW_TRACK_A_MAX_DOCS": int(os.getenv("REVIEW_TRACK_A_MAX_DOCS", "12")),
                 "REVIEW_EMBED_BACKEND": os.getenv("REVIEW_EMBED_BACKEND", "remote"),
                 "LOCAL_EMBEDDING_MODEL_PATH": os.getenv("LOCAL_EMBEDDING_MODEL_PATH", ""),
                 "NIGHTLY_INDEX_DEADLINE": os.getenv("NIGHTLY_INDEX_DEADLINE", "08:00"),

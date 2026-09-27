@@ -96,6 +96,10 @@ DOCKER_BUILDKIT=0 docker compose build
 docker compose up -d
 ```
 
+> **容器以非 root 用户运行（默认 uid/gid 1000）**。`DATA_ROOT` 下的目录须事先存在且该用户可写；数据目录属主不是 1000 时构建加 `--build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)`，需要旧的 root 行为传 `APP_UID=0 APP_GID=0`。
+>
+> **健康检查**：daemon 主循环每 30 秒写 `${DATA_ROOT}/heartbeat`，compose healthcheck 超过 3 小时未更新即标记 unhealthy（定时任务同步执行，MinerU/教材入库可能跑很久，所以阈值较宽）。只标记、不自动重启。
+
 ### 3. 常用配置项
 
 | 变量 | 作用 | 什么时候需要改 |
@@ -203,6 +207,14 @@ python review.py baseline-list [--json] # 【基线列表】查看注册表中�
 - `--lang`：目标语言，可选 `zh`（中文综述）或 `en`（英文综述，按 1.6x 单词当量自动换算）；
 - `--sections`：主体章节数；不指定时按目标字数档位由模型生成 3-9 个，并执行章节数与每章 2-4 个检索问题的结构校验；
 - `--outline`：外部大纲文件（JSON 或 `## 章节标题` + `- 检索问题` 格式的 markdown），完全手工控制章节与检索方向，指定后跳过大纲生成。
+- `--resume-from`：从额度暂停时写出的检查点 JSON 续跑，已完成章节不重写。
+
+**额度暂停（`paused_quota`）**：GPT-5.4 日硬阀在大纲或任一章节阶段触发时，任务不算失败：
+- CLI 把大纲与已完成章节写入 `REVIEW_OUTPUT_DIR/checkpoints/review_paused_*.json`，以**退出码 75**（EX_TEMPFAIL）退出，并打印次日续跑命令（`generate ... --resume-from <检查点>`）；大纲阶段即耗尽时同样以 75 退出，次日重跑即可。
+- MCP 任务状态记为 `paused_quota` 并附 `resume_after`（下一个 UTC 00:00）；`REVIEW_AUTO_RESUME_QUOTA=1`（默认）时服务到点自动续跑，也可手动 `resume_review`。大纲阶段暂停的任务续跑时会重新生成大纲。
+- 生成前会给出额度预估（预计 token 与当日剩余），便于判断是否当天能写完。
+
+**溯源质量闸门**：除引用覆盖与对比表外，每章还检查两项比例——无法在证据中找到出处的量化句（`REVIEW_NUMERIC_UNSUPPORTED_MAX`，默认 0.2）、因幻觉引用被剥离而失去来源的句子（`REVIEW_UNSOURCED_CLAIM_MAX`，默认 0.15），超限即阻塞并定向重写。DOI 统一规范化并校验格式；图表按「图/表 章-序」编号；每章 Track A 证据最多覆盖 `REVIEW_TRACK_A_MAX_DOCS`（默认 12）篇文献。
 
 - **双轨逐章链路**：每章按 Stage B→C 顺序执行。Track A 经 Qwen3 向量召回、Reranker 精排与 `gpt-5.4-mini` 证据评分，负责机理和实测数据；Track B 只装载有真实摘要的外围文献，负责背景与学术脉络。两轨共同受 18,000 字符预算约束，正文由固定 `gpt-5.4` 撰写并使用规范学术编号（如 `[@U-J25-001]`）。
 - **跨章覆盖与降级**：每章实际引用的文献会进入使用历史，后续章节对重复文献按次数降权；该机制在关闭 Reranker 或重排服务故障时仍生效。重排故障会显式降级至确定性的向量排序，Track B 故障则保留 Track A 继续生成。
@@ -423,6 +435,8 @@ Web 控制台默认全网卡监听 `0.0.0.0:8001`，并已注册为 Linux 常驻
 
 主导航的「综述生成与恢复」进入 `/static/reviews.html`。Web 与 CLI/MCP 共用逐章检索和写作编排，每完成一章保存检查点；重启后可从任务列表恢复，已完成章节不会重新生成。检查点默认写入 `DB_PATH` 同目录的独立 `web_review_jobs.db`，可用 `WEB_REVIEW_JOBS_DB_PATH` 覆盖。Web 任务注册器按**单进程**运行，不支持多个 Uvicorn workers 共用该任务库。
 
+任务列表同时**只读**展示 MCP 服务创建的综述任务（标 `[MCP]`，状态 `completed` 显示为「完成」、`paused_quota` 显示为「额度暂停」并注明恢复时间）。MCP 任务只能在 MCP 客户端用 `resume_review` 续跑，Web 端对其续跑返回 409；Web 自己的暂停任务可在页面上直接恢复。
+
 发现候选完成真实向量化后，CLI/Web/MCP 的检索与综述会联合读取发现库和原馆藏库，不把发现记录合并进生产库。发现库路径统一按 `TEST_CITATION_DB_PATH`、兼容变量 `CITATION_NETWORK_DB_PATH`、仓库 `data/test_citation_network.db` 的顺序选择。嵌入失败保留正文并进入待重试队列；空白/扫描 PDF 无可提取正文时需先补充 OCR，不会用标题或测试向量冒充正文索引。
 
 | 访问场景 | 访问 URL | 连接方式与说明 |
@@ -537,8 +551,15 @@ flowchart LR
 2. **孤儿 Work 隔离治理**：
    * 针对未完成完整流水线的孤儿文献（如 `work_oa_w4391143884`），标记为 `QUARANTINED_INCOMPLETE` 并在 `eligible_for_citation_graph = 0` 下从默认图谱与向量检索中完全排除；
    * 保留其资产及审计链，后续补齐完整解析与向量化后可平滑恢复。
-3. **自动化测试覆盖**：
-   * 全套测试套件（`pytest`）包含 **200+ 个用例**，覆盖 doctype 码表、chunker 切块、bookintake 教材、citation network 引文消歧、snowball 滚雪球、isolation 隔离回归、web API、MCP server 与综述检查点恢复。
+3. **Web / MCP HTTP 请求守卫**：
+   * **Host 白名单**（防 DNS rebinding）：IP 字面量、localhost、本机主机名与本机网卡地址默认放行，域名访问须列入 `REMOTE_ALLOWED_HOSTS`（如 `*.ts.net` 主机名），否则 421/403；
+   * **CSRF**：带浏览器 `Origin`/`Referer` 的写请求必须同源或在 `WEB_CORS_ORIGINS` 白名单内；不再使用通配 CORS；
+   * **入库互斥**：Web 上传与 daemon 实时/Batch 任务共用 `dirname(DB_PATH)/.intake.lock`，锁忙时 daemon 跳过本轮。
+4. **合规获取全文**：OA 候选只按直链、以项目 User-Agent 下载；拿不到 PDF 即停在不可得并提示手动上传，不使用无头浏览器绕过出版商反爬（Playwright 路径已于 2026-09-27 删除）。
+5. **自动化测试覆盖**：
+   * 全套测试（`pytest`）约 **500 个用例**，覆盖 doctype 码表、chunker、教材入库、引文消歧、滚雪球、隔离回归、Web API、MCP server、Batch 导出完整性、额度暂停与综述检查点恢复。
+   * `tests/conftest.py` 强制隔离：所有路径指向临时目录、禁用 `.env` 加载、拦截对生产数据目录的 `sqlite3.connect` 与所有非回环网络。需要外网或只读访问生产库的用例分别标记 `network` / `prod_readonly`，默认不选（`pytest -m network` 显式运行；后者还需 `LIT_ALLOW_PROD_READONLY=1`）。
+   * CI（GitHub Actions）在 Python 3.10/3.11 × Ubuntu/Windows 上运行测试，并对 `RUFF_STRICT_PATHS` 列出的文件执行 ruff 检查。
 
 
 ---

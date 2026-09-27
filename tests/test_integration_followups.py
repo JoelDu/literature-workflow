@@ -105,3 +105,12 @@ def test_fulltext_acquisition_has_no_browser_fallback(tmp_path, monkeypatch):
     assert [url for url, _ua in requested] == ["https://oa.invalid/paper.pdf"]
     assert requested[0][1].startswith("LiteratureAnalyzer/")
     assert res["results"][0]["status"] != "FULLTEXT_ACQUIRED"
+
+
+def test_track_a_max_docs_env_reaches_settings(monkeypatch):
+    import utils
+
+    monkeypatch.setenv("REVIEW_TRACK_A_MAX_DOCS", "7")
+    monkeypatch.setattr(utils, "_settings", None)
+    assert utils.get_settings().REVIEW_TRACK_A_MAX_DOCS == 7
+    monkeypatch.setattr(utils, "_settings", None)
