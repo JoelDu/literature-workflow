@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 from jinja2 import Template
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from .models import (
     Outline, OutlineSection, Evidence, SectionDraft, ReviewDoc, infer_table_suggested
@@ -28,14 +28,55 @@ from .review_quality import (
 
 # ── LLM 调用与 JSON 解析 ──────────────────────────────────────────────────────
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=60), reraise=True)
+def _is_transient_api_error(exc: BaseException) -> bool:
+    """只有瞬时网络/服务端故障值得指数退避重试；额度耗尽、4xx 请求错误与输出解析错误都不重试。"""
+    from .quota import QuotaExceededError
+    if isinstance(exc, QuotaExceededError):
+        return False
+    try:
+        import openai
+    except Exception:  # pragma: no cover - openai 为必装依赖
+        openai = None
+    if openai is not None:
+        if isinstance(exc, openai.RateLimitError):
+            # insufficient_quota 是账户额度耗尽，重试只会重复失败。
+            return getattr(exc, "code", None) != "insufficient_quota"
+        if isinstance(exc, (openai.APIConnectionError, openai.InternalServerError)):
+            return True  # APITimeoutError 是 APIConnectionError 的子类
+        if isinstance(exc, openai.APIStatusError):
+            return int(getattr(exc, "status_code", 0) or 0) >= 500
+    return isinstance(exc, (ConnectionError, TimeoutError))
+
+
+def _consumed_no_tokens(exc: BaseException) -> bool:
+    """请求确定未在服务端产生计费：连接未建立，或服务端以 4xx 直接拒绝。
+
+    超时与 5xx 可能已经开始生成，保守保留预留。
+    """
+    try:
+        import openai
+    except Exception:  # pragma: no cover
+        openai = None
+    if openai is not None:
+        if isinstance(exc, openai.APITimeoutError):
+            return False
+        if isinstance(exc, openai.APIConnectionError):
+            return True
+        if isinstance(exc, openai.APIStatusError):
+            return 400 <= int(getattr(exc, "status_code", 0) or 0) < 500
+    return isinstance(exc, ConnectionError)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=60),
+       retry=retry_if_exception(_is_transient_api_error), reraise=True)
 def _chat_once(client, model: str, prompt: str, json_mode: bool,
                call_type: str = "review_llm", stage: str = "", meta: dict = None) -> str:
     import time
     from utils import get_settings
-    from .quota import reserve, reconcile, record_llm_call
+    from .quota import reserve, reconcile, release, record_llm_call
     settings = get_settings()
     max_tokens = 12_000 if model == "gpt-5.4" else 4_000
+    # QuotaExceededError 在这里抛出且不被重试：额度耗尽意味着暂停，而不是失败。
     reservation = reserve(settings, model, prompt, max_tokens)
     kwargs = {"model": model,
               "messages": [{"role": "user", "content": prompt}],
@@ -48,19 +89,22 @@ def _chat_once(client, model: str, prompt: str, json_mode: bool,
     resp = None
     try:
         resp = client.chat.completions.create(**kwargs)
-        reconcile(settings, model, reservation, resp.usage)
-        content = resp.choices[0].message.content
-        cost_sec = time.time() - t0
-        record_llm_call(settings, call_type=call_type, model=model, prompt=prompt,
-                        response_text=content, stage=stage, usage=resp.usage,
-                        cost_seconds=cost_sec, status="SUCCESS", meta=meta)
-        return content
     except Exception as e:
-        cost_sec = time.time() - t0
+        if _consumed_no_tokens(e):
+            try:
+                release(settings, model, reservation)
+            except Exception:
+                pass  # 释放失败只会让额度更保守，不能掩盖原始异常
         record_llm_call(settings, call_type=call_type, model=model, prompt=prompt,
                         response_text="", stage=stage, usage=None,
-                        cost_seconds=cost_sec, status="FAILED", error_message=str(e), meta=meta)
+                        cost_seconds=time.time() - t0, status="FAILED", error_message=str(e), meta=meta)
         raise
+    reconcile(settings, model, reservation, resp.usage)
+    content = resp.choices[0].message.content
+    record_llm_call(settings, call_type=call_type, model=model, prompt=prompt,
+                    response_text=content, stage=stage, usage=resp.usage,
+                    cost_seconds=time.time() - t0, status="SUCCESS", meta=meta)
+    return content
 
 
 def _chat(client, model: str, prompt: str, json_mode: bool = True,
@@ -318,6 +362,8 @@ def generate_outline(topic: str, store, embedder, client, model, settings, conso
         validation_errors = _outline_validation_errors(outline, scaling, n_sections)
     if validation_errors:
         raise RuntimeError(f"大纲结构校验失败: {'；'.join(validation_errors)}")
+    # 立论随大纲 JSON 一起持久化，续跑/手工编辑大纲后仍能传到每一章的写作提示词。
+    outline.apply_alignment(thesis, research_gap, mainline_logic)
     return outline
 
 
@@ -465,7 +511,14 @@ def _map_one_chunk(client, model, heading, questions_text, chunk, paper_meta,
 def gather_evidence(section: OutlineSection, store, embedder, client, model,
                     settings, console, paper_meta: dict, reranker=None,
                     doc_usage_history: dict = None, review_top_k: int = None,
-                    evidence_n: int = None) -> list:
+                    evidence_n: int = None, max_docs: int = None) -> list:
+    """第一轨证据：召回→重排→map 打分→边际价值优选。
+
+    max_docs：本章第一轨独立文献数上限。按边际价值从高到低贪心保留，已入选文献的后续 chunk
+    不占新名额；用于在写作前把证据收敛到引用上限之内，避免写完再触发整章重写。
+    QuotaExceededError 不会被吞掉：立即取消未开始的 map 调用并上抛，由编排层转为暂停。
+    """
+    from .quota import QuotaExceededError
     # 1) 每个问题分别向量召回，按 chunk_id 并集去重，保留最高检索分
     review_top_k = review_top_k or settings.REVIEW_TOP_K
     evidence_n = evidence_n or settings.REVIEW_EVIDENCE_N
@@ -533,6 +586,9 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
             c = futures[fut]
             try:
                 results.append(fut.result())
+            except QuotaExceededError:
+                pool_exec.shutdown(wait=True, cancel_futures=True)
+                raise
             except Exception as e:
                 console.print(f"[yellow]⚠️ 证据评估失败 chunk {c.chunk_id}: {e}")
 
@@ -559,17 +615,26 @@ def gather_evidence(section: OutlineSection, store, embedder, client, model,
     ranked_results.sort(key=lambda pair: -pair[1])
     best_value = ranked_results[0][1] if ranked_results else 0.0
     marginal_floor = best_value * 0.20
-    kept = [
-        result for result, value in ranked_results[:evidence_n]
-        if value > 0 and value >= marginal_floor
-    ]
+    kept = []
+    kept_docs: set = set()
+    for result, value in ranked_results:
+        if len(kept) >= evidence_n:
+            break
+        if value <= 0 or value < marginal_floor:
+            continue
+        doc_id = result["chunk"].doc_id
+        if max_docs and doc_id not in kept_docs and len(kept_docs) >= max_docs:
+            continue
+        kept.append(result)
+        kept_docs.add(doc_id)
 
     if len(kept) < 3:
         console.print(f"[yellow]⚠️ 章节「{section.heading}」证据不足（仅 {len(kept)} 条），生成内容可能较薄。")
     return [Evidence(chunk_id=r["chunk"].chunk_id, doc_id=r["chunk"].doc_id,
                      score=r["score"], summary=r["summary"],
                      section_title=r["chunk"].section_title,
-                     retrieval_score=r["chunk"].score) for r in kept]
+                     retrieval_score=r["chunk"].score,
+                     chunk_text=str(getattr(r["chunk"], "content", "") or "")) for r in kept]
 
 
 def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_meta: dict,
@@ -652,7 +717,9 @@ def _citation_aliases(paper_meta: dict, id_prefix_len: int) -> dict:
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
                   words: tuple = (1800, 2600), focus: str = "",
-                  broad_bib: list = None, validation_feedback: str = "") -> SectionDraft:
+                  broad_bib: list = None, validation_feedback: str = "",
+                  thesis: str = "", research_gap: str = "",
+                  mainline_logic: str = "") -> SectionDraft:
     blocks = []
     citation_meta = dict(paper_meta)
     for ev in evidence:
@@ -700,6 +767,7 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         table_requirement = "本章未同时满足大纲规划和同类可比数据门槛，不要生成表格。"
     focus_line = f"\n8. 本综述整体侧重方向：{focus}。行文视角、案例取舍与评述角度均以该侧重为准。" if focus else ""
     repair_line = f"\n9. 上次输出校验未通过：{validation_feedback}。本次必须逐项修复。" if validation_feedback else ""
+    alignment_line = _alignment_line(thesis, research_gap, mainline_logic)
     sample_1 = list(cite_to_doc.keys())[0] if cite_to_doc else "U-J25-001"
     sample_2 = list(cite_to_doc.keys())[1] if len(cite_to_doc) > 1 else sample_1
     recommended_min = min(available_doc_count, max(5, words[0] // 250))
@@ -716,13 +784,17 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         sample_cite_1=sample_1, sample_cite_2=sample_2,
         words_min=words[0], words_max=words[1], table_requirement=table_requirement,
         citation_guidance=citation_guidance,
-        focus_line=focus_line, repair_line=repair_line)
+        focus_line=focus_line, repair_line=repair_line,
+        alignment_line=alignment_line)
     text = _chat(client, model, prompt, json_mode=False,
                  call_type="write_section", stage="stage_C_write_section",
                  meta={"review_title": review_title, "heading": section.heading,
                        "evidence_count": len(evidence), "broad_bib_count": len(broad_bib or [])}).strip()
 
-    # 丢弃不在证据集中的引用标记（幻觉引用）
+    # 丢弃不在证据集中的引用标记（幻觉引用）；原本只靠幻觉引用支撑的句子会静默失去来源，
+    # 记录下来交给质量门禁与修复回路，而不是假装它们从未存在。
+    unsourced = _unsourced_after_strip(text, valid_cite_marks)
+
     def _filter_cite(m):
         return f"[@{cite_to_doc[m.group(1)]}]" if m.group(1) in valid_cite_marks else ""
     text = _CITE_RE.sub(_filter_cite, text)
@@ -738,6 +810,41 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
         cited_doc_ids=cited,
         track_a_doc_ids=[doc_id for doc_id in cited if doc_id in track_a_available],
         track_b_doc_ids=[doc_id for doc_id in cited if doc_id in track_b_available],
+        unsourced_sentences=unsourced,
+    )
+
+
+_WRITE_SENTENCE_RE = re.compile(r"[^\n。！？!?；;]+(?:[。！？!?；;]|$)")
+
+
+def _unsourced_after_strip(text: str, valid_marks: set) -> list[str]:
+    """返回含幻觉引用、且剥离后不再有任何有效引用的句子（已去掉无效标记）。"""
+    sentences = []
+    for match in _WRITE_SENTENCE_RE.finditer(text or ""):
+        sentence = match.group(0)
+        marks = [m.group(1) for m in _CITE_RE.finditer(sentence)]
+        if not marks or any(mark in valid_marks for mark in marks):
+            continue
+        stripped = _CITE_RE.sub("", sentence).strip()
+        if stripped:
+            sentences.append(stripped)
+    return sentences
+
+
+def _alignment_line(thesis: str, research_gap: str, mainline_logic: str) -> str:
+    parts = []
+    if thesis:
+        parts.append(f"核心立论：{thesis}")
+    if research_gap:
+        parts.append(f"学术缺口：{research_gap}")
+    if mainline_logic:
+        parts.append(f"主线逻辑：{mainline_logic}")
+    if not parts:
+        return ""
+    return (
+        "\n10. 全文立论对齐（" + "；".join(parts) + "）。本章必须显式服务于上述核心立论："
+        "开篇点明本章在主线中的位置，章末用一两句话说明本章证据如何支持、修正或限定该立论，"
+        "并指出与学术缺口相关的未解决问题；不得偏离主线另起话题。"
     )
 
 
@@ -844,7 +951,8 @@ def write_intro_conclusion(outline: Outline, drafts: list, client, model,
 
 def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
                     paper_meta: dict, evidence_total: int,
-                    id_prefix_len: int = 8) -> ReviewDoc:
+                    id_prefix_len: int = 8,
+                    evidence_by_heading: dict | None = None) -> ReviewDoc:
     cited_ids = {doc_id for draft in drafts for doc_id in draft.cited_doc_ids}
     citation_meta = dict(paper_meta)
     for doc_id in cited_ids:
@@ -866,14 +974,10 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
             return f"[{numbering[doc_id]}]"
         return _CITE_RE.sub(repl, text)
 
-    new_sections = [SectionDraft(
-        heading=d.heading,
-        markdown=_renumber(d.markdown),
-        cited_doc_ids=d.cited_doc_ids,
-        track_a_doc_ids=d.track_a_doc_ids,
-        track_b_doc_ids=d.track_b_doc_ids,
-        source_evidence_count=d.source_evidence_count,
-    ) for d in drafts]
+    # 章节号 = 最终位置 + 2（引言占第 1 章）；失败章节被跳过后图号仍与实际章节一致。
+    new_sections = [d.model_copy(update=dict(
+        markdown=_renumber(renumber_figure_labels(d.markdown, index + 2)),
+    )) for index, d in enumerate(drafts)]
 
     raw_review = ReviewDoc(
         title=outline.title, topic=outline.topic,
@@ -891,7 +995,17 @@ def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
             doc_id for draft in drafts for doc_id in draft.track_b_doc_ids
         ),
     )
-    return audit_and_clean_review(raw_review, context, paper_meta).review
+    return audit_and_clean_review(
+        raw_review, context, paper_meta, evidence_by_heading=evidence_by_heading,
+    ).review
+
+
+_FIGURE_LABEL_RE = re.compile(r"(图|表)\s(\d+)-(\d+)")
+
+
+def renumber_figure_labels(markdown: str, chapter_no: int) -> str:
+    """把章节内"图 n-m / 表 n-m"的章号统一改写为最终章节号（章内序号 m 不变）。"""
+    return _FIGURE_LABEL_RE.sub(lambda m: f"{m.group(1)} {chapter_no}-{m.group(3)}", markdown or "")
 
 
 def render_review_note(review: ReviewDoc, paper_meta: dict, settings,
