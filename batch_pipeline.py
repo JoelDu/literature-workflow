@@ -867,7 +867,9 @@ def _export_completed(c, conn) -> int:
     # 限制单次导出最多 BATCH_SIZE_LIMIT 篇以平抑速率，按文献唯一ID进行 Excel 导出及防重写。
     """
     c.execute(
-        f"SELECT id, title, pdf_path, language, images_dir, result_json, batch_provider, batch_job_id, mineru_md FROM papers WHERE status=? LIMIT {settings.BATCH_SIZE_LIMIT}",
+        f"SELECT id, title, pdf_path, language, images_dir, result_json, batch_provider, batch_job_id, mineru_md FROM papers WHERE status=? "
+        # 上轮导出出错（error_message 非空）的排在最后，不挡新完成的文献
+        f"ORDER BY (error_message IS NOT NULL) LIMIT {settings.BATCH_SIZE_LIMIT}",
         (STATUS_COMPLETED,),
     )
     completed = c.fetchall()
@@ -875,65 +877,99 @@ def _export_completed(c, conn) -> int:
         console.print("[dim]当前没有新完成的文献需要导出。")
         return 0
 
+    from litreview.analysis_record import PaperAnalysisRecord
+
     excel_rows = []
+    exported = []  # (doc_id, title)：本轮笔记已生成、待 Excel 落盘后统一标 EXPORTED
     for doc_id, title, pdf_path, lang, images_dir, result_json, provider, job_id, md_text in completed:
-        from litreview.analysis_record import PaperAnalysisRecord
-        note_meta = build_note_metadata(title, md_text or "", lang)
-        analysis = PaperAnalysisRecord.from_llm_json(
-            result_json,
-            markdown_text=md_text or "",
-            paper_meta=note_meta,
-        )
+        # 单篇隔离：任何一篇出错只影响它自己，绝不拖累前后文献。
+        # 只有 LLM 结果本身坏掉才转 RESULT_PARSE_FAILED 重新提交（重花额度才有意义）；
+        # 笔记/磁盘等环境异常重提交也修不好，保持 COMPLETED 并记 error_message，
+        # 下轮排在队尾重试导出，不再调用 LLM。
+        try:
+            note_meta = build_note_metadata(title, md_text or "", lang)
+            analysis = PaperAnalysisRecord.from_llm_json(
+                result_json,
+                markdown_text=md_text or "",
+                paper_meta=note_meta,
+            )
+            # 与实时管道一致：LLM 返回的 JSON 解析失败时绝不把垃圾内容导出为终态
+            if analysis.error:
+                err_msg = f"分析结果解析失败，已转入重提交队列: {str(analysis.error)[:500]}"
+                console.print(f"[yellow]⚠️ {title}: {err_msg}")
+                c.execute("UPDATE papers SET status=?, error_message=? WHERE id=?",
+                          (STATUS_RESULT_PARSE_FAILED, err_msg, doc_id))
+                conn.commit()
+                log_run_event(mode="batch", event="paper_exported", title=title, doc_id=doc_id, status="failed", error=err_msg)
+                continue
 
-        images = []
-        if images_dir and os.path.exists(images_dir):
-            for ext in ["*.png", "*.jpg", "*.jpeg"]:
-                images.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
-        images = [os.path.abspath(img) for img in images]
+            images = []
+            if images_dir and os.path.exists(images_dir):
+                for ext in ["*.png", "*.jpg", "*.jpeg"]:
+                    images.extend(glob.glob(os.path.join(images_dir, "**", ext), recursive=True))
+            images = [os.path.abspath(img) for img in images]
 
-        # 导出 Obsidian，携带 doc_id 以确保生成带哈希的安全跨平台相对附件笔记
-        note_path = generate_obsidian_note(note_meta, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
-        note_filename = os.path.basename(note_path)
-        obsidian_link_name = os.path.splitext(note_filename)[0]
+            # 导出 Obsidian，携带 doc_id 以确保生成带哈希的安全跨平台相对附件笔记
+            note_path = generate_obsidian_note(note_meta, analysis, images, settings.OBSIDIAN_VAULT_DIR, doc_id)
+            note_filename = os.path.basename(note_path)
+            obsidian_link_name = os.path.splitext(note_filename)[0]
 
-        # 收集 Excel，通过深模块自动格式化与列对齐
-        excel_rows.append(analysis.to_excel_row(
-            doc_id=doc_id,
-            title=title,
-            pdf_path=pdf_path,
-            note_name=obsidian_link_name,
-            status="EXPORTED",
-            provider=provider,
-            job_id=job_id,
-            processed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
+            # 收集 Excel，通过深模块自动格式化与列对齐
+            excel_rows.append(analysis.to_excel_row(
+                doc_id=doc_id,
+                title=title,
+                pdf_path=pdf_path,
+                note_name=obsidian_link_name,
+                status="EXPORTED",
+                provider=provider,
+                job_id=job_id,
+                processed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ))
+            exported.append((doc_id, title))
+        except Exception as e:
+            err_msg = f"导出失败，保留 COMPLETED 待下轮重试导出: {str(e)[:500]}"
+            console.print(f"[yellow]⚠️ {title}: {err_msg}")
+            c.execute("UPDATE papers SET error_message=? WHERE id=?", (err_msg, doc_id))
+            conn.commit()
+            log_run_event(mode="batch", event="paper_exported", title=title, doc_id=doc_id, status="failed", error=err_msg)
 
-        # 移至导出终态
-        c.execute("UPDATE papers SET status=? WHERE id=?", (STATUS_EXPORTED, doc_id))
-        conn.commit()
+    if not excel_rows:
+        return 0
+
+    # 先落 Excel，再统一标 EXPORTED：Excel 写失败时这些文献仍停在 COMPLETED，
+    # 下一轮会原样重导（笔记按 doc_id 覆盖、Excel 按文献ID去重，均幂等），不会出现
+    # 「数据库已 EXPORTED 但 Excel 里没有」的孤儿。
+    try:
+        export_to_excel(excel_rows, settings.EXCEL_OUTPUT_PATH)
+    except Exception as e:
+        console.print(f"[red]Excel 写入失败，{len(excel_rows)} 篇文献保留 COMPLETED 待下轮重导: {e}")
+        log_run_event(mode="batch", event="excel_export", status="failed", error=str(e), extra={"count": len(excel_rows)})
+        return 0
+
+    # 单事务移至导出终态
+    with conn:
+        c.executemany("UPDATE papers SET status=?, error_message=NULL WHERE id=?",
+                      [(STATUS_EXPORTED, doc_id) for doc_id, _ in exported])
+    for doc_id, title in exported:
         log_run_event(mode="batch", event="paper_exported", title=title, doc_id=doc_id, status="success")
         console.print(f"[green]✅ 成功导出: {title}")
+    console.print(f"[bold green]共导出 {len(excel_rows)} 篇文献到 {settings.EXCEL_OUTPUT_PATH}")
 
-    # 批量合并去重导出 Excel
-    if excel_rows:
-        export_to_excel(excel_rows, settings.EXCEL_OUTPUT_PATH)
-        console.print(f"[bold green]共导出 {len(excel_rows)} 篇文献到 {settings.EXCEL_OUTPUT_PATH}")
-
-        # 导出后自动立即增量更新综述 4096 维 Qwen3 向量索引与结构化元数据（即时处理，无需夜间等待）
-        if settings.REVIEW_AUTO_INDEX:
-            try:
-                from litreview.indexer import build_index
-                exported_ids = [r["文献ID"] for r in excel_rows]
-                build_index(settings=settings, console=console, doc_ids=exported_ids)
-            except Exception as e:
-                console.print(f"[yellow]⚠️ 综述向量索引自动更新失败（不影响导出，可手动重试）: {e}")
-            try:
-                from llm_router import make_openai_client
-                from litreview.enrich import run_enrich
-                llm_client, _ = make_openai_client(quiet=True)
-                run_enrich(settings, console, llm_client, use_llm=settings.REVIEW_ENRICH_LLM)
-            except Exception as e:
-                console.print(f"[yellow]⚠️ 元数据自动提取失败（不影响导出，可手动重试）: {e}")
+    # 导出后自动立即增量更新综述 4096 维 Qwen3 向量索引与结构化元数据（即时处理，无需夜间等待）
+    if settings.REVIEW_AUTO_INDEX:
+        try:
+            from litreview.indexer import build_index
+            exported_ids = [r["文献ID"] for r in excel_rows]
+            build_index(settings=settings, console=console, doc_ids=exported_ids)
+        except Exception as e:
+            console.print(f"[yellow]⚠️ 综述向量索引自动更新失败（不影响导出，可手动重试）: {e}")
+        try:
+            from llm_router import make_openai_client
+            from litreview.enrich import run_enrich
+            llm_client, _ = make_openai_client(quiet=True)
+            run_enrich(settings, console, llm_client, use_llm=settings.REVIEW_ENRICH_LLM)
+        except Exception as e:
+            console.print(f"[yellow]⚠️ 元数据自动提取失败（不影响导出，可手动重试）: {e}")
 
     return len(excel_rows)
 
