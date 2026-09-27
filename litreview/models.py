@@ -51,6 +51,18 @@ class Outline(BaseModel):
     title: str
     topic: str = ""
     sections: list = Field(default_factory=list)   # list[OutlineSection]，仅主体章节
+    # 作者立论三元组随大纲 JSON 持久化，保证每章写作与续跑都能看到同一核心立论。
+    thesis: str = ""
+    research_gap: str = ""
+    mainline_logic: str = ""
+
+    def apply_alignment(self, thesis: str = "", research_gap: str = "",
+                        mainline_logic: str = "") -> "Outline":
+        """显式传入的非空参数优先；缺省时沿用大纲自带值。原地更新并返回 self。"""
+        self.thesis = (thesis or "").strip() or self.thesis
+        self.research_gap = (research_gap or "").strip() or self.research_gap
+        self.mainline_logic = (mainline_logic or "").strip() or self.mainline_logic
+        return self
 
     @classmethod
     def from_dict(cls, d: dict, topic: str = "") -> "Outline":
@@ -66,7 +78,11 @@ class Outline(BaseModel):
                 sections.append(OutlineSection(**s_dict))
             elif isinstance(s, OutlineSection):
                 sections.append(s)
-        return cls(title=d.get("title", topic or "文献综述"), topic=topic or d.get("topic", ""), sections=sections)
+        return cls(title=d.get("title", topic or "文献综述"), topic=topic or d.get("topic", ""),
+                   sections=sections,
+                   thesis=str(d.get("thesis") or ""),
+                   research_gap=str(d.get("research_gap") or ""),
+                   mainline_logic=str(d.get("mainline_logic") or ""))
 
 
 class Evidence(BaseModel):
@@ -76,6 +92,8 @@ class Evidence(BaseModel):
     summary: str
     section_title: str = ""       # 来源片段在原论文中的小节标题
     retrieval_score: float = 0.0  # 向量检索余弦分（调试用）
+    # 原始片段正文，仅供零 token 数值溯源审计；不写入 manifest（私有全文）。
+    chunk_text: str = ""
 
 
 class SectionDraft(BaseModel):
@@ -85,6 +103,11 @@ class SectionDraft(BaseModel):
     track_a_doc_ids: list = Field(default_factory=list)
     track_b_doc_ids: list = Field(default_factory=list)
     source_evidence_count: int = 0  # 支持检查点续跑后准确恢复全文证据计数
+    # 幻觉引用被剥离后失去全部来源的句子（剥离后的文本），供质量门禁与修复回路使用。
+    unsourced_sentences: list = Field(default_factory=list)
+    # doc_id -> 该文献在写作输入（证据摘要、原始片段、第二轨摘要）中出现过的规范化数值；
+    # 随检查点持久化，续跑后的数值溯源审计仍可复现。
+    evidence_numbers: dict = Field(default_factory=dict)
 
 
 class ReviewDoc(BaseModel):
