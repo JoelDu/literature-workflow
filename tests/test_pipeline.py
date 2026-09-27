@@ -132,7 +132,8 @@ def test_pipeline_list_and_approve(pipeline_env):
     c_conn.close()
 
 
-def test_pipeline_acquisition_and_ingestion(pipeline_env):
+def test_pipeline_acquisition_and_ingestion(pipeline_env, monkeypatch):
+    monkeypatch.setattr(pypdf._page.PageObject, "extract_text", lambda self: "Extracted scientific full text for the test paper.")
     """测试合法 OA PDF 下载、解析入库与引文对齐全链路。"""
     cache_db, test_db, staging_dir = pipeline_env
 
@@ -159,13 +160,16 @@ def test_pipeline_acquisition_and_ingestion(pipeline_env):
 
     # 执行入库与切块
     ing_res = ingest_acquired_candidates(
-        cache_db_path=cache_db, test_db_path=test_db, staging_dir=staging_dir, max_ingest=2
+        cache_db_path=cache_db, test_db_path=test_db, staging_dir=staging_dir, max_ingest=2,
+        generate_vector_embeddings=False
     )
     assert ing_res["ingested_count"] == 1
     ingested = ing_res["ingested_works"][0]
-    assert ingested["lifecycle_status"] in ("VECTOR_INDEXED", "VECTOR_INDEXED_TEST")
+    assert ingested["lifecycle_status"] == "GRAPH_INDEXED"
+    assert ingested["retryable"] is True
+    assert ing_res["failed_count"] == 1
     assert ingested["chunks_persisted"] > 0
-    assert ingested["embeddings_persisted"] > 0
+    assert ingested["embeddings_persisted"] == 0
     assert ingested["new_work_id"].startswith("work_oa_")
 
     # 验证测试引文库数据已写入
@@ -203,3 +207,55 @@ def test_pipeline_acquisition_and_ingestion(pipeline_env):
     assert d_row[2] == "DISCOVERED"
     assert d_row[3] == "APPROVED"
     c_conn.close()
+
+
+def test_embedding_failure_then_retry(pipeline_env, monkeypatch):
+    monkeypatch.setattr(pypdf._page.PageObject, "extract_text", lambda self: "Extracted scientific full text for the test paper.")
+    import numpy as np
+    from types import SimpleNamespace
+    cache, graph, staging = pipeline_env
+    with sqlite3.connect(cache) as conn:
+        conn.execute("UPDATE discovered_candidates SET lifecycle_status='FULLTEXT_ACQUIRED' WHERE candidate_id='cand_oa_1'")
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    os.makedirs(staging, exist_ok=True)
+    with open(os.path.join(staging, 'cand_oa_1.pdf'), 'wb') as handle:
+        writer.write(handle)
+    settings = SimpleNamespace(EMBEDDING_MODEL='real', EMBEDDING_DIM=2, EMBEDDING_BATCH_SIZE=16)
+    with patch('utils.get_settings', return_value=settings), patch('litreview.indexer._get_default_embed_client', return_value=object()), patch('litreview.embedder.Embedder.embed_texts', side_effect=RuntimeError('offline')):
+        result = ingest_acquired_candidates(cache, graph, staging_dir=staging)
+    assert result['failed_count'] == 1
+    assert result['ingested_works'][0]['lifecycle_status'] == 'GRAPH_INDEXED'
+    with sqlite3.connect(graph) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM review_chunks WHERE embedding IS NOT NULL').fetchone()[0] == 0
+    with patch('utils.get_settings', return_value=settings), patch('litreview.indexer._get_default_embed_client', return_value=object()), patch('litreview.embedder.Embedder.embed_texts', return_value=np.array([[1,0]],dtype=np.float32)):
+        result = ingest_acquired_candidates(cache, graph, staging_dir=staging)
+    assert result['indexed_count'] == 1
+    assert result['failed_count'] == 0
+    assert result['ingested_works'][0]['lifecycle_status'] == 'VECTOR_INDEXED'
+
+
+def test_empty_pdf_and_quarantined_work_are_not_indexed(pipeline_env, monkeypatch):
+    cache, graph, staging = pipeline_env
+    os.makedirs(staging, exist_ok=True)
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    with open(os.path.join(staging, 'cand_oa_1.pdf'), 'wb') as handle:
+        writer.write(handle)
+    with sqlite3.connect(cache) as conn:
+        conn.execute("UPDATE discovered_candidates SET lifecycle_status='FULLTEXT_ACQUIRED' WHERE candidate_id='cand_oa_1'")
+    result = ingest_acquired_candidates(cache, graph, staging_dir=staging, generate_vector_embeddings=False)
+    assert result['failed_count'] == 1
+    assert result['ingested_works'][0]['lifecycle_status'] == 'FULLTEXT_ACQUIRED'
+    assert result['ingested_works'][0]['chunks_persisted'] == 0
+    monkeypatch.setattr(pypdf._page.PageObject, 'extract_text', lambda self: 'Extracted scientific full text')
+    result = ingest_acquired_candidates(cache, graph, staging_dir=staging, generate_vector_embeddings=False)
+    work = result['ingested_works'][0]['new_work_id']
+    for status, deleted in [('QUARANTINED', 0), ('NORMAL', 1)]:
+        with sqlite3.connect(graph) as conn:
+            conn.execute('UPDATE works SET quarantine_status=?,is_deleted=? WHERE work_id=?', (status,deleted,work))
+        result = ingest_acquired_candidates(cache, graph, staging_dir=staging, generate_vector_embeddings=False)
+        assert result['failed_count'] == 1
+        assert result['ingested_works'][0]['retryable'] is False
+        with sqlite3.connect(graph) as conn:
+            assert conn.execute('SELECT quarantine_status,is_deleted FROM works WHERE work_id=?', (work,)).fetchone() == (status,deleted)

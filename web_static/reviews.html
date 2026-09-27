@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>综述生成与恢复</title>
+<style>body{font:16px system-ui;max-width:960px;margin:40px auto;padding:0 20px;background:#f6f8fb;color:#172b4d}form,article{background:white;padding:24px;margin:20px 0;border-radius:12px}label{display:block;margin:10px 0}input,textarea,select{padding:8px;width:95%;font:inherit}button{padding:9px 16px;cursor:pointer}pre{white-space:pre-wrap;max-height:250px;overflow:auto}a{margin-right:16px}#message{color:#a22}</style></head>
+<body><a href="/">← 返回工作台</a><h1>综述生成与恢复</h1><p>章节完成后自动保存。服务重启后可在任务列表继续生成。</p>
+<form id="create"><label>综述主题<input name="topic" required></label><label>研究侧重<textarea name="focus"></textarea></label><label>目标字数<input name="words" type="number" min="0" value="8000"></label><label>章节数（0 为自动）<input name="sections" type="number" min="0" value="0"></label><label>核心立论（可选）<textarea name="thesis"></textarea></label><label>研究缺口（可选）<textarea name="research_gap"></textarea></label><label>论述主线（可选）<input name="mainline_logic"></label><button>开始生成</button></form>
+<p id="message" role="status"></p><h2>任务</h2><div id="jobs"></div><script src="/static/reviews.js"></script></body></html>

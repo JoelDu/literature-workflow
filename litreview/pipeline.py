@@ -19,7 +19,6 @@ import pypdf
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Set
 from datetime import datetime
-from dotenv import dotenv_values
 
 from litreview.ref_parser import parse_reference_mention, normalize_title, extract_first_author_surname
 from litreview.chunker import split_markdown
@@ -580,7 +579,7 @@ def ingest_acquired_candidates(
             SELECT candidate_id, query_run_id, openalex_id, doi, title, authors_json,
                    journal_or_venue, publication_year, source_seeds_json, track, oa_url, landing_page_url
             FROM discovered_candidates
-            WHERE lifecycle_status = 'FULLTEXT_ACQUIRED'
+            WHERE lifecycle_status IN ('FULLTEXT_ACQUIRED', 'PARSED', 'GRAPH_INDEXED', 'VECTOR_INDEXED_TEST')
             LIMIT ?
         """, (max_ingest,)).fetchall()
 
@@ -591,6 +590,12 @@ def ingest_acquired_candidates(
         pdf_path = os.path.join(staging_dir, f"{cid}.pdf")
 
         if not os.path.exists(pdf_path):
+            ingested_works.append({
+                "candidate_id": cid, "title": title, "is_real_embedding": False,
+                "lifecycle_status": "FULLTEXT_ACQUIRED", "retryable": True,
+                "error": "Acquired PDF is missing from the staging directory",
+                "chunks_persisted": 0, "embeddings_persisted": 0,
+            })
             continue
 
         # 1. 读取并验真 PDF
@@ -602,20 +607,55 @@ def ingest_acquired_candidates(
         page_count = len(reader.pages)
         full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
 
+        if not full_text.strip():
+            cache_conn.execute("UPDATE discovered_candidates SET lifecycle_status='FULLTEXT_ACQUIRED' WHERE candidate_id=?", (cid,))
+            cache_conn.commit()
+            ingested_works.append({
+                "candidate_id": cid, "title": title, "is_real_embedding": False,
+                "lifecycle_status": "FULLTEXT_ACQUIRED", "retryable": True,
+                "error": "PDF contains no extractable full text; OCR is required before retrying",
+                "chunks_persisted": 0, "embeddings_persisted": 0,
+            })
+            continue
+
         # 2. 生成规范 Work ID
         short_oa = oa_id.split("/")[-1].lower() if oa_id else cid[:12]
         new_work_id = f"work_oa_{short_oa}"
         authors_list = json.loads(auth_json) if auth_json else []
+        existing = test_conn.execute(
+            "SELECT quarantine_status,is_deleted FROM works WHERE work_id=?", (new_work_id,)
+        ).fetchone()
+        if existing and (existing[0] != "NORMAL" or existing[1]):
+            ingested_works.append({
+                "candidate_id": cid, "new_work_id": new_work_id, "title": title,
+                "is_real_embedding": False, "retryable": False,
+                "error": "Work is quarantined or deleted; restore it explicitly before ingestion",
+                "chunks_persisted": 0, "embeddings_persisted": 0,
+                "lifecycle_status": cache_conn.execute(
+                    "SELECT lifecycle_status FROM discovered_candidates WHERE candidate_id=?", (cid,)
+                ).fetchone()[0],
+            })
+            continue
 
         # 3. 写入测试数据库 works 表
         test_conn.execute("""
-            INSERT OR REPLACE INTO works (
+            INSERT INTO works (
                 work_id, work_type, canonical_title, publication_year,
                 journal_or_venue, authors_json, quarantine_status,
                 quarantine_reason, eligible_for_retrieval,
                 eligible_for_citation_graph, in_library, is_deleted,
                 created_at, updated_at
             ) VALUES (?, 'journal_article', ?, ?, ?, ?, 'NORMAL', NULL, 1, 1, 1, 0, ?, ?)
+            ON CONFLICT(work_id) DO UPDATE SET
+                canonical_title=excluded.canonical_title,
+                publication_year=excluded.publication_year,
+                journal_or_venue=excluded.journal_or_venue,
+                authors_json=excluded.authors_json, in_library=1,
+                eligible_for_retrieval=CASE WHEN works.quarantine_status='NORMAL'
+                    AND works.is_deleted=0 THEN 1 ELSE 0 END,
+                eligible_for_citation_graph=CASE WHEN works.quarantine_status='NORMAL'
+                    AND works.is_deleted=0 THEN 1 ELSE 0 END,
+                updated_at=excluded.updated_at
         """, (
             new_work_id, title, year, venue,
             json.dumps(authors_list, ensure_ascii=False),
@@ -645,7 +685,7 @@ def ingest_acquired_candidates(
         """, (new_work_id, title, now_iso))
 
         # 5. 写入 document_assets (完整资产元数据回填)
-        asset_id = f"asset_{new_work_id[:16]}"
+        asset_id = f"asset_{new_work_id}"
         source_url = oa_url or landing_url or "https://www.nature.com/articles/s41598-024-55876-y.pdf"
         test_conn.execute("""
             INSERT OR REPLACE INTO document_assets (
@@ -702,7 +742,7 @@ def ingest_acquired_candidates(
                 else:
                     quality_counts["PARSE_FAILED"] += 1
 
-                m_id = f"mention_{new_work_id[:12]}_{idx}"
+                m_id = f"mention_{new_work_id}_{idx}"
                 test_conn.execute("""
                     INSERT OR REPLACE INTO reference_mentions (
                         mention_id, citing_work_id, source_run_id, ref_index,
@@ -734,7 +774,7 @@ def ingest_acquired_candidates(
         chunks = split_markdown(new_work_id, full_text)
         if not chunks:
             from litreview.chunker import Chunk
-            content = full_text.strip() if len(full_text.strip()) >= 10 else f"{title}\n{venue or ''} ({year or ''})"
+            content = full_text.strip()
             chunks = [Chunk(doc_id=new_work_id, chunk_index=0, section_title="Overview", content=content)]
 
         chunks_persisted = 0
@@ -749,40 +789,32 @@ def ingest_acquired_candidates(
         embeddings_list = []
         embedding_model_name = "Qwen/Qwen3-Embedding-8B"
 
-        env_conf = dotenv_values(".env") if os.path.exists(".env") else {}
-        sf_key = os.getenv("SILICONFLOW_API_KEY") or env_conf.get("SILICONFLOW_API_KEY")
-        sf_base = os.getenv("SILICONFLOW_API_BASE") or env_conf.get("SILICONFLOW_API_BASE", "https://api.siliconflow.cn/v1")
-
-        if sf_key and generate_vector_embeddings:
+        embedding_error = "Vector embedding was disabled"
+        if generate_vector_embeddings:
             try:
-                from openai import OpenAI
-                sf_client = OpenAI(api_key=sf_key, base_url=sf_base)
-                batch_size = 16
-                for b_idx in range(0, len(chunk_texts), batch_size):
-                    batch = chunk_texts[b_idx:b_idx+batch_size]
-                    resp = sf_client.embeddings.create(model=embedding_model_name, input=batch)
-                    for item in resp.data:
-                        embeddings_list.append(np.array(item.embedding, dtype=np.float32))
-                if len(embeddings_list) == len(chunks):
-                    # 验证真实模型向量指标：非空、维度 4096、范数、非零维度分布
-                    dim_ok = all(len(v) == 4096 for v in embeddings_list)
-                    norm_ok = all(0.5 < float(np.linalg.norm(v)) < 1.5 for v in embeddings_list)
-                    if dim_ok and norm_ok:
-                        is_real_embedding = True
-            except Exception as e:
+                from utils import get_settings
+                from litreview.embedder import Embedder
+                from litreview.indexer import _get_default_embed_client
+                settings = get_settings()
+                embedding_model_name = settings.EMBEDDING_MODEL
+                embedder = Embedder(_get_default_embed_client(), embedding_model_name,
+                                    settings.EMBEDDING_DIM, settings.EMBEDDING_BATCH_SIZE)
+                vectors = embedder.embed_texts(chunk_texts)
+                if (vectors.shape != (len(chunks), settings.EMBEDDING_DIM)
+                        or not np.isfinite(vectors).all()
+                        or np.any(np.linalg.norm(vectors, axis=1) == 0)):
+                    raise ValueError("Invalid embedding response")
+                embeddings_list = list(vectors)
+                is_real_embedding = True
+                embedding_error = None
+            except Exception as exc:
+                embedding_error = f"{type(exc).__name__}: {exc}"
                 embeddings_list = []
 
-        if not is_real_embedding:
-            embedding_model_name = "qwen3-embedding-test"
-            embeddings_list = []
-            for chk in chunks:
-                vec = np.zeros(1024, dtype=np.float32)
-                h_int = int(hashlib.md5(chk.content.encode('utf-8')).hexdigest()[:8], 16)
-                vec[0] = (h_int % 1000) / 1000.0
-                embeddings_list.append(vec)
-
-        for chk, vec in zip(chunks, embeddings_list):
-            vec_blob = vec.tobytes()
+        # Persist parsed chunks even when indexing fails; a retry can finish them.
+        for i, chk in enumerate(chunks):
+            vec = embeddings_list[i] if is_real_embedding else None
+            vec_blob = vec.tobytes() if vec is not None else None
             test_conn.execute("""
                 INSERT OR REPLACE INTO review_chunks (
                     doc_id, chunk_index, section_title, content, char_len, embedding, embedding_model
@@ -792,7 +824,7 @@ def ingest_acquired_candidates(
                 chk.content, len(chk.content), vec_blob, embedding_model_name
             ))
             chunks_persisted += 1
-            embeddings_persisted += 1
+            embeddings_persisted += int(vec is not None)
 
         # 保存 review_index_meta
         test_conn.execute("""
@@ -808,7 +840,7 @@ def ingest_acquired_candidates(
         if is_real_embedding:
             cur_lifecycle = "VECTOR_INDEXED"
         else:
-            cur_lifecycle = "VECTOR_INDEXED_TEST"
+            cur_lifecycle = "GRAPH_INDEXED"
 
         cache_conn.execute("UPDATE discovered_candidates SET lifecycle_status = ? WHERE candidate_id = ?", (cur_lifecycle, cid))
         cache_conn.commit()
@@ -826,6 +858,8 @@ def ingest_acquired_candidates(
             "chunks_persisted": chunks_persisted,
             "embeddings_persisted": embeddings_persisted,
             "is_real_embedding": is_real_embedding,
+            "retryable": not is_real_embedding,
+            "error": embedding_error,
             "embedding_model": embedding_model_name,
             "embedding_dimension": len(embeddings_list[0]) if embeddings_list else 0,
             "reference_mentions_extracted": ref_mentions_count,
@@ -840,7 +874,10 @@ def ingest_acquired_candidates(
     cache_conn.close()
 
     return {
-        "ingested_count": len(ingested_works),
+        "attempted_count": len(ingested_works),
+        "ingested_count": sum(w["chunks_persisted"] > 0 for w in ingested_works),
+        "indexed_count": sum(w["is_real_embedding"] for w in ingested_works),
+        "failed_count": sum(not w["is_real_embedding"] for w in ingested_works),
         "ingested_works": ingested_works
     }
 

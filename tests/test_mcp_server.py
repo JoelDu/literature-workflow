@@ -377,6 +377,7 @@ def test_get_citation_network_and_expand_mcp_tools(monkeypatch, tmp_path):
     conn.close()
 
     monkeypatch.setenv("CITATION_NETWORK_DB_PATH", str(db_path))
+    monkeypatch.delenv("TEST_CITATION_DB_PATH", raising=False)
     server = _fresh_mcp(monkeypatch, tmp_path)
 
     # 1. get_citation_network with include_candidates=False

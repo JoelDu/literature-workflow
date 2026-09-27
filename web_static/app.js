@@ -1301,7 +1301,7 @@ async function loadPipelineData() {
           </td>
           <td>
             <span class="badge ${c.lifecycle_status === 'FULLTEXT_ACQUIRED' ? 'badge-success' : 'badge-warning'}">
-              ${c.lifecycle_status === 'FULLTEXT_ACQUIRED' ? '🟢 已获取全文' : '🟡 已批准待获取'}
+              ${c.lifecycle_status === 'FULLTEXT_ACQUIRED' ? '🟢 已获取全文' : c.lifecycle_status === 'APPROVED' ? '🟡 已批准待获取' : '🟡 语义索引待完成，可重试'}
             </span>
           </td>
           <td>
@@ -1503,9 +1503,13 @@ async function executeAcquireAndIngest(candidateIds) {
       pollJobStatus(jsonIng.data.job_id, (ingJob) => {
         setPipelineStepActive("step-graph");
         const ingRes = ingJob.result || {};
-        const ingestedCount = ingRes.ingested_count || 0;
+        const ingestedCount = ingRes.indexed_count || 0;
+        const pendingCount = ingRes.failed_count || 0;
 
-        if (ingestedCount > 0) {
+        if (pendingCount > 0) {
+          consoleBox.innerHTML += `<div class="log-line text-warning">[待重试] 真实语义索引完成 ${ingestedCount} 篇，${pendingCount} 篇尚未完成，请在待入库列表重试。</div>`;
+          showToast(`索引完成 ${ingestedCount} 篇，待重试 ${pendingCount} 篇`, "warning", 5000);
+        } else if (ingestedCount > 0) {
           consoleBox.innerHTML += `<div class="log-line text-success font-bold">[成功] 🎉 真实 Qwen3-Embedding-8B 4096维向量化完成（成功入库 ${ingestedCount} 篇），引文图谱节点与边已成功回填！</div>`;
           showToast(`🎉 成功入库 ${ingestedCount} 篇文献并完成 4096 维向量化与引文图谱回填！`, "success", 5000);
         } else {
@@ -1829,7 +1833,7 @@ function pollJobStatus(jobId, onComplete) {
         consoleBox.scrollTop = consoleBox.scrollHeight;
       }
 
-      if (job.status === "completed") {
+      if (job.status === "completed" || job.status === "partial") {
         clearInterval(AppState.jobPollTimer);
         AppState.jobPollTimer = null;
         if (onComplete) onComplete(job);
@@ -1837,6 +1841,7 @@ function pollJobStatus(jobId, onComplete) {
         clearInterval(AppState.jobPollTimer);
         AppState.jobPollTimer = null;
         showToast(`任务执行失败: ${job.error}`, "error", 6000);
+        loadPipelineData();
       }
     } catch (err) {
       console.error("Poll job error:", err);

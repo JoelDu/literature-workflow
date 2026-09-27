@@ -636,23 +636,38 @@ def gather_broad_bibliography(section: OutlineSection, store, embedder, paper_me
 _CITE_RE = re.compile(r"\[@([A-Za-z0-9_\-]+)\]")
 
 
+def _citation_aliases(paper_meta: dict, id_prefix_len: int) -> dict:
+    """Only accept an alias if it identifies exactly one document in the corpus."""
+    owners = {}
+    for doc_id, meta in paper_meta.items():
+        for alias in (doc_id, doc_id[:id_prefix_len], meta.get("cite_key")):
+            if alias:
+                owners.setdefault(alias, set()).add(doc_id)
+    aliases = {alias: next(iter(docs)) for alias, docs in owners.items() if len(docs) == 1}
+    # Exact document IDs are authoritative even if another document's human key collides.
+    aliases.update({doc_id: doc_id for doc_id in paper_meta})
+    return aliases
+
+
 def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
                   review_title: str, client, model, id_prefix_len: int = 8,
                   words: tuple = (1800, 2600), focus: str = "",
                   broad_bib: list = None, validation_feedback: str = "") -> SectionDraft:
     blocks = []
-    valid_cite_marks = set()
-    cite_to_doc = {}
+    citation_meta = dict(paper_meta)
+    for ev in evidence:
+        citation_meta.setdefault(ev.doc_id, {})
+    for b in broad_bib or []:
+        citation_meta.setdefault(b["doc_id"], b)
+    aliases = _citation_aliases(citation_meta, id_prefix_len)
+    allowed_docs = {ev.doc_id for ev in evidence} | {b["doc_id"] for b in broad_bib or []}
+    cite_to_doc = {alias: doc for alias, doc in aliases.items() if doc in allowed_docs}
+    valid_cite_marks = set(cite_to_doc)
     for i, ev in enumerate(evidence, 1):
         m = paper_meta.get(ev.doc_id, {})
-        # 优先使用学术语义编号（如 U-J25-001），回退使用 doc_id 前缀
         cite_key = m.get("cite_key") or ev.doc_id[:id_prefix_len]
-        valid_cite_marks.add(cite_key)
-        valid_cite_marks.add(ev.doc_id[:id_prefix_len])
-        valid_cite_marks.add(ev.doc_id)
-        cite_to_doc[cite_key] = ev.doc_id
-        cite_to_doc[ev.doc_id[:id_prefix_len]] = ev.doc_id
-        cite_to_doc[ev.doc_id] = ev.doc_id
+        if cite_to_doc.get(cite_key) != ev.doc_id:
+            cite_key = ev.doc_id
 
         doc_type_label = dt.label(m.get("doc_type", "paper"))
         blocks.append(
@@ -664,12 +679,8 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
     broad_blocks = []
     for j, b in enumerate(broad_bib or [], 1):
         cite_key = b.get("cite_key") or b["doc_id"][:id_prefix_len]
-        valid_cite_marks.add(cite_key)
-        valid_cite_marks.add(b["doc_id"][:id_prefix_len])
-        valid_cite_marks.add(b["doc_id"])
-        cite_to_doc[cite_key] = b["doc_id"]
-        cite_to_doc[b["doc_id"][:id_prefix_len]] = b["doc_id"]
-        cite_to_doc[b["doc_id"]] = b["doc_id"]
+        if cite_to_doc.get(cite_key) != b["doc_id"]:
+            cite_key = b["doc_id"]
 
         doc_type_label = dt.label(b.get("doc_type", "paper"))
         broad_blocks.append(
@@ -713,7 +724,7 @@ def write_section(section: OutlineSection, evidence: list, paper_meta: dict,
 
     # 丢弃不在证据集中的引用标记（幻觉引用）
     def _filter_cite(m):
-        return m.group(0) if m.group(1) in valid_cite_marks else ""
+        return f"[@{cite_to_doc[m.group(1)]}]" if m.group(1) in valid_cite_marks else ""
     text = _CITE_RE.sub(_filter_cite, text)
 
     cited = []
@@ -834,16 +845,12 @@ def write_intro_conclusion(outline: Outline, drafts: list, client, model,
 def assemble_review(outline: Outline, drafts: list, intro: str, conclusion: str,
                     paper_meta: dict, evidence_total: int,
                     id_prefix_len: int = 8) -> ReviewDoc:
-    # 建立全局 cite_key 和 doc_id 前缀到完整 doc_id 的映射
-    cite_to_doc = {}
-    for d in drafts:
-        for doc_id in d.cited_doc_ids:
-            m = paper_meta.get(doc_id, {})
-            cite_key = m.get("cite_key")
-            if cite_key:
-                cite_to_doc[cite_key] = doc_id
-            cite_to_doc[doc_id[:id_prefix_len]] = doc_id
-            cite_to_doc[doc_id] = doc_id
+    cited_ids = {doc_id for draft in drafts for doc_id in draft.cited_doc_ids}
+    citation_meta = dict(paper_meta)
+    for doc_id in cited_ids:
+        citation_meta.setdefault(doc_id, {})
+    cite_to_doc = {alias: doc for alias, doc in _citation_aliases(citation_meta, id_prefix_len).items()
+                   if doc in cited_ids}
 
     numbering = {}   # doc_id → n
     ordered_docs = []

@@ -15,7 +15,8 @@
   - **可视化看板**：提供 `python cli.py history`（查看每日处理成功/失败统计与失败详情）以及 `python cli.py status`（查看当前任务分布）命令行看板，方便进行日常运维与统计。
 - **极致的生产级优化**：
   - **哈希去重**：自动计算 PDF 的 SHA-256 哈希值并记录，避免重复处理已解析文献，节省解析 Token 额度。
-  - **中间产物策略**：实时模式导出后自动清理 MinerU 的临时文件夹省磁盘；批处理模式**故意保留** `mineru_output/`——综述生成器的 `enrich` 要从里面的 `content_list.json` 免费抽取图表和参考文献，删了就只能花钱调大模型重来。
+  - **额度延期**：实时分析遇到 UTC 当日额度不足时，保留输入 PDF，并在数据库记录下一 UTC 日恢复日期；同日后续扫描和服务重启均跳过解析，避免重复调用 MinerU。次日自动恢复。
+  - **中间产物策略**：实时与批处理模式均保留 `mineru_output/`，供综述生成器的 `enrich` 从 `content_list.json` 本地抽取图表和参考文献。实时模式同时将正文与分析结果保存到检索源表，随后自动建立索引。
   - **空解析拦截**：MinerU 返回 success 不代表抽出了字（扫描件、纯图版 PDF 常常只给个空 `full.md`）。正文少于 200 字符的直接判永久失败移入 `failed_pdfs/`，不让大模型对着标题瞎编、把污染数据写进知识库。
   - **日志降噪**：守护进程在没有检测到新文件时保持静默（仅输出一行暗色扫描提示），避免无效日志刷屏。
   - **格式与错误感知**：自动感知 CAJ 等不支持的非 PDF 格式文件并进行警告；能够动态区分临时错误（网络波动、API 超时）与永久错误（页数超限、损坏文件），对临时错误进行自动重试。
@@ -28,7 +29,7 @@
 input_pdfs/
     └── *.pdf
         ↓ MinerUClient (OCR 解析 & 图片提取)
-    mineru_output/ (解析中间产物，处理完成后自动清理)
+    mineru_output/ (保留解析资产，供元数据补全与综述插图使用)
         ├── 论文名_hash/
         │   ├── *.md (结构化 Markdown)
         │   └── images/
@@ -336,6 +337,8 @@ python review.py search "余热回收" --corpus patent          # 只在专利�
 
 服务端已通过 **双传输融合网关（Dual-Transport Fusion）** 常驻监听 `0.0.0.0:8002`（由 systemd `literature-review-mcp.service` 守护），各客户端配置如下：
 
+Web 与 MCP HTTP/SSE 使用同一访问守卫：本机、局域网及 Tailscale 免 token；公网需配置 `REMOTE_AUTH_TOKEN`（兼容 `MCP_AUTH_TOKEN`）并携带 Bearer token。默认不信任客户端提交的转发头。经反向代理访问时，以 `REMOTE_TRUSTED_PROXY_CIDRS` 显式指定代理 IP/CIDR，代理必须传入真实来源。直接用 Uvicorn 启动时加 `--no-proxy-headers`，让应用统一处理来源判断。
+
 #### 1. OpenAI Codex Desktop（推荐：Streamable HTTP 模式）
 Codex Desktop 遵循 MCP 2025 Streamable HTTP 规范，向 `/mcp` 端点发起连接：
 ```toml
@@ -417,6 +420,10 @@ tail -f "$(dirname "$DB_PATH")/mcp_server.log"
 ### 1. Web 服务访问与多场景组网
 
 Web 控制台默认全网卡监听 `0.0.0.0:8001`，并已注册为 Linux 常驻系统服务（`literature-web.service`）：
+
+主导航的「综述生成与恢复」进入 `/static/reviews.html`。Web 与 CLI/MCP 共用逐章检索和写作编排，每完成一章保存检查点；重启后可从任务列表恢复，已完成章节不会重新生成。检查点默认写入 `DB_PATH` 同目录的独立 `web_review_jobs.db`，可用 `WEB_REVIEW_JOBS_DB_PATH` 覆盖。Web 任务注册器按**单进程**运行，不支持多个 Uvicorn workers 共用该任务库。
+
+发现候选完成真实向量化后，CLI/Web/MCP 的检索与综述会联合读取发现库和原馆藏库，不把发现记录合并进生产库。发现库路径统一按 `TEST_CITATION_DB_PATH`、兼容变量 `CITATION_NETWORK_DB_PATH`、仓库 `data/test_citation_network.db` 的顺序选择。嵌入失败保留正文并进入待重试队列；空白/扫描 PDF 无可提取正文时需先补充 OCR，不会用标题或测试向量冒充正文索引。
 
 | 访问场景 | 访问 URL | 连接方式与说明 |
 | :--- | :--- | :--- |

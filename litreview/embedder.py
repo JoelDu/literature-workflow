@@ -17,13 +17,20 @@ class Embedder:
         # Qwen3-Embedding 支持 MRL 自定义维度（dimensions 参数）；bge 系列不支持
         self._supports_dimensions = "Qwen3-Embedding" in model
 
-    @retry(stop=stop_after_attempt(4), wait=wait_exponential(min=2, max=30))
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=3, max=45), reraise=True)
     def _embed_batch(self, texts: list) -> np.ndarray:
         texts = [t[:_MAX_CHARS] for t in texts]
         kwargs = {"model": self.model, "input": texts}
         if self._supports_dimensions:
             kwargs["dimensions"] = self.dim
-        resp = self.client.embeddings.create(**kwargs)
+        try:
+            resp = self.client.embeddings.create(**kwargs)
+        except Exception as e:
+            err_msg = getattr(e, "message", None) or getattr(e, "body", None) or str(e)
+            import logging
+            logging.getLogger("litreview.embedder").warning(f"Embedding batch API 调用异常 ({type(e).__name__}): {err_msg}")
+            raise RuntimeError(f"Embedding API 调用失败 ({type(e).__name__}): {err_msg}") from e
+
         # 按 index 排序，防服务端乱序返回
         data = sorted(resp.data, key=lambda d: d.index)
         mat = np.array([d.embedding for d in data], dtype=np.float32)

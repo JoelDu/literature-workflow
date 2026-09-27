@@ -342,11 +342,11 @@ def _make_reranker():
 
 def cmd_search(args):
     _require_siliconflow()
-    from litreview.store import VectorStore
+    from litreview.retrieval_store import create_retrieval_store
     from openai import OpenAI
     client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
                     base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180)
-    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    store = create_retrieval_store(settings)
     embedder = _make_embedder(client)
     qvec = embedder.embed_query(args.query)
     reranker = None if args.no_rerank else _make_reranker()
@@ -684,10 +684,10 @@ def cmd_reconcile(args):
 
 def cmd_propose(args):
     """预立论探测：从本地文献库提炼 3 套差异鲜明的顶刊级立论方案（Thesis + Research Gap + 主线逻辑）。"""
-    from litreview.store import VectorStore
+    from litreview.retrieval_store import create_retrieval_store
     from litreview.stages import propose_review_angles
     client, _ = _make_client()
-    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    store = create_retrieval_store(settings)
     _require_siliconflow()
     from openai import OpenAI
     embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))
@@ -707,10 +707,10 @@ def cmd_propose(args):
 
 
 def cmd_outline(args):
-    from litreview.store import VectorStore
+    from litreview.retrieval_store import create_retrieval_store
     from litreview.stages import generate_outline
     client, model = _make_client()
-    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    store = create_retrieval_store(settings)
     _require_siliconflow()
     from openai import OpenAI
     embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))
@@ -734,13 +734,13 @@ def cmd_outline(args):
 
 def cmd_generate(args):
     import time
-    from litreview.store import VectorStore
+    from litreview.retrieval_store import create_retrieval_store
     from litreview.stages import (generate_outline, load_outline_file, gather_evidence,
                                   write_intro_conclusion,
                                   assemble_review, render_review_note, export_docx)
 
     client, model = _make_client()
-    store = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+    store = create_retrieval_store(settings)
     _require_siliconflow()
     from openai import OpenAI
     embedder = _make_embedder(OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"), base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180))

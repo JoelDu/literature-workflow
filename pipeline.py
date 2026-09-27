@@ -1,6 +1,8 @@
 import os
 import glob
 import shutil
+import sqlite3
+from contextlib import closing
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -14,6 +16,8 @@ from rich.progress import (
 
 from mineru_client import MinerUClient
 from llm_router import LLMRouter
+from db_schema import ensure_papers_table
+from litreview.quota import QuotaExceededError, defer_realtime_until_next_day, realtime_deferred_until
 from utils import init_dirs, build_note_metadata, generate_obsidian_note, export_to_excel, get_settings, calculate_pdf_hash, extract_original_abstract, load_processed_hashes, save_processed_hash, log_run_event, MIN_MARKDOWN_CHARS
 
 # ── 强前置校验配置 ──────────────────────────────────────────────────────────
@@ -23,6 +27,10 @@ console = Console()
 
 
 def main():
+    deferred_until = realtime_deferred_until(settings)
+    if deferred_until:
+        console.print(f"[dim]实时处理等待额度恢复，将于 {deferred_until} 00:00 UTC 后重试。[/dim]")
+        return 0
     # 自动初始化所有目录，包括统一的 data/ 文件夹
     data_dir = os.path.dirname(settings.EXCEL_OUTPUT_PATH)
     init_dirs(
@@ -144,6 +152,13 @@ def main():
                     progress.advance(main_task)
                     continue
 
+            except QuotaExceededError as e:
+                defer_realtime_until_next_day(settings, e)
+                console.print(f"[yellow]当日额度不足，保留待处理 PDF 并结束本轮扫描: {e}")
+                log_run_event(mode="realtime", event="paper_processed", title=title,
+                              doc_id=doc_id, status="deferred", error=str(e),
+                              extra={"stage": "llm", "type": "quota"})
+                break
             except Exception as e:
                 import requests
                 err_msg = str(e).lower()
@@ -168,9 +183,23 @@ def main():
             note_filename = os.path.basename(note_path)
             obsidian_link_name = os.path.splitext(note_filename)[0]
 
-            # Step 3.5: 清理 MinerU 中间产物
-            shutil.rmtree(output_folder, ignore_errors=True)
-            console.print(f"[dim]已清理 MinerU 中间文件: {output_folder}[/dim]")
+            # 先持久化检索源，再归档；保留 content_list.json/图片供 enrich 使用。
+            os.makedirs(os.path.dirname(os.path.abspath(settings.DB_PATH)), exist_ok=True)
+            with closing(sqlite3.connect(settings.DB_PATH)) as conn, conn:
+                ensure_papers_table(conn)
+                conn.execute("""INSERT INTO papers
+                    (id, title, pdf_path, language, mineru_md, images_dir, status,
+                     batch_provider, result_json, processed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED', 'openai', ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET title=excluded.title,
+                    pdf_path=excluded.pdf_path, language=excluded.language,
+                    mineru_md=excluded.mineru_md, images_dir=excluded.images_dir,
+                    status=excluded.status, batch_provider=excluded.batch_provider,
+                    result_json=excluded.result_json, error_message=NULL,
+                    processed_at=excluded.processed_at""",
+                    (doc_id, title, pdf_path, analysis.language, md_text,
+                     mineru_res["images_dir"], analysis.model_dump_json(),
+                     datetime.now().isoformat()))
 
             # Step 4: 归档原始 PDF 到归档文件夹（必须在记录 Excel 路径之前移动！）
             dest_pdf_path = os.path.join(settings.PROCESSED_PDF_DIR, filename)
@@ -179,6 +208,10 @@ def main():
             except Exception as e:
                 console.print(f"[yellow]归档 PDF 失败 {filename}, 回退记录原路径: {e}")
                 dest_pdf_path = pdf_path
+
+            with closing(sqlite3.connect(settings.DB_PATH)) as conn, conn:
+                conn.execute("UPDATE papers SET pdf_path=?, status='EXPORTED' WHERE id=?",
+                             (dest_pdf_path, doc_id))
 
             # Step 5: 收集 Excel 行（通过深模块自动格式化）
             excel_rows.append(analysis.to_excel_row(

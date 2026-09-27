@@ -1,5 +1,17 @@
 # 磷化工文献解析器 (Literature Analyzer) - 项目交接文档
 
+## 2026-09-27 修复与发布日志
+
+- 完成目的与实现审核的八项修复：实时正文持久化、发现库联合检索、教材嵌入客户端隔离、UTC 配额延期、Web 转发头鉴权、MCP HTTP/SSE 守卫、Web 逐章检查点恢复、真实向量入库状态。
+- 补齐发现文献唯一引用键，拒绝有歧义的缩写；无全文不再用标题代替正文，重新入库保持隔离/删除状态。
+- Web 新增「综述生成与恢复」入口；任务独立保存到 `web_review_jobs.db`，按单 Web 进程运行。
+- 验证：隔离集成回归 214 passed（1 warning）；最终 UTC 延期与恢复状态调整后，受影响套件 21 passed。两个页面脚本语法检查通过。未发起收费生成或修改生产文献数据。
+- 配置：发现库统一 `TEST_CITATION_DB_PATH` / `CITATION_NETWORK_DB_PATH`；可信反向代理使用 `REMOTE_TRUSTED_PROXY_CIDRS`，自定义 Uvicorn 启动须加 `--no-proxy-headers`。
+- 2026-09-27 08:52–08:54（Asia/Shanghai）已发布并重启：系统级 `literature-web.service`、用户级 `literature-review-mcp.service`、Docker `lit_analyzer`。重启前 Web 无生成任务、MCP 无 running/queued 任务。
+- 容器依赖清单与工作区一致，基于原镜像构建代码更新镜像 `lit-analyzer:repair-20260927`，同时更新 `lit-analyzer:1.0` 并重建容器；数据挂载保持一致。旧容器镜像保留为 `lit-analyzer:rollback-20260927`。
+- 发布验证：Web 首页、综述页面/脚本及任务接口均 HTTP 200；MCP initialize HTTP 200；容器 6 个关键文件 SHA-256 与工作区一致，状态 running、RestartCount=0。冷启动没有待提交/待拉取 Batch，已进入正常定时调度。输入目录已有一个不支持的 `.djvu` 文件，仅警告，未移动该文件。
+- 详细记录：[修复记录](docs/project-purpose-fixes-2026-09-26.md)。
+
 ## 1. 项目概述
 
 **Literature Analyzer** 最初是一个全自动的、基于大模型和多模态视觉模型的文献（PDF/CAJ）智能解析与结构化提取流水线，现已扩展为**入库流水线 + 综述生成器（litreview）+ 教材入库 + MCP Server** 的完整系统。它把"一堆 PDF/EPUB"自动变成结构化 Excel 知识库、可双链检索的 Obsidian 笔记，并能在已入库的文献上做检索增强生成，直接产出带引用的中文学术综述。
@@ -522,3 +534,8 @@ claude mcp add --scope user literature-review /path/to/literature-workflow/mcp_s
       - `tests/test_run_baseline.py` (25 项) + `tests/test_run_validation.py` (31 项) + `tests/test_manifest.py` (15 项)；
       - 关联核心模块 (8 套件) 112 项测试通过 (1 warning)；
       - 全仓库全量自动化测试 **334 passed, 1 warning (100% 全绿通过)**。
+
+42. **云端批处理最终一致性防御与 52 篇全量向量补建入库 (2026-08-29)**：
+    * **OpenAI Batch 异步竞态加固 (`batch_pipeline.py`)**：在 `files.create` 上传后增加文件状态就绪轮询（`files.retrieve` 确认 `status == 'processed'` 与安全缓冲），根除云端存储同步延迟引发的 `Cannot find file` 报错；在拉取结果遇 `failed` 状态时解包详细错误并标记论文状态供下一轮错峰自愈；
+    * **嵌入异常解包与鲁棒退避 (`litreview/embedder.py`)**：细化异常拦截，解包并透传具体 API Response Body 错误详情，将重试次数提升至 5 次并延长退避窗口至 45s；
+    * **52 篇挂起文献 100% 向量化入库**：修复后重新执行索引，**52 篇文献（含 5 本大型教材共 4,838 文本块）全部成功完成 4096 维 Qwen3-Embedding 向量化**，全库待索引降为 0（已嵌入总块数达到 44,400 块）。

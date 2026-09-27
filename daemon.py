@@ -105,7 +105,7 @@ def book_intake_job():
         if report["ok"] > 0 and settings.REVIEW_AUTO_INDEX:
             try:
                 from litreview.indexer import build_index
-                build_index(settings, console, client)
+                build_index(settings=settings, console=console)
             except Exception as e:
                 console.print(f"[yellow]⚠️ 综述索引自动更新失败（不影响入库，可手动运行 review.py index）: {e}")
     except Exception as e:

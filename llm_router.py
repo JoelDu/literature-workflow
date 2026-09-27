@@ -9,10 +9,11 @@ import os
 import httpx
 from langdetect import detect, DetectorFactory
 from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from litreview.analysis_prompt import build_adaptive_analysis_prompt
 from litreview.token_budget import truncate_to_input_budget
+from litreview.quota import QuotaExceededError
 
 DetectorFactory.seed = 0
 OPENAI_MODEL = "gpt-5.4-mini"
@@ -78,7 +79,8 @@ class LLMRouter:
     def analyze_paper(self, markdown_text: str, doc_type: str = "paper"):
         return self._call_openai(markdown_text, doc_type=doc_type)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
+           retry=retry_if_not_exception_type(QuotaExceededError), reraise=True)
     def _call_openai(self, text: str, doc_type: str = "paper"):
         import time
         # 实时模式同样消耗额度，必须和 Batch/元数据共用 UTC 账本。

@@ -165,8 +165,8 @@ def _store():
     if _state["store"] is None:
         with _state_lock:
             if _state["store"] is None:
-                from litreview.store import VectorStore
-                _state["store"] = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM)
+                from litreview.retrieval_store import create_retrieval_store
+                _state["store"] = create_retrieval_store(settings)
     return _state["store"]
 
 
@@ -682,7 +682,7 @@ def _check_literature_sufficiency(topic: str, words: int = 0, target_lang: str =
     lang_name = "英文综述" if target_lang.lower() in ("en", "english", "英文") else "中文综述"
     
     store = _store()
-    conn = store._conn()
+    paper_meta = store.get_paper_meta()
     keywords = [k.strip() for k in topic.replace("、", " ").replace(",", " ").replace("与", " ").replace("相关", " ").replace("研究", " ").split() if len(k.strip()) >= 2]
     
     # 1. 语义向量检索相关文献 ID（仅在真实客户端环境下执行，具备离线与降级容错）
@@ -696,29 +696,18 @@ def _check_literature_sufficiency(topic: str, words: int = 0, target_lang: str =
         except Exception as e:
             logger.debug(f"向量初筛离线或跳过: {e}")
     
-    # 2. 关键词与元数据匹配
-    kw_doc_ids = set()
-    if keywords:
-        clauses = []
-        params = []
-        for kw in keywords:
-            clauses.append("(p.title LIKE ? OR d.title_zh LIKE ? OR d.title_en LIKE ? OR d.keywords LIKE ?)")
-            params.extend([f"%{kw}%"] * 4)
-        sql = f"SELECT p.id FROM papers p LEFT JOIN paper_details d ON p.id = d.doc_id WHERE p.status='EXPORTED' AND ({' OR '.join(clauses)})"
-        rows = conn.execute(sql, params).fetchall()
-        kw_doc_ids = {r[0] for r in rows}
-    
+    # Use the same corpus as retrieval, including approved discovery evidence.
+    kw_doc_ids = {
+        doc_id for doc_id, meta in paper_meta.items()
+        if any(kw.casefold() in " ".join(str(meta.get(field) or "") for field in
+               ("title", "title_zh", "title_en", "keywords")).casefold() for kw in keywords)
+    }
     all_matched_ids = vector_doc_ids.union(kw_doc_ids)
-    
-    # 统计分类分布
     breakdown = {}
-    if all_matched_ids:
-        placeholders = ",".join(["?"] * len(all_matched_ids))
-        b_rows = conn.execute(f"SELECT COALESCE(d.doc_type, 'paper'), COUNT(*) FROM papers p LEFT JOIN paper_details d ON p.id=d.doc_id WHERE p.id IN ({placeholders}) GROUP BY COALESCE(d.doc_type, 'paper')", list(all_matched_ids)).fetchall()
-        for dt_code, count in b_rows:
-            breakdown[dt.label(dt_code)] = count
-    conn.close()
-    
+    for doc_id in all_matched_ids:
+        label = dt.label(paper_meta.get(doc_id, {}).get("doc_type", "paper"))
+        breakdown[label] = breakdown.get(label, 0) + 1
+
     matched_cnt = len(all_matched_ids)
     is_sufficient = matched_cnt >= threshold
     gap = max(0, threshold - matched_cnt)
@@ -1426,9 +1415,8 @@ def get_citation_network(
     from litreview.citation_network import query_citation_network
 
     # 优先读取测试数据库或环境变量指定的引文网络库
-    db_path = os.getenv("CITATION_NETWORK_DB_PATH", os.path.join(_log_dir, "test_citation_network.db"))
-    if not os.path.exists(db_path):
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_citation_network.db")
+    from litreview.retrieval_store import discovery_db_path
+    db_path = discovery_db_path()
 
     if not os.path.exists(db_path):
         return f"❌ 引文网络数据库不存在 ({db_path})，请先运行构建脚本。"
@@ -1540,9 +1528,8 @@ def citation_expand(
     if not seeds_list:
         return "❌ 请提供至少 1 篇种子文献 ID 或 DOI。"
 
-    db_path = os.getenv("CITATION_NETWORK_DB_PATH", os.path.join(_log_dir, "test_citation_network.db"))
-    if not os.path.exists(db_path):
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_citation_network.db")
+    from litreview.retrieval_store import discovery_db_path
+    db_path = discovery_db_path()
 
     res = expand_citations(
         seed_ids=seeds_list[:3],  # 严格限制 1~3 篇
@@ -1715,7 +1702,7 @@ def acquire_fulltext(
         "EXTERNAL_DISCOVERY_CACHE_DB_PATH",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "external_discovery_cache.db")
     )
-    staging_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "staging_pdf")
+    staging_dir = os.getenv("STAGING_PDF_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "staging_pdf")
 
     res = _acquire_ft(
         cache_db_path=cache_db,
@@ -1772,11 +1759,9 @@ def ingest_acquired_candidates(
         "EXTERNAL_DISCOVERY_CACHE_DB_PATH",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "external_discovery_cache.db")
     )
-    test_db = os.getenv(
-        "CITATION_NETWORK_DB_PATH",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_citation_network.db")
-    )
-    staging_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "staging_pdf")
+    from litreview.retrieval_store import discovery_db_path
+    test_db = discovery_db_path()
+    staging_dir = os.getenv("STAGING_PDF_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "staging_pdf")
 
     res = _ingest_cands(
         cache_db_path=cache_db,
@@ -1790,19 +1775,22 @@ def ingest_acquired_candidates(
 
     lines = []
     lines.append("# 🏛️ 文献解析、索引入库与引文图谱回填报告")
-    lines.append(f"* **成功入库篇数**: **{res['ingested_count']}** 篇\n")
+    lines.append(f"* **完成语义索引**: **{res.get('indexed_count', 0)}** 篇；待重试 **{res.get('failed_count', 0)}** 篇\n")
 
     for w in res.get("ingested_works", []):
         chk_cnt = w.get("chunks_persisted", w.get("chunks_count", 0))
         emb_cnt = w.get("embeddings_persisted", 0)
         align = w.get("realignment_stats", {})
         lines.append(f"* 📖 《{w['title']}》 ({w.get('year') or '-'})")
-        lines.append(f"  - 新建 Canonical Work ID: `{w['new_work_id']}` | 原 Candidate ID: `{w['candidate_id']}`")
+        lines.append(f"  - Canonical Work ID: `{w.get('new_work_id') or '尚未入库'}` | 原 Candidate ID: `{w['candidate_id']}`")
         lines.append(f"  - DOI: `{w.get('doi') or '-'}` | PDF 页数: {w.get('pdf_pages', 0)} 页 | 正文字符: {w.get('text_length', 0):,}")
         lines.append(f"  - 语义分块数: {chk_cnt} 块 | 向量嵌入数: {emb_cnt} 条 | 提取参考文献: {w.get('reference_mentions_extracted', 0)} 条")
         if align:
             lines.append(f"  - 引文消歧账本: 确认在馆: **{align.get('confirmed_links', 0)}** 篇 | 待复核: **{align.get('candidate_defer', 0)}** 篇 | 馆外未解析: **{align.get('unresolved_external', 0)}** 篇 (闭环核验: `{align.get('is_accounting_closed')}`)")
-        lines.append(f"  - 最终生命周期状态: **`{w.get('lifecycle_status', 'VECTOR_INDEXED')}`**")
+        lines.append(f"  - 最终生命周期状态: **`{w.get('lifecycle_status', 'GRAPH_INDEXED')}`**")
+        if w.get("error"):
+            action = "可重试" if w.get("retryable") else "需人工处理"
+            lines.append(f"  - ⚠️ 未完成（{action}）：{w['error']}")
 
     return "\n".join(lines)
 
@@ -1865,6 +1853,8 @@ class McpServerHost:
         if args.transport in ("sse", "streamable-http", "http"):
             import uvicorn
             from starlette.applications import Starlette
+            from starlette.middleware import Middleware
+            from litreview.guard import RemoteAccessGuardMiddleware
 
             mcp.settings.host = args.host
             mcp.settings.port = args.port
@@ -1889,12 +1879,14 @@ class McpServerHost:
                 debug=mcp.settings.debug,
                 routes=unique_routes,
                 lifespan=http_app.router.lifespan_context,
+                middleware=[Middleware(RemoteAccessGuardMiddleware)],
             )
 
             logger.info(f"🌐 MCP Server 启动双传输融合模式 (Streamable HTTP: http://{args.host}:{args.port}/mcp | SSE: http://{args.host}:{args.port}/sse)")
             print(f"🌐 MCP Server 监听: http://{args.host}:{args.port}/mcp (Streamable HTTP) 与 http://{args.host}:{args.port}/sse (SSE)", file=sys.stderr)
             try:
-                uvicorn.run(dual_app, host=args.host, port=args.port, log_level="info", access_log=False)
+                uvicorn.run(dual_app, host=args.host, port=args.port, log_level="info", access_log=False,
+                            proxy_headers=False)
             except Exception:
                 logger.error(f"MCP server dual-transport 异常退出\n{traceback.format_exc()}")
                 raise

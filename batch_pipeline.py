@@ -355,6 +355,17 @@ def _submit_openai_batch(requests: list, llm_router: LLMRouter, c, conn) -> tupl
             file_id = getattr(file_obj, "id", None)
             if not file_id:
                 raise ValueError(f"无法从 FileObject 提取 file_id: {file_obj}")
+            
+            # 🛡️ 针对 OpenAI 分布式存储最终一致性的就绪等待与轮询校验 (防 Cannot find file 异步竞态)
+            for attempt in range(8):
+                try:
+                    finfo = ds_client.files.retrieve(file_id)
+                    fstatus = getattr(finfo, "status", None)
+                    if fstatus == "processed":
+                        break
+                except Exception:
+                    pass
+                time.sleep(1.5)
                 
             return ds_client.batches.create(
                 input_file_id=file_id,
@@ -733,9 +744,16 @@ def _fetch_openai_results(job_id: str, llm_router: LLMRouter, c, conn) -> tuple[
         log_run_event(mode="batch", event="batch_fetched", status="success", extra={"batch_id": job_id, "provider": "openai", "completed": success_count, "failed": fail_count, "actual_tokens": total_tokens})
         return success_count, fail_count
         
-    # 云端失败：更新整个 Batch 涉及的所有论文为 BATCH_FAILED 状态以闭环
+    # 云端失败：提取错误明细，并更新整批论文状态以便守护进程下一轮自动恢复重试
     elif status_val in ("failed", "cancelled", "expired"):
-        err_msg = f"OpenAI 任务在云端夭折，返回状态: {status_val}"
+        err_details = []
+        if hasattr(status, "errors") and getattr(status.errors, "data", None):
+            for ed in status.errors.data:
+                code_txt = getattr(ed, "code", "")
+                msg_txt = getattr(ed, "message", "")
+                err_details.append(f"[{code_txt}] {msg_txt}")
+        detail_str = "; ".join(err_details) if err_details else ""
+        err_msg = f"OpenAI 任务在云端夭折，返回状态: {status_val}" + (f" (原因: {detail_str})" if detail_str else "")
         console.print(f"[bold red]  {err_msg}")
         _record_batch_unknown_failure(job_id, c, conn)
         return 0, _mark_batch_failed(job_id, err_msg, c, conn)

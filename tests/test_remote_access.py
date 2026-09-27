@@ -100,7 +100,7 @@ def test_remote_access_guard_middleware_integration():
     middleware = [Middleware(RemoteAccessGuardMiddleware, guard=guard)]
     app = Starlette(routes=routes, middleware=middleware)
 
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 1234))
 
     # 1. 模拟本地 Localhost 请求 -> 放行
     resp = client.get("/api/test_data", headers={"X-Forwarded-For": "127.0.0.1"})
@@ -108,16 +108,18 @@ def test_remote_access_guard_middleware_integration():
     assert resp.json()["status"] == "ok"
 
     # 2. 模拟 Tailscale 专网请求 -> 放行
-    resp = client.get("/api/test_data", headers={"X-Forwarded-For": "100.83.137.43", "Tailscale-User-Login": "dudu"})
+    client = TestClient(app, client=("100.83.137.43", 1234))
+    resp = client.get("/api/test_data", headers={"Tailscale-User-Login": "dudu"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
 
     # 3. 模拟公网非法请求 -> 403 拦截
-    resp = client.get("/api/test_data", headers={"X-Forwarded-For": "198.51.100.5"})
+    client = TestClient(app, client=("198.51.100.5", 1234))
+    resp = client.get("/api/test_data")
     assert resp.status_code == 403
     assert "Forbidden" in resp.json()["error"]
 
     # 4. 模拟公网带合法 Token 请求 -> 200 放行
-    resp = client.get("/api/test_data", headers={"X-Forwarded-For": "198.51.100.5", "Authorization": "Bearer my_token_abc"})
+    resp = client.get("/api/test_data", headers={"Authorization": "Bearer my_token_abc"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"

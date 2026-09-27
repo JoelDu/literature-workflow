@@ -19,7 +19,7 @@
 
 **生产级的细节打磨**（这些是踩过坑之后加的）：
 - SHA-256 哈希去重，重复的 PDF 不会重复烧 token
-- MinerU 的中间产物（正文 md、公式/表格切片、`content_list.json`）在**批处理模式下故意保留**，因为综述生成器的 `enrich` 要靠它免费解析元数据、`figures.py` 要靠它自动插图——删了就只能改花钱调大模型。代价是占盘：当前论文侧 843MB、教材侧 2.0GB。只有实时模式（`RUN_MODE=realtime`）用完即删。
+- MinerU 的解析资产（正文 md、公式/表格切片、`content_list.json`）在**实时与批处理模式下均保留**，供 `enrich` 本地提取元数据及 `figures.py` 自动插图。实时模式还会将正文、分析结果及解析资产路径持久化到 `papers`，以 `EXPORTED` 状态接入后续索引与检索。
 - 解析出口按 `MIN_MARKDOWN_CHARS=200` 拦空结果：MinerU 返回 success 不代表抽出了字，扫描件和纯图版 PDF 常常只给个空 `full.md`，放行的话大模型只能靠标题编，编出来的还会写进 Obsidian 和 Excel
 - 网络抖动/API 超时这种临时错误会自动重试，页数超限/文件损坏这种永久错误不会瞎重试
 - MinerU key 支持配置多个，额度用完自动切下一个，不会因为某个 key 失效整条流水线卡死

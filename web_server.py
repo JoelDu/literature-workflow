@@ -94,8 +94,8 @@ def _get_store():
     if _state["store"] is None:
         with _state_lock:
             if _state["store"] is None:
-                from litreview.store import VectorStore
-                _state["store"] = VectorStore(settings.DB_PATH, settings.EMBEDDING_DIM, readonly=True)
+                from litreview.retrieval_store import create_retrieval_store
+                _state["store"] = create_retrieval_store(settings, readonly=True)
     return _state["store"]
 
 def _get_client():
@@ -741,6 +741,62 @@ async def api_search(request: Request) -> JSONResponse:
 
 # ── AI 综述生成与导出 ─────────────────────────────────────────────────────────
 
+_review_jobs_loaded_path = None
+
+
+def _review_job_store():
+    from litreview.review_jobs import ReviewJobStore
+    path = os.getenv("WEB_REVIEW_JOBS_DB_PATH") or str(
+        Path(get_app_settings().DB_PATH).parent / "web_review_jobs.db")
+    return ReviewJobStore(path)
+
+
+def _load_review_jobs():
+    # The Web service runs one process; only a new process recovers abandoned jobs.
+    global _review_jobs_loaded_path
+    store = _review_job_store()
+    with _jobs_lock:
+        if _review_jobs_loaded_path == store.path:
+            return
+        for job in store.load_all():
+            if job["status"] in ("running", "queued"):
+                job["status"] = "interrupted"
+                job["current_stage"] = "INTERRUPTED"
+                store.save(job)
+            _jobs.setdefault(job["job_id"], job)
+        _review_jobs_loaded_path = store.path
+
+
+def _persist_web_review_job(job):
+    _review_job_store().save(job)
+
+
+def _start_review_thread(job):
+    threading.Thread(
+        target=_review_generator_worker,
+        args=(job["job_id"], job["topic"], job.get("focus", ""), job.get("words", 0),
+              job.get("sections", 0), job.get("outline"), job.get("model_override", job.get("model"))),
+        daemon=True,
+    ).start()
+
+
+async def api_review_resume(request: Request) -> JSONResponse:
+    _load_review_jobs()
+    with _jobs_lock:
+        job = _jobs.get(request.path_params["job_id"])
+        if not job:
+            return JSONResponse({"success": False, "error": "任务不存在"}, status_code=404)
+        if job["status"] not in ("interrupted", "failed", "partial"):
+            return JSONResponse({"success": False, "error": "当前任务不能恢复"}, status_code=409)
+        job.update(status="running", error="", current_stage="RESUMING")
+        for field in ("baseline_verdict", "baseline_status", "baseline_summary", "baseline_error"):
+            job[field] = None
+        job.setdefault("log", []).append("从已保存的章节检查点恢复")
+        _persist_web_review_job(job)
+    _start_review_thread(job)
+    return JSONResponse({"success": True, "data": {"job_id": job["job_id"], "status": "running"}})
+
+
 async def api_review_outline(request: Request) -> JSONResponse:
     """生成综述大纲 JSON (供前端展示与编辑)"""
     data = await request.json()
@@ -763,7 +819,10 @@ async def api_review_outline(request: Request) -> JSONResponse:
         from rich.console import Console
         import io
         return generate_outline(topic, store, embedder, client, outline_model,
-                                settings, Console(file=io.StringIO()), focus=focus, n_sections=sections)
+                                settings, Console(file=io.StringIO()), focus=focus, n_sections=sections,
+                                words=int(data.get("words", 0)), target_lang=data.get("target_lang", "zh"),
+                                research_gap=data.get("research_gap", ""), thesis=data.get("thesis", ""),
+                                mainline_logic=data.get("mainline_logic", ""))
                                 
     loop = asyncio.get_event_loop()
     try:
@@ -781,15 +840,18 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                             n_sections: int, outline_json: Optional[str],
                             model_override: Optional[str] = None):
     """执行端到端综述生成的后台 Worker 线程（支持自定义模型名称）"""
-    from litreview.models import Outline
-    from litreview.stages import (generate_outline as _gen, gather_evidence, write_section,
+    from litreview.models import Outline, SectionDraft
+    from litreview.stages import (generate_outline as _gen,
                                   write_intro_conclusion, assemble_review, render_review_note,
                                   export_docx)
-    from litreview.figures import select_section_figures
+    from litreview.review_orchestrator import (ReviewDependencies, ReviewHooks,
+        SectionGenerationConfig, allocate_review_words, generate_review_sections)
+    from litreview.stages import get_scaling_config
+    import copy
     from rich.console import Console
     import io
     
-    settings = get_app_settings()
+    settings = copy.copy(get_app_settings())
     job = _jobs[job_id]
     console = Console(file=io.StringIO(), no_color=True, width=100)
     
@@ -800,6 +862,7 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                 job["current_stage"] = stage
             if progress is not None:
                 job["progress"] = progress
+            _persist_web_review_job(job)
         logger.info(f"[ReviewJob {job_id}] {msg}")
 
     try:
@@ -807,6 +870,8 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
         client = _get_client()
         model = model_override or settings.REVIEW_MODEL
         analysis_model = model_override or settings.ANALYSIS_MODEL
+        settings.REVIEW_MODEL = model
+        settings.ANALYSIS_MODEL = analysis_model
         store = _get_store()
         embedder = _get_embedder()
         reranker = _get_reranker()
@@ -822,51 +887,44 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
         else:
             log("📋 阶段 A：根据文献库内容生成综述结构大纲...", stage="A_OUTLINE", progress=5)
             outline = _gen(topic, store, embedder, client, analysis_model, settings, console,
-                           focus=focus, n_sections=n_sections)
+                           focus=focus, n_sections=n_sections, words=words,
+                           target_lang=job.get("target_lang", "zh"),
+                           research_gap=job.get("research_gap", ""), thesis=job.get("thesis", ""),
+                           mainline_logic=job.get("mainline_logic", ""))
             log(f"✔ 大纲完成：《{outline.title}》（共 {len(outline.sections)} 章节）", stage="A_OUTLINE", progress=15)
             
         with _jobs_lock:
             job["outline"] = outline.model_dump()
 
-        # 字数配比
-        if words:
-            intro_target = max(300, min(900, int(words * 0.12)))
-            concl_target = max(350, min(1100, int(words * 0.15)))
-            per = max(400, (words - intro_target - concl_target) // max(1, len(outline.sections)))
-            section_words = (int(per * 0.85), int(per * 1.15))
-            intro_words = (int(intro_target * 0.8), int(intro_target * 1.2))
-            concl_words = (int(concl_target * 0.8), int(concl_target * 1.2))
-        else:
-            section_words, intro_words, concl_words = (600, 1000), (300, 500), (400, 700)
+            _persist_web_review_job(job)
 
-        # 2. 证据收集与评分 (Stage B)
-        section_evidence = []
-        n_sec = len(outline.sections)
-        for i, sec in enumerate(outline.sections, 1):
-            pct = 15 + int((i / n_sec) * 35)
-            log(f"🔍 阶段 B：检索并筛选高质量证据 [{i}/{n_sec}] {sec.heading}...", stage="B_EVIDENCE", progress=pct)
-            ev = gather_evidence(sec, store, embedder, client, analysis_model, settings,
-                                 console, paper_meta, reranker=reranker)
-            section_evidence.append(ev)
-            log(f"  ✔ 章节 [{i}] 保留 {len(ev)} 条严谨证据 (≥{settings.REVIEW_MIN_SCORE}分)")
+        word_plan = allocate_review_words(words, len(outline.sections))
+        section_words, intro_words, concl_words = (
+            word_plan.section_words, word_plan.intro_words, word_plan.conclusion_words)
+        scaling = get_scaling_config(words, job.get("target_lang", "zh"))
 
-        # 3. 章节起草与插图匹配 (Stage C)
-        drafts = []
-        used_figures = set()
-        for i, (sec, evs) in enumerate(zip(outline.sections, section_evidence), 1):
-            pct = 50 + int((i / n_sec) * 35)
-            if not evs:
-                log(f"⚠️ 阶段 C：章节 [{i}] {sec.heading} 无充分证据，跳过", stage="C_WRITING", progress=pct)
-                continue
-            log(f"✍️ 阶段 C：AI 精细化撰写章节 [{i}/{n_sec}] {sec.heading}...", stage="C_WRITING", progress=pct)
-            draft = write_section(sec, evs, paper_meta, outline.title, client, model,
-                                  words=section_words, focus=focus)
-            if settings.REVIEW_INSERT_FIGURES:
-                n_figs = select_section_figures(store, reranker, sec, draft, settings,
-                                                console, used_figures)
-                if n_figs:
-                    log(f"  🖼️ 自动匹配并插入相关文献图表 {n_figs} 幅")
-            drafts.append(draft)
+        def checkpoint(drafts):
+            with _jobs_lock:
+                job["checkpoint"] = [draft.model_dump() for draft in drafts]
+                job["progress"] = 15 + int(70 * len(drafts) / max(1, len(outline.sections)))
+                job["current_stage"] = "C_WRITING"
+                _persist_web_review_job(job)
+
+        section_result = generate_review_sections(
+            outline,
+            ReviewDependencies(store, embedder, client, reranker, settings, console),
+            SectionGenerationConfig(
+                section_words=section_words, focus=focus,
+                initial_drafts=[SectionDraft(**item) for item in job.get("checkpoint", [])],
+                review_top_k=scaling["rerank_top_k"], evidence_n=scaling["evidence_n"]),
+            ReviewHooks(on_progress=log, on_checkpoint=checkpoint),
+        )
+        drafts = section_result.drafts
+        # A resumed missing chapter belongs in its original outline position.
+        order = {section.heading: i for i, section in enumerate(outline.sections)}
+        drafts.sort(key=lambda draft: order.get(draft.heading, len(order)))
+        incomplete = bool(section_result.failed_sections)
+        job["failed_sections"] = section_result.failed_sections
 
         if not drafts:
             raise RuntimeError("所有章节均无有效证据支持，请检查主题与文献库是否匹配！")
@@ -876,14 +934,17 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
         try:
             intro, conclusion = write_intro_conclusion(outline, drafts, client, model,
                                                        intro_words=intro_words,
-                                                       concl_words=concl_words, focus=focus)
+                                                       concl_words=concl_words, focus=focus,
+                                                       thesis=job.get("thesis", ""),
+                                                       research_gap=job.get("research_gap", ""))
         except Exception as e:
             log(f"⚠️ 引言/结论撰写异常（正文已保留）: {e}")
             intro, conclusion = "", ""
+            incomplete = True
 
         # 5. 装配与渲染导出 (Stage D)
         log("📦 阶段 D：组装规范参考文献、生成 Markdown 与 Word 文档...", stage="D_ASSEMBLING", progress=92)
-        evidence_total = sum(len(e) for e in section_evidence)
+        evidence_total = section_result.evidence_count
         review = assemble_review(outline, drafts, intro, conclusion, paper_meta, evidence_total)
         
         template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review_template.md")
@@ -904,7 +965,7 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                 write_review_manifest, ManifestInput, RunContext, PromptSnapshot, RetrievalSnapshot
             )
             from litreview import prompts
-            evidence_by_heading = {sec.heading: evs for sec, evs in zip(outline.sections, section_evidence)}
+            evidence_by_heading = section_result.evidence_by_heading
             run_ctx = RunContext(
                 topic=topic,
                 run_id=job_id,
@@ -913,11 +974,11 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
                 analysis_model=analysis_model,
                 reranker_model=settings.RERANK_MODEL,
                 target_words=words,
-                target_lang="zh",
+                target_lang=job.get("target_lang", "zh"),
                 focus=focus,
-                thesis="",
-                research_gap="",
-                mainline_logic="",
+                thesis=job.get("thesis", ""),
+                research_gap=job.get("research_gap", ""),
+                mainline_logic=job.get("mainline_logic", ""),
                 prompts=PromptSnapshot(
                     outline_prompt_version=prompts.PROMPT_VERSION,
                     section_prompt_version=prompts.PROMPT_VERSION,
@@ -984,8 +1045,8 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
 
         elapsed = int(time.time() - t0)
         with _jobs_lock:
-            job["status"] = "partial" if manifest_err else "done"
-            job["current_stage"] = "PARTIAL_COMPLETED" if manifest_err else "COMPLETED"
+            job["status"] = "partial" if manifest_err or incomplete else "done"
+            job["current_stage"] = "PARTIAL_COMPLETED" if manifest_err or incomplete else "COMPLETED"
             job["progress"] = 100
             job["output_md"] = out_path
             job["output_docx"] = docx_path
@@ -1002,7 +1063,9 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             job["evidence_count"] = review.evidence_count
             job["elapsed_seconds"] = elapsed
             
-        if manifest_err:
+        if incomplete:
+            log(f"⚠️ 部分正文或引言/结论尚未完成，可从检查点重试：{section_result.failed_sections}")
+        elif manifest_err:
             log(f"⚠️ 综述正文与 Word 已生成，但运行清单生成失败: {manifest_err}")
         elif baseline_verdict == "FAIL":
             log(f"⚠️ 综述生成完成，但基线检查发现质量退化或基线损坏: {baseline_summary}")
@@ -1010,7 +1073,7 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             log(f"⚠️ 综述生成完成，但自动基线检查异常: {baseline_error}")
         else:
             log(f"🎉 综述生成完毕！使用模型 {model}，引用文献 {review.doc_count} 篇，引用证据 {review.evidence_count} 条，总耗时 {elapsed} 秒。")
-        status_tag = "partial" if manifest_err else "success"
+        status_tag = "partial" if manifest_err or incomplete else "success"
         log_run_event(mode="review", event="review_generated", title=review.title, status=status_tag,
                       extra={"topic": topic, "sections": len(review.sections),
                              "cited_docs": review.doc_count, "elapsed_s": elapsed,
@@ -1027,10 +1090,12 @@ def _review_generator_worker(job_id: str, topic: str, focus: str, words: int,
             job["current_stage"] = "FAILED"
             job["error"] = str(e)
             job["log"].append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 任务失败: {e}")
+            _persist_web_review_job(job)
 
 
 async def api_review_generate(request: Request) -> JSONResponse:
     """启动综述生成任务"""
+    _load_review_jobs()
     data = await request.json()
     topic = data.get("topic", "").strip()
     focus = data.get("focus", "").strip()
@@ -1049,7 +1114,15 @@ async def api_review_generate(request: Request) -> JSONResponse:
             "topic": topic,
             "focus": focus,
             "words": words,
+            "sections": sections,
+            "outline": outline_json,
+            "checkpoint": [],
+            "target_lang": data.get("target_lang", "zh"),
+            "thesis": data.get("thesis", ""),
+            "research_gap": data.get("research_gap", ""),
+            "mainline_logic": data.get("mainline_logic", ""),
             "model": model_override or get_app_settings().REVIEW_MODEL,
+            "model_override": model_override,
             "status": "running",
             "current_stage": "PENDING",
             "progress": 0,
@@ -1069,13 +1142,9 @@ async def api_review_generate(request: Request) -> JSONResponse:
             "error": ""
         }
         
-    t = threading.Thread(
-        target=_review_generator_worker,
-        args=(job_id, topic, focus, words, sections, outline_json, model_override),
-        daemon=True
-    )
-    t.start()
-    
+    _persist_web_review_job(_jobs[job_id])
+    _start_review_thread(_jobs[job_id])
+
     return JSONResponse({
         "success": True,
         "data": {
@@ -1090,6 +1159,7 @@ async def api_review_generate(request: Request) -> JSONResponse:
 
 async def api_review_jobs(request: Request) -> JSONResponse:
     """获取所有综述任务列表"""
+    _load_review_jobs()
     with _jobs_lock:
         job_list = list(_jobs.values())
     job_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -1098,6 +1168,7 @@ async def api_review_jobs(request: Request) -> JSONResponse:
 
 async def api_review_job_detail(request: Request) -> JSONResponse:
     """获取单个综述任务详情"""
+    _load_review_jobs()
     job_id = request.path_params["job_id"]
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -1108,6 +1179,7 @@ async def api_review_job_detail(request: Request) -> JSONResponse:
 
 async def api_review_job_stream(request: Request) -> StreamingResponse:
     """SSE 流式传输综述生成日志与进度"""
+    _load_review_jobs()
     job_id = request.path_params["job_id"]
     
     async def event_generator():
@@ -1144,7 +1216,7 @@ async def api_review_job_stream(request: Request) -> StreamingResponse:
             
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             
-            if job.get("status") in ("done", "failed"):
+            if job.get("status") in ("done", "failed", "partial", "interrupted"):
                 break
                 
             await asyncio.sleep(1.0)
@@ -1368,10 +1440,8 @@ def _get_cache_db_path():
     )
 
 def _get_test_citation_db_path():
-    return os.getenv(
-        "TEST_CITATION_DB_PATH",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_citation_network.db")
-    )
+    from litreview.retrieval_store import discovery_db_path
+    return discovery_db_path()
 
 def _get_staging_pdf_dir():
     return os.getenv(
@@ -1505,13 +1575,19 @@ def _run_ingest_worker(job_id: str, candidate_ids: List[str]):
             candidate_ids=candidate_ids,
             max_ingest=len(candidate_ids)
         )
+        if res.get("error"):
+            raise RuntimeError(res["error"])
+        indexed = res.get("indexed_count", 0)
+        failed = res.get("failed_count", 0)
+        status = "partial" if failed and indexed else "failed" if failed else "completed"
         _update_bg_job(
             job_id,
-            status="completed",
+            status=status,
             progress=100,
-            message=f"入库与图谱回填完成：成功入库 {res.get('ingested_count', 0)} 篇，跳过 {res.get('skipped_count', 0)} 篇",
-            log_entry=f"入库成功: 篇数={res.get('ingested_count', 0)}",
-            result=res
+            message=f"语义索引完成 {indexed} 篇；未完成、可重试 {failed} 篇",
+            log_entry=f"解析/图谱入库 {res.get('ingested_count', 0)} 篇，真实向量索引 {indexed} 篇，待重试 {failed} 篇",
+            result=res,
+            error="部分文献语义索引未完成，请重试" if failed else None,
         )
     except Exception as e:
         logger.error(f"Ingest job {job_id} error: {e}", exc_info=True)
@@ -1860,10 +1936,10 @@ async def api_pipeline_overview(request: Request) -> JSONResponse:
         conn = sqlite3.connect(cache_db)
         conn.row_factory = sqlite3.Row
         try:
-            # 1. 待入库 (APPROVED / FULLTEXT_ACQUIRED)
+            # 已解析但尚无真实向量的文献仍须可见、可重试。
             pending_rows = conn.execute("""
                 SELECT * FROM discovered_candidates
-                WHERE lifecycle_status IN ('APPROVED', 'FULLTEXT_ACQUIRED')
+                WHERE lifecycle_status IN ('APPROVED', 'FULLTEXT_ACQUIRED', 'PARSED', 'GRAPH_INDEXED', 'VECTOR_INDEXED_TEST', 'INDEXED')
                 ORDER BY discovered_at DESC
             """).fetchall()
             pending = [dict(r) for r in pending_rows]
@@ -1876,10 +1952,10 @@ async def api_pipeline_overview(request: Request) -> JSONResponse:
             """).fetchall()
             failed = [dict(r) for r in failed_rows]
             
-            # 3. 成功入库 (VECTOR_INDEXED / PARSED / GRAPH_INDEXED / INDEXED)
+            # 只有真实语义索引完成才属于成功。
             success_rows = conn.execute("""
                 SELECT * FROM discovered_candidates
-                WHERE lifecycle_status IN ('VECTOR_INDEXED', 'VECTOR_INDEXED_TEST', 'INDEXED', 'PARSED', 'GRAPH_INDEXED')
+                WHERE lifecycle_status = 'VECTOR_INDEXED'
                 ORDER BY discovered_at DESC
             """).fetchall()
             success = [dict(r) for r in success_rows]
@@ -1999,6 +2075,7 @@ routes = [
     Route("/api/review/generate", endpoint=api_review_generate, methods=["POST"]),
     Route("/api/review/jobs", endpoint=api_review_jobs, methods=["GET"]),
     Route("/api/review/jobs/{job_id}", endpoint=api_review_job_detail, methods=["GET"]),
+    Route("/api/review/jobs/{job_id}/resume", endpoint=api_review_resume, methods=["POST"]),
     Route("/api/review/jobs/{job_id}/stream", endpoint=api_review_job_stream, methods=["GET"]),
     Route("/api/review/files", endpoint=api_review_files, methods=["GET"]),
     Route("/api/review/preview", endpoint=api_review_preview, methods=["GET"]),
@@ -2050,7 +2127,7 @@ def run():
         print(f" ⚠️ 端口 {req_port} 已被占用，已自动切换至空闲端口 {port}")
     print(f" 💡 按 Ctrl+C 可停止服务")
     print(f"=======================================================\n")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info", proxy_headers=False)
 
 
 if __name__ == "__main__":

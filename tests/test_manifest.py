@@ -20,6 +20,17 @@ from litreview.review_quality import audit_and_clean_review, EvidenceContext
 from litreview.store import VectorStore
 
 
+@pytest.fixture(autouse=True)
+def isolated_worker_persistence(monkeypatch, tmp_path):
+    monkeypatch.setenv("WEB_REVIEW_JOBS_DB_PATH", str(tmp_path / "web_jobs.db"))
+    monkeypatch.setattr("utils.log_run_event", lambda *a, **kw: None)
+    import web_server
+    monkeypatch.setattr(web_server, "log_run_event", lambda *a, **kw: None)
+    # The worker now also uses the shared second retrieval track and figure hook.
+    monkeypatch.setattr("litreview.stages.gather_broad_bibliography", lambda *a, **kw: [])
+    monkeypatch.setattr("litreview.figures.select_section_figures", lambda *a, **kw: 0)
+
+
 def test_corpus_fingerprint_deterministic_and_missing_fallback(tmp_path):
     """验证 VectorStore.get_corpus_fingerprint 的确定性与表缺失安全降级。"""
     db_path = str(tmp_path / "test_corpus.db")

@@ -42,11 +42,15 @@ class RemoteAccessGuard:
         self,
         auth_token: Optional[str] = None,
         allow_public_wan: bool = False,
-        trusted_cidrs: Optional[List[str]] = None
+        trusted_cidrs: Optional[List[str]] = None,
+        trusted_proxy_cidrs: Optional[List[str]] = None,
     ):
         self._auth_token = auth_token or os.getenv("REMOTE_AUTH_TOKEN") or os.getenv("MCP_AUTH_TOKEN")
         self._allow_public_wan = allow_public_wan or (os.getenv("ALLOW_PUBLIC_WAN", "0").lower() in ("1", "true"))
         self._custom_subnets = []
+        proxy_cidrs = trusted_proxy_cidrs if trusted_proxy_cidrs is not None else (
+            os.getenv("REMOTE_TRUSTED_PROXY_CIDRS", "").split(","))
+        self._proxy_subnets = [ipaddress.ip_network(c.strip()) for c in proxy_cidrs if c.strip()]
         if trusted_cidrs:
             for c in trusted_cidrs:
                 try:
@@ -57,7 +61,7 @@ class RemoteAccessGuard:
     def classify_ip(self, ip_str: str) -> str:
         """对客户端 IP 地址进行网络区域分类。"""
         if not ip_str:
-            return NetworkClassification.LOCALHOST
+            return NetworkClassification.WAN
         
         clean_ip = ip_str.strip()
         if clean_ip.startswith("[") and "]" in clean_ip:
@@ -98,6 +102,34 @@ class RemoteAccessGuard:
                 return NetworkClassification.LAN
 
         return NetworkClassification.WAN
+
+    def _is_proxy(self, address: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        return any(ip.version == net.version and ip in net for net in self._proxy_subnets)
+
+    def client_ip(self, peer: str, headers: Dict[str, str]) -> str:
+        """Only configured proxies may supply a forwarding chain.
+
+        Walk from the socket towards the client, stopping at the first untrusted
+        hop; a forged prefix can never override that hop. A configured proxy
+        without valid forwarding data fails closed instead of inheriting LAN trust.
+        """
+        if not self._is_proxy(peer):
+            return peer
+        forwarded = headers.get("x-forwarded-for") or headers.get("x-real-ip", "")
+        hops = [hop.strip() for hop in forwarded.split(",")]
+        try:
+            for hop in hops:
+                ipaddress.ip_address(hop)
+        except ValueError:
+            return "unknown-proxy-client"
+        for hop in reversed(hops):
+            if not self._is_proxy(hop):
+                return hop
+        return "unknown-proxy-client"
 
     def is_trusted_network(self, ip_str: str) -> bool:
         """判断是否属于免鉴权的受信任网络区域 (Local / Tailscale / Private LAN)。"""
@@ -147,14 +179,8 @@ class RemoteAccessGuardMiddleware(BaseHTTPMiddleware):
         if request.url.path in ("/favicon.ico", "/api/health", "/api/ping"):
             return await call_next(request)
 
-        # 提取真实客户端 IP（兼容反向代理头）
-        client_ip = (
-            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            or request.headers.get("x-real-ip", "").strip()
-            or (request.client.host if request.client else "127.0.0.1")
-        )
-
         headers_dict = {k.lower(): v for k, v in request.headers.items()}
+        client_ip = self.guard.client_ip(request.client.host if request.client else "", headers_dict)
         allowed, reason = self.guard.verify_request_access(client_ip, headers_dict)
 
         if not allowed:

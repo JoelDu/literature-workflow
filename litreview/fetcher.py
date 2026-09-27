@@ -296,8 +296,11 @@ def resolve_work_by_title_and_author(
                             elif family or given:
                                 authors_list.append(family or given)
                         
+                        import html
                         container_titles = it.get("container-title", [])
-                        journal = container_titles[0] if container_titles else ""
+                        raw_journal = container_titles[0] if container_titles else ""
+                        journal = html.unescape(raw_journal)
+                        cand_title = html.unescape(cand_title)
                         
                         bib_meta = parse_crossref_biblio(it)
 

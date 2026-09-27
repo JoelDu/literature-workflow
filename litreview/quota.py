@@ -6,14 +6,53 @@ Batch 由 batch_pipeline 单独登记；这里覆盖综述、元数据和教材�
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from db_schema import ensure_llm_quota_tables
 from .token_budget import estimate_tokens, usage_totals
 
 MINI_MODEL = "gpt-5.4-mini"
 REVIEW_MODEL = "gpt-5.4"
+
+
+class QuotaExceededError(RuntimeError):
+    """UTC 当日额度不足；保留输入，等待之后的扫描重试。"""
+
+    def __init__(self, message: str, utc_date: str | None = None):
+        super().__init__(message)
+        self.utc_date = utc_date
+
+
+def defer_realtime_until_next_day(settings, error: QuotaExceededError) -> str:
+    """持久化实时扫描暂停日界线，避免守护进程重复调用 MinerU。"""
+    today = error.utc_date or _now()[0]
+    retry_date = (datetime.fromisoformat(today) + timedelta(days=1)).date().isoformat()
+    conn = sqlite3.connect(settings.DB_PATH)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS realtime_quota_deferral (
+            scope TEXT PRIMARY KEY, retry_on_utc_date TEXT NOT NULL)""")
+        conn.execute("INSERT OR REPLACE INTO realtime_quota_deferral VALUES ('realtime', ?)",
+                     (retry_date,))
+        conn.commit()
+    finally:
+        conn.close()
+    return retry_date
+
+
+def realtime_deferred_until(settings) -> str | None:
+    """返回尚未到期的 UTC 恢复日期；每次从磁盘读取，跨进程重启有效。"""
+    if not os.path.isfile(settings.DB_PATH):
+        return None
+    conn = sqlite3.connect(settings.DB_PATH)
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='realtime_quota_deferral'").fetchone():
+            return None
+        row = conn.execute("SELECT retry_on_utc_date FROM realtime_quota_deferral WHERE scope='realtime'").fetchone()
+        return row[0] if row and _now()[0] < row[0] else None
+    finally:
+        conn.close()
 
 
 def _now() -> tuple[str, str]:
@@ -42,7 +81,7 @@ def reserve(settings, model: str, prompt: str, max_output_tokens: int) -> tuple[
         row = conn.execute("SELECT reserved_tokens, actual_total_tokens FROM llm_usage_model_daily WHERE utc_date=? AND model=?",
                            (utc_date, model)).fetchone()
         if row[0] + row[1] + estimate > _cap(settings, model):
-            raise RuntimeError(f"{model} UTC 当日额度不足：已使用/预留 {row[0] + row[1]}，本次预留 {estimate}，上限 {_cap(settings, model)}")
+            raise QuotaExceededError(f"{model} UTC 当日额度不足：已使用/预留 {row[0] + row[1]}，本次预留 {estimate}，上限 {_cap(settings, model)}", utc_date=utc_date)
         conn.execute("UPDATE llm_usage_model_daily SET reserved_tokens=reserved_tokens+?, updated_at=? WHERE utc_date=? AND model=?",
                      (estimate, now, utc_date, model))
         conn.commit()
@@ -87,4 +126,3 @@ def record_llm_call(settings, call_type: str, model: str, prompt: str,
         pass
     finally:
         conn.close()
-
