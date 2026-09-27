@@ -26,6 +26,41 @@ settings = get_settings()
 console = Console()
 
 
+def _is_transient_db_error(e: Exception) -> bool:
+    """SQLite 锁冲突（含额度账本 reserve() 撞锁）是并发瞬时态，绝不能据此把 PDF 判死。"""
+    if isinstance(e, sqlite3.OperationalError):
+        msg = str(e).lower()
+        return "locked" in msg or "busy" in msg
+    return False
+
+
+def _convert_caj_inputs() -> None:
+    """CAJ 预转换（与 batch_pipeline 一致）：转成功的 PDF 会被随后的 glob("*.pdf") 捡起。"""
+    caj_files = glob.glob(os.path.join(settings.INPUT_PDF_DIR, "*.caj"))
+    if not caj_files:
+        return
+    console.print(f"[cyan]🔄 检测到 {len(caj_files)} 个 CAJ 文件，开始转换为 PDF...")
+    try:
+        from caj_converter import convert_caj_files
+        convert_caj_files(settings.INPUT_PDF_DIR,
+                          os.path.join(os.path.dirname(settings.DB_PATH), "caj_originals"))
+    except Exception as e:
+        console.print(f"[red]CAJ 转换模块运行异常，本轮跳过: {e}")
+
+
+def _copy_word_export(mineru_res: dict, title: str) -> None:
+    """把 MinerU 生成的 docx 复制到 Word 导出目录（与 batch_pipeline 同一位置）。失败只告警。"""
+    docx_path = mineru_res.get("docx_path")
+    if not docx_path or not os.path.exists(docx_path):
+        return
+    try:
+        docx_dir = os.path.join(os.path.dirname(settings.INPUT_PDF_DIR), "word_exports")
+        os.makedirs(docx_dir, exist_ok=True)
+        shutil.copy(docx_path, os.path.join(docx_dir, f"{title}.docx"))
+    except Exception as e:
+        console.print(f"[yellow]⚠️ 复制 Word 导出失败（不影响入库）{title}: {e}")
+
+
 def main():
     deferred_until = realtime_deferred_until(settings)
     if deferred_until:
@@ -41,6 +76,8 @@ def main():
         settings.FAILED_PDF_DIR,
         data_dir
     )
+
+    _convert_caj_inputs()
 
     pdf_files = glob.glob(os.path.join(settings.INPUT_PDF_DIR, "*.pdf"))
     
@@ -110,6 +147,8 @@ def main():
                     progress.advance(main_task)
                     continue
 
+                _copy_word_export(mineru_res, title)
+
                 images = []
                 if mineru_res["images_dir"] and os.path.exists(mineru_res["images_dir"]):
                     for ext in ["*.png", "*.jpg", "*.jpeg"]:
@@ -163,8 +202,10 @@ def main():
                 import requests
                 err_msg = str(e).lower()
                 is_transient = (
-                    any(kw in err_msg for kw in ["timeout", "network", "rate limit", "connection", "try again", "busy"])
+                    any(kw in err_msg for kw in ["timeout", "network", "rate limit", "connection", "try again", "busy",
+                                                 "database is locked"])
                     or isinstance(e, (TimeoutError, ConnectionError, requests.RequestException))
+                    or _is_transient_db_error(e)
                 )
                 if is_transient:
                     console.print(f"[yellow]⚠️ LLM 调用临时失败 (待重试) {filename}: {e}")

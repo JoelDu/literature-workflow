@@ -18,6 +18,33 @@ settings = get_settings()
 console = Console()
 
 
+HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+def heartbeat_path() -> str:
+    """心跳文件路径：默认 <DB_PATH 所在目录>/heartbeat（容器内 /app/data/heartbeat，
+    宿主机 ${DATA_ROOT}/heartbeat）；可用环境变量 DAEMON_HEARTBEAT_PATH 覆盖。"""
+    override = os.getenv("DAEMON_HEARTBEAT_PATH")
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.abspath(settings.DB_PATH)), "heartbeat")
+
+
+def write_heartbeat(path: str | None = None) -> str:
+    """原子写入当前时间（ISO 与 epoch 秒），供 docker healthcheck 按 mtime/内容判活。
+    写失败只告警，绝不影响调度主循环。"""
+    path = path or heartbeat_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {int(time.time())} pid={os.getpid()}\n")
+        os.replace(tmp, path)
+    except Exception as e:
+        console.print(f"[yellow]心跳文件写入失败 {path}: {e}")
+    return path
+
+
 def send_notification(title, message):
     """发送轻量级消息推送 (如 Server酱, Bark, 飞书, 钉钉等)。
     使用 requests.get(..., params=...) 对 URL 参数进行自动安全编码，规避字符串拼接漏洞。
@@ -142,6 +169,8 @@ def main():
     # 建立持久化数据目录，包括统一的 data/ 文件夹
     data_dir = os.path.dirname(settings.EXCEL_OUTPUT_PATH)
     init_dirs(data_dir)
+    # 冷启动任务可能很久，先写一次心跳，避免容器刚起就被判不健康
+    write_heartbeat()
     
     if settings.RUN_MODE.lower() == "batch":
         console.print(
@@ -167,9 +196,16 @@ def main():
                   f"每晚最多处理 {settings.BOOK_DAILY_PAGE_BUDGET} 页 PDF")
     schedule.every().day.at(settings.BOOK_INTAKE_TIME).do(book_intake_job)
 
-    # 主循环
+    # 主循环：每轮调度后按 HEARTBEAT_INTERVAL_SECONDS 节流写心跳。
+    # 注意 run_pending() 同步执行任务，长任务期间心跳会停更，healthcheck 阈值须覆盖最长任务耗时。
+    hb_path = write_heartbeat()
+    console.print(f"心跳文件: {hb_path}（每 {HEARTBEAT_INTERVAL_SECONDS}s 更新）")
+    last_beat = time.monotonic()
     while True:
         schedule.run_pending()
+        if time.monotonic() - last_beat >= HEARTBEAT_INTERVAL_SECONDS:
+            write_heartbeat(hb_path)
+            last_beat = time.monotonic()
         time.sleep(1)
 
 
