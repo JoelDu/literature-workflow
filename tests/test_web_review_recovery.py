@@ -119,3 +119,44 @@ def test_worker_resumes_shared_orchestrator_preserves_usage_and_partial(web, mon
     assert restored['evidence_count'] == 6
     assert [draft['heading'] for draft in restored['checkpoint']] == ['first', 'second', 'third']
     assert ReviewJobStore(str(tmp_path / 'jobs.db')).load_all()[0]['status'] == 'done'
+
+
+def test_mcp_jobs_listed_read_only_and_not_resumable_from_web(monkeypatch, tmp_path):
+    """MCP 的任务在 Web 列表可见（带 source=mcp），但续跑必须回 MCP，不能被 Web 抢走。"""
+    import sqlite3
+    from starlette.requests import Request
+    import web_server
+    out_dir = tmp_path / 'reviews'
+    out_dir.mkdir()
+    (out_dir / 'mcp_review.md').write_text('# r', encoding='utf-8')
+    prod_db = tmp_path / 'batch_tracking.db'
+    conn = sqlite3.connect(prod_db)
+    conn.execute('CREATE TABLE review_jobs (job_id TEXT PRIMARY KEY, topic TEXT, status TEXT, '
+                 'progress_log TEXT, output_path TEXT, docx_path TEXT, manifest_path TEXT, '
+                 'error TEXT, queued_at TEXT, resume_after TEXT)')
+    conn.execute("INSERT INTO review_jobs VALUES ('m1', 'MCP主题', 'completed', '[\"ok\"]', ?, "
+                 "'/elsewhere/x.docx', '', '', '2026-09-27 10:00:00', '')",
+                 (str(out_dir / 'mcp_review.md'),))
+    conn.execute("INSERT INTO review_jobs VALUES ('m2', 'MCP暂停', 'paused_quota', '[]', '', '', '', "
+                 "'', '2026-09-27 11:00:00', '2026-09-28T00:00:00+00:00')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv('WEB_REVIEW_JOBS_DB_PATH', str(tmp_path / 'web_jobs.db'))
+    monkeypatch.setattr(web_server, '_jobs', {})
+    monkeypatch.setattr(web_server, '_review_jobs_loaded_path', None, raising=False)
+    monkeypatch.setattr(web_server, 'get_app_settings', lambda: SimpleNamespace(
+        DB_PATH=str(prod_db), REVIEW_MODEL='review', REVIEW_OUTPUT_DIR=str(out_dir)))
+
+    jobs = json.loads(asyncio.run(web_server.api_review_jobs(None)).body)['data']
+    by_id = {job['job_id']: job for job in jobs}
+    assert [job['job_id'] for job in jobs] == ['m2', 'm1']
+    assert by_id['m1']['source'] == 'mcp' and by_id['m1']['status'] == 'done'
+    assert by_id['m1']['filename_md'] == 'mcp_review.md'
+    assert by_id['m1']['filename_docx'] == ''  # 不在综述目录内的路径不给下载名
+    assert by_id['m2']['resume_after'] == '2026-09-28T00:00:00+00:00'
+
+    scope = {'type': 'http', 'method': 'POST', 'path': '/api/review/jobs/m2/resume',
+             'headers': [], 'path_params': {'job_id': 'm2'}}
+    resp = asyncio.run(web_server.api_review_resume(Request(scope)))
+    assert resp.status_code == 409
+    assert 'MCP' in json.loads(resp.body)['error']

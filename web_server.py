@@ -834,10 +834,56 @@ def _start_review_thread(job):
     ).start()
 
 
+def _mcp_review_jobs(limit: int = 50) -> List[Dict[str, Any]]:
+    """只读列出 MCP 服务创建的综述任务（存于 DB_PATH 的 review_jobs 表）。
+
+    两个服务各自持有队列与中断恢复逻辑，任务归属不能混：这里只展示，
+    续跑仍须回到 MCP 的 resume_review（或其额度重置后的自动续跑）。
+    """
+    db_path = get_app_settings().DB_PATH
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT job_id, topic, status, progress_log, output_path, docx_path, manifest_path, "
+            "error, queued_at, resume_after FROM review_jobs ORDER BY queued_at DESC LIMIT ?",
+            (limit,)).fetchall()
+    except sqlite3.Error:  # 表不存在或旧库缺列：MCP 从未在这台机器上跑过综述
+        return []
+    finally:
+        conn.close()
+    out_dir = get_app_settings().REVIEW_OUTPUT_DIR
+    jobs = []
+    for job_id, topic, status, log_json, md, docx, manifest, error, queued_at, resume_after in rows:
+        try:
+            log = json.loads(log_json or "[]")
+        except ValueError:
+            log = []
+        job = {"job_id": job_id, "topic": topic, "source": "mcp",
+               "status": "done" if status == "completed" else status,
+               "progress": 100 if status == "completed" else 0,
+               "log": log[-12:], "error": error or "", "created_at": queued_at or "",
+               "resume_after": resume_after or ""}
+        for kind, path in (("md", md), ("docx", docx), ("manifest", manifest)):
+            name = os.path.basename(path or "")
+            resolved = resolve_within(out_dir, name) if name else None
+            job[f"filename_{kind}"] = name if resolved and os.path.isfile(resolved) else ""
+        jobs.append(job)
+    return jobs
+
+
 async def api_review_resume(request: Request) -> JSONResponse:
     _load_review_jobs()
     job_id = request.path_params["job_id"]
     started, error = _resume_review_job(job_id)
+    if not started and error == "任务不存在" and any(
+            j["job_id"] == job_id for j in _mcp_review_jobs(limit=500)):
+        error = "该任务由 MCP 服务创建，请在 MCP 客户端用 resume_review 续跑"
+        return JSONResponse({"success": False, "error": error}, status_code=409)
     if not started:
         return JSONResponse({"success": False, "error": error},
                             status_code=404 if error == "任务不存在" else 409)
@@ -1240,7 +1286,9 @@ async def api_review_jobs(request: Request) -> JSONResponse:
     """获取所有综述任务列表"""
     _load_review_jobs()
     with _jobs_lock:
-        job_list = list(_jobs.values())
+        job_list = [dict(job, source="web") for job in _jobs.values()]
+    known = {job["job_id"] for job in job_list}
+    job_list += [job for job in _mcp_review_jobs() if job["job_id"] not in known]
     job_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return JSONResponse({"success": True, "data": job_list})
 

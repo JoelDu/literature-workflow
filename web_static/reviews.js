@@ -17,7 +17,8 @@ async function refresh() {
     for (const job of jobs) {
       const card = document.createElement('article');
       const title = document.createElement('h3');
-      title.textContent = `${job.topic} — ${labels[job.status] || job.status} (${job.progress || 0}%)`;
+      const source = job.source === 'mcp' ? ' [MCP]' : '';
+      title.textContent = `${job.topic}${source} — ${labels[job.status] || job.status} (${job.progress || 0}%)`;
       card.append(title);
       if (job.status === 'paused_quota') {
         const note = document.createElement('p');
@@ -25,7 +26,8 @@ async function refresh() {
         note.textContent = `当日 token 额度已用尽，已完成章节已存检查点；将于 ${when} 自动续跑。`;
         card.append(note);
       }
-      if (['partial', 'failed', 'interrupted', 'paused_quota'].includes(job.status)) {
+      // MCP 创建的任务只读展示：续跑归 MCP 进程（resume_review / 额度重置后自动续跑）
+      if (job.source !== 'mcp' && ['partial', 'failed', 'interrupted', 'paused_quota'].includes(job.status)) {
         const button = document.createElement('button');
         button.textContent = '从检查点继续';
         button.onclick = async () => {
