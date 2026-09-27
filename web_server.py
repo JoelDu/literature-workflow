@@ -52,7 +52,7 @@ from litreview.citation_network import (
     get_full_citation_graph,
     get_seed_subgraph
 )
-from litreview.guard import RemoteAccessGuardMiddleware
+from litreview.guard import RemoteAccessGuardMiddleware, cors_origins
 from litreview.safe_paths import safe_basename, resolve_within, is_valid_candidate_id
 
 # ── 日志配置 ──
@@ -519,7 +519,12 @@ async def api_upload(request: Request) -> JSONResponse:
 # ── 后台任务与流水线调度 ─────────────────────────────────────────────────────
 
 def _run_intake_worker(task_id: str, mode: str):
-    """后台执行文献入库流水线"""
+    """后台执行文献入库流水线。
+
+    全程持有 litreview.intake_lock 跨进程锁，避免与 daemon 或另一 Web 任务同时扫描
+    同一输入目录、重复处理同一 PDF；锁被占用时任务状态置为 busy 并直接返回。
+    """
+    from litreview.intake_lock import intake_lock, IntakeBusyError
     settings = get_app_settings()
     task = _active_pipelines[task_id]
     
@@ -528,49 +533,54 @@ def _run_intake_worker(task_id: str, mode: str):
         logger.info(f"[{task_id}] {msg}")
         
     try:
-        log(f"🚀 启动文献入库流水线 (模式: {mode})...")
-        if mode == "realtime":
-            import pipeline
-            processed = pipeline.main()
-            log(f"✔ 实时扫描完成，成功处理 {processed} 篇文献。")
-        elif mode == "batch_prepare":
-            import batch_pipeline
-            report = batch_pipeline.prepare_batch()
-            log(f"✔ Batch 任务提交完成：扫描 {report.get('scanned', 0)} 篇，提交云端 {report.get('submitted', 0)} 篇。")
-        elif mode == "batch_fetch":
-            import batch_pipeline
-            report = batch_pipeline.fetch_and_export_batches()
-            log(f"✔ Batch 结果拉取完成：检查 {report.get('checked', 0)} 个批次，成功导出 {report.get('exported', 0)} 篇。")
-        elif mode == "books":
-            from litreview.bookintake import run_scheduled_intake
-            from llm_router import make_openai_client
-            client = None
-            if settings.REVIEW_ENRICH_LLM:
-                client, _ = make_openai_client(quiet=True)
-            from rich.console import Console
-            import io
-            c = Console(file=io.StringIO())
-            rep = run_scheduled_intake(settings, c, client=client, use_llm=settings.REVIEW_ENRICH_LLM)
-            log(f"✔ 教材入库完成：扫描 {rep.get('scanned',0)} 本，成功 {rep.get('ok',0)} 本，跳过 {rep.get('skipped',0)} 本。")
-        else:
-            log(f"未知流水线模式: {mode}")
+        with intake_lock(settings.DB_PATH):
+            log(f"🚀 启动文献入库流水线 (模式: {mode})...")
+            if mode == "realtime":
+                import pipeline
+                processed = pipeline.main()
+                log(f"✔ 实时扫描完成，成功处理 {processed} 篇文献。")
+            elif mode == "batch_prepare":
+                import batch_pipeline
+                report = batch_pipeline.prepare_batch()
+                log(f"✔ Batch 任务提交完成：扫描 {report.get('scanned', 0)} 篇，提交云端 {report.get('submitted', 0)} 篇。")
+            elif mode == "batch_fetch":
+                import batch_pipeline
+                report = batch_pipeline.fetch_batch()
+                log(f"✔ Batch 结果拉取完成：检查 {report.get('jobs_checked', 0)} 个批次，成功导出 {report.get('exported', 0)} 篇。")
+            elif mode == "books":
+                from litreview.bookintake import run_scheduled_intake
+                from llm_router import make_openai_client
+                client = None
+                if settings.REVIEW_ENRICH_LLM:
+                    client, _ = make_openai_client(quiet=True)
+                from rich.console import Console
+                import io
+                c = Console(file=io.StringIO())
+                rep = run_scheduled_intake(settings, c, client=client, use_llm=settings.REVIEW_ENRICH_LLM)
+                log(f"✔ 教材入库完成：扫描 {rep.get('scanned',0)} 本，成功 {rep.get('ok',0)} 本，跳过 {rep.get('skipped',0)} 本。")
+            else:
+                log(f"未知流水线模式: {mode}")
             
-        # 自动执行元数据补齐与向量索引
-        if settings.REVIEW_AUTO_INDEX:
-            log("🔍 触发增量向量索引构建...")
-            from litreview.indexer import build_index
-            from rich.console import Console
-            import io
-            client = None
-            if settings.REVIEW_EMBED_BACKEND != "local":
-                from openai import OpenAI
-                client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
-                                base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180)
-            rep_idx = build_index(settings, Console(file=io.StringIO()), client)
-            log(f"✔ 向量索引增量更新完成：新增索引 {rep_idx.get('indexed', 0)} 篇 / {rep_idx.get('chunks', 0)} 块。")
+            # 自动执行元数据补齐与向量索引
+            if settings.REVIEW_AUTO_INDEX:
+                log("🔍 触发增量向量索引构建...")
+                from litreview.indexer import build_index
+                from rich.console import Console
+                import io
+                client = None
+                if settings.REVIEW_EMBED_BACKEND != "local":
+                    from openai import OpenAI
+                    client = OpenAI(api_key=os.getenv("SILICONFLOW_API_KEY"),
+                                    base_url=os.getenv("SILICONFLOW_API_BASE"), timeout=180)
+                rep_idx = build_index(settings, Console(file=io.StringIO()), client)
+                log(f"✔ 向量索引增量更新完成：新增索引 {rep_idx.get('indexed', 0)} 篇 / {rep_idx.get('chunks', 0)} 块。")
             
-        task["status"] = "done"
-        log("🎉 流水线执行完毕！")
+            task["status"] = "done"
+            log("🎉 流水线执行完毕！")
+    except IntakeBusyError as e:
+        task["status"] = "busy"
+        task["error"] = str(e)
+        log(f"⏸ 已有入库流水线在运行（daemon 或另一 Web 任务），本次未执行: {e}")
     except Exception as e:
         task["status"] = "failed"
         task["error"] = str(e)
@@ -2116,13 +2126,8 @@ routes = [
 ]
 
 def _cors_origins() -> List[str]:
-    """WEB_CORS_ORIGINS 逗号分隔的跨域白名单；默认空 = 不开放任何跨域。
-
-    前端 web_static 同源访问，不需要 CORS。通配 "*" 会让用户浏览的任意网站
-    借其 IP 身份调用本 API，因此显式忽略。
-    """
-    raw = os.getenv("WEB_CORS_ORIGINS", "")
-    return [o.strip() for o in raw.split(",") if o.strip() and o.strip() != "*"]
+    """WEB_CORS_ORIGINS 白名单；解析逻辑在 litreview.guard.cors_origins，与 CSRF 校验共用。"""
+    return cors_origins()
 
 
 def build_middleware(cors_origins: Optional[List[str]] = None) -> List[Middleware]:
