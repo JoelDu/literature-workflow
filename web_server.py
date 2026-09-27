@@ -53,6 +53,7 @@ from litreview.citation_network import (
     get_seed_subgraph
 )
 from litreview.guard import RemoteAccessGuardMiddleware
+from litreview.safe_paths import safe_basename, resolve_within, is_valid_candidate_id
 
 # ── 日志配置 ──
 logging.basicConfig(
@@ -468,8 +469,13 @@ async def api_upload(request: Request) -> JSONResponse:
     errors = []
     
     for upload in files:
-        filename = getattr(upload, "filename", "unnamed.pdf")
+        raw_name = getattr(upload, "filename", "unnamed.pdf")
+        if not raw_name:
+            continue
+        # 客户端文件名只取基名，防止 "../" 或绝对路径写出输入目录
+        filename = safe_basename(raw_name)
         if not filename:
+            errors.append(f"{raw_name!r}: 非法文件名")
             continue
         ext = os.path.splitext(filename)[1].lower()
         if target_type == "book" and ext not in (".pdf", ".epub"):
@@ -479,8 +485,11 @@ async def api_upload(request: Request) -> JSONResponse:
             errors.append(f"{filename}: 论文仅支持 PDF 格式")
             continue
             
-        dest_path = os.path.join(dest_dir, filename)
-        
+        dest_path = resolve_within(dest_dir, filename)
+        if not dest_path:
+            errors.append(f"{filename}: 目标路径超出上传目录")
+            continue
+
         # 写入临时文件并计算哈希
         try:
             content = await upload.read()
@@ -1277,11 +1286,14 @@ async def api_review_files(request: Request) -> JSONResponse:
 async def api_review_preview(request: Request) -> JSONResponse:
     """读取指定综述 Markdown 的内容用于在线预览"""
     filename = request.query_params.get("filename", "")
-    if not filename or ".." in filename or "/" in filename or "\\" in filename:
+    if not filename or ".." in filename or safe_basename(filename) != filename:
         return JSONResponse({"success": False, "error": "非法文件名"}, status_code=400)
-        
+
     settings = get_app_settings()
-    target = Path(settings.REVIEW_OUTPUT_DIR) / filename
+    resolved = resolve_within(settings.REVIEW_OUTPUT_DIR, filename)
+    if not resolved:
+        return JSONResponse({"success": False, "error": "非法文件名"}, status_code=400)
+    target = Path(resolved)
     if not target.exists() or not target.is_file():
         return JSONResponse({"success": False, "error": "文件不存在"}, status_code=404)
         
@@ -1302,11 +1314,14 @@ async def api_review_preview(request: Request) -> JSONResponse:
 async def api_review_download(request: Request) -> Response:
     """下载综述文件 (.docx 或 .md)"""
     filename = request.query_params.get("filename", "")
-    if not filename or ".." in filename or "/" in filename or "\\" in filename:
+    if not filename or ".." in filename or safe_basename(filename) != filename:
         return JSONResponse({"success": False, "error": "非法文件名"}, status_code=400)
-        
+
     settings = get_app_settings()
-    target = Path(settings.REVIEW_OUTPUT_DIR) / filename
+    resolved = resolve_within(settings.REVIEW_OUTPUT_DIR, filename)
+    if not resolved:
+        return JSONResponse({"success": False, "error": "非法文件名"}, status_code=400)
+    target = Path(resolved)
     if not target.exists() or not target.is_file():
         return JSONResponse({"success": False, "error": "文件不存在"}, status_code=404)
         
@@ -1983,19 +1998,34 @@ async def api_pipeline_upload_pdf(request: Request) -> JSONResponse:
         
         if not candidate_id or not file_obj:
             return JSONResponse({"success": False, "error": "必须提供 candidate_id 和 PDF 文件"}, status_code=400)
-            
+        if not is_valid_candidate_id(candidate_id):
+            return JSONResponse({"success": False, "error": "非法 candidate_id"}, status_code=400)
+
+        # 候选必须真实存在于发现库，才允许落盘到 staging
+        cache_db = _get_cache_db_path()
+        if not os.path.exists(cache_db):
+            return JSONResponse({"success": False, "error": f"未找到候选: {candidate_id}"}, status_code=404)
+        conn = sqlite3.connect(cache_db)
+        try:
+            exists = conn.execute("SELECT 1 FROM discovered_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
+        finally:
+            conn.close()
+        if not exists:
+            return JSONResponse({"success": False, "error": f"未找到候选: {candidate_id}"}, status_code=404)
+
         pdf_bytes = await file_obj.read()
         if len(pdf_bytes) < 100 or pdf_bytes[:4] != b"%PDF":
             return JSONResponse({"success": False, "error": "上传的文件不是有效的 PDF 格式 (缺少 %PDF 文件头)"}, status_code=400)
-            
+
         staging_dir = _get_staging_pdf_dir()
         os.makedirs(staging_dir, exist_ok=True)
-        dest_path = os.path.join(staging_dir, f"{candidate_id}.pdf")
-        
+        dest_path = resolve_within(staging_dir, f"{candidate_id}.pdf")
+        if not dest_path:
+            return JSONResponse({"success": False, "error": "非法 candidate_id"}, status_code=400)
+
         with open(dest_path, "wb") as f:
             f.write(pdf_bytes)
-            
-        cache_db = _get_cache_db_path()
+
         if os.path.exists(cache_db):
             conn = sqlite3.connect(cache_db)
             conn.execute("UPDATE discovered_candidates SET lifecycle_status = 'FULLTEXT_ACQUIRED' WHERE candidate_id = ?", (candidate_id,))
@@ -2085,16 +2115,31 @@ routes = [
     Mount("/static", app=StaticFiles(directory=str(static_dir)), name="static"),
 ]
 
-middleware = [
-    Middleware(GZipMiddleware, minimum_size=1000),
-    Middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    ),
-    Middleware(RemoteAccessGuardMiddleware)
-]
+def _cors_origins() -> List[str]:
+    """WEB_CORS_ORIGINS 逗号分隔的跨域白名单；默认空 = 不开放任何跨域。
+
+    前端 web_static 同源访问，不需要 CORS。通配 "*" 会让用户浏览的任意网站
+    借其 IP 身份调用本 API，因此显式忽略。
+    """
+    raw = os.getenv("WEB_CORS_ORIGINS", "")
+    return [o.strip() for o in raw.split(",") if o.strip() and o.strip() != "*"]
+
+
+def build_middleware(cors_origins: Optional[List[str]] = None) -> List[Middleware]:
+    origins = _cors_origins() if cors_origins is None else cors_origins
+    stack = [Middleware(GZipMiddleware, minimum_size=1000)]
+    if origins:
+        stack.append(Middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        ))
+    stack.append(Middleware(RemoteAccessGuardMiddleware))
+    return stack
+
+
+middleware = build_middleware()
 
 app = Starlette(routes=routes, middleware=middleware)
 
