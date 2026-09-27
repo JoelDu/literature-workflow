@@ -1,0 +1,11 @@
+# 目前只放工具配置；项目本身仍按 requirements.txt 安装，不是可 pip install 的包。
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["scratch", ".git_broken_backup", "caj2pdf-src"]
+
+[tool.ruff.lint]
+# 先只开 pyflakes（F）：未定义名、未使用导入/变量这类几乎零误报的问题。
+# 存量代码仍有 ~160 条（多为 F401/F541），CI 暂只对已清理的文件强制检查，
+# 见 .github/workflows/tests.yml 的 RUFF_STRICT_PATHS；清理一个文件就往里加一个。
+select = ["F"]

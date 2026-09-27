@@ -1,0 +1,8 @@
+# 开发 / CI 依赖。运行时依赖只在 requirements.txt，镜像不装这里的东西。
+-r requirements.txt
+
+pytest==9.1.1          # 本机 ~/.venv_lit 实测版本
+pytest-timeout>=2.3    # CI 用 --timeout 兜住卡死的用例（本机 venv 暂未安装）
+ruff==0.15.20          # 与 pyproject.toml [tool.ruff] 配套；本机 ~/.venv/bin/ruff 实测版本
+# starlette.testclient 依赖 httpx；版本跟 requirements.txt 的锁定保持一致
+httpx==0.28.1

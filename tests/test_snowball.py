@@ -1,14 +1,13 @@
 """Tests for OpenAlex & Crossref Citation Snowball Engine (Phase 3 MVP)."""
 import os
-import json
 import sqlite3
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 
 from litreview.snowball import (
     OpenAlexClient,
     CrossrefClient,
-    DiscoveredCandidate,
     expand_citations,
     format_snowball_markdown_report,
     init_cache_db
@@ -208,6 +207,7 @@ def test_snowball_ledger_and_governance_fixed_fixture(tmp_path):
         assert "引文覆盖率" not in report_md
 
 
+@pytest.mark.network
 def test_snowball_real_api_smoke():
     """保留真实 OpenAlex API 连通性 Smoke Test。"""
     client = OpenAlexClient()

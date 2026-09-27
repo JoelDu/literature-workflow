@@ -1,6 +1,8 @@
 import pytest
 from litreview.facade import LiteratureReviewFacade, JobRegistry, get_facade
 
+import lit_seed as seed
+
 
 def test_job_registry_lifecycle():
     registry = JobRegistry()
@@ -23,38 +25,47 @@ def test_job_registry_lifecycle():
     assert completed["result"]["output"] == "done"
 
 
-def test_facade_dashboard_stats():
-    facade = get_facade()
+@pytest.fixture
+def facade(seeded_dbs, tmp_path):
+    return LiteratureReviewFacade(
+        prod_db_path=seeded_dbs.prod_db,
+        test_citation_db_path=seeded_dbs.citation_db,
+        cache_db_path=seeded_dbs.cache_db,
+        staging_dir=str(tmp_path / "staging_pdf"),
+    )
+
+
+def test_facade_dashboard_stats(facade):
     stats = facade.get_dashboard_stats()
-    assert "library" in stats
-    assert "graph" in stats
-    assert "candidates" in stats
     graph = stats["graph"]
     assert graph["production_baseline_total"] == (
-        graph["production_baseline_normal"] + graph["production_baseline_quarantined"])
+        graph["production_baseline_normal"] + graph["production_baseline_quarantined"]) == 4
     assert graph["edges_total"] == (
         graph["confirmed_edges"] + graph["candidate_edges"] + graph["unresolved_edges"])
+    assert stats["library"]["total_docs"] == 4
 
 
-def test_facade_list_documents():
-    facade = get_facade()
-    try:
-        docs = facade.list_documents(page=1, page_size=5)
-    except Exception as exc:
-        if "unable to open database file" in str(exc):
-            pytest.skip("production database is not readable in this environment")
-        raise
-    assert "items" in docs
-    assert docs["total"] >= len(docs["items"])
-    assert len(docs["items"]) <= 5
+def test_facade_list_documents(facade):
+    docs = facade.list_documents(page=1, page_size=3)
+    assert docs["total"] == 4
+    assert len(docs["items"]) == 3
 
 
-def test_facade_citation_graph():
-    facade = get_facade()
+def test_facade_citation_graph(facade):
     graph = facade.get_citation_graph(include_unresolved=False)
-    assert "nodes" in graph
-    assert "links" in graph
     node_ids = {node["id"] for node in graph["nodes"]}
+    assert node_ids == {seed.DOC_A, seed.DOC_B, seed.DOC_C, seed.OA_WORK}
     assert all(link["source"] in node_ids and link["target"] in node_ids
                for link in graph["links"])
     assert graph["is_backbone"] is True
+
+
+def test_get_facade_uses_isolated_env_paths(monkeypatch, seeded_dbs):
+    """单例外观按环境变量取路径；在测试里它必须指向种子库而不是 /mnt/ripe。"""
+    import litreview.facade as facade_mod
+
+    monkeypatch.setattr(facade_mod, "_default_facade", None)
+    f = get_facade()
+    assert f.prod_db_path == seeded_dbs.prod_db
+    assert f.test_citation_db_path == seeded_dbs.citation_db
+    assert f.get_dashboard_stats()["library"]["total_docs"] == 4

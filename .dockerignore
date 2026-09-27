@@ -1,13 +1,45 @@
+# 版本库 / 密钥
 .git
+.git_broken_backup
 .env
+.env.*
+!.env.example
+*.pem
+*_key.txt
+
+# 本地虚拟环境 / 缓存
+.venv
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 数据与运行时产物（容器里全部通过 volume 挂进来）
 *.db
+*.db-shm
+*.db-wal
 *.xlsx
+pdf.tmp
+data/
 mineru_output/
 input_pdfs/
 processed_pdfs/
 failed_pdfs/
+input_books/
+book_output/
+processed_books/
+failed_books/
 obsidian_vault/
-__pycache__/
-*.pyc
 test_output/
-data/
+
+# 运行时用不到的东西
+tests/
+docs/
+scratch/
+.claude/
+.github/
+# Claude 技能包（zip），给写作助手用，不是服务运行所需
+*.skill
+# 旧 .env.bak 的 Windows 路径（F:\...）在 Linux 上误建出来的目录
+F:*

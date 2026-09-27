@@ -83,6 +83,16 @@ services:
       - BOOK_FAILED_DIR=./failed_books
       - DB_PATH=./data/batch_tracking.db
       - EXCEL_OUTPUT_PATH=./data/knowledge_base.xlsx
+      # 同理：.env 里的 DATA_ROOT 是宿主机路径（如 /mnt/ripe/...），只给上面 volumes 用；
+      # 容器内的数据根固定是 /app/data（daemon 往 $DATA_ROOT/heartbeat 写心跳，healthcheck 读它）。
+      - DATA_ROOT=/app/data
+      # 图谱库 / 外部发现缓存 / 暂存 PDF / 综述任务库：代码默认也落在 data/ 下，这里写死防止
+      # .env 里给宿主机 CLI 用的绝对路径跟着 env_file 注入进来。
+      - TEST_CITATION_DB_PATH=./data/test_citation_network.db
+      - CITATION_NETWORK_DB_PATH=./data/test_citation_network.db
+      - EXTERNAL_DISCOVERY_CACHE_DB_PATH=./data/external_discovery_cache.db
+      - STAGING_PDF_DIR=./data/staging_pdf
+      - WEB_REVIEW_JOBS_DB_PATH=./data/web_review_jobs.db
       # 运行日志按天落 data/app-YYYY-MM-DD.log，超期自动删；0 = 永久保留
       - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
     logging:
@@ -107,3 +117,15 @@ services:
       - ${DATA_ROOT:-./data}:/app/data
     # 默认启动常驻守护进程
     command: ["python", "daemon.py"]
+    # daemon 主循环定期 touch /app/data/heartbeat。超过 10 分钟没更新 = 主循环卡死或进程挂了。
+    # 只标记 unhealthy（restart: always 不会因此重启容器）；需要自动重启请配合 autoheal 之类的工具。
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,time; p='/app/data/heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 600 else 1)"
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 10m

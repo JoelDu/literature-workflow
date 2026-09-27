@@ -10,17 +10,52 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt pytest
+        run: python -m pip install -r requirements-dev.txt
       - name: Run tests
-        run: python -m pytest -q
+        # tests/conftest.py 把所有数据路径指向临时目录、禁用 .env、拦截出网；
+        # network / prod_readonly 两类用例在 CI 上永远不跑（pytest.ini 默认也已排除，这里再写一遍防回退）。
+        run: python -m pytest -q -m "not network and not prod_readonly" --timeout=300 --durations=10
       - name: Check MCP launcher syntax
         if: runner.os == 'Linux'
         run: sh -n mcp_server.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      # 已清理干净、必须保持零告警的文件；清理完一个存量文件就加进来。
+      RUFF_STRICT_PATHS: >-
+        tests/conftest.py
+        tests/lit_seed.py
+        tests/test_isolation_guard.py
+        tests/test_web_api.py
+        tests/test_library_store.py
+        tests/test_citation_network.py
+        tests/test_facade.py
+        tests/test_snowball.py
+        tests/test_dev_evaluation.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install ruff
+        run: python -m pip install "$(grep -E '^ruff' requirements-dev.txt)"
+      - name: ruff check (enforced paths)
+        run: ruff check $RUFF_STRICT_PATHS
+      - name: ruff check (whole repo, report only)
+        continue-on-error: true
+        run: ruff check --statistics .
