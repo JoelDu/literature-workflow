@@ -18,7 +18,6 @@ def _safe_move_hijack(src, dst, **kwargs):
         os.remove(src)
     except Exception as e:
         print(f"[Warning] 已复制到 {dst}，但删除源文件失败，可能导致重复残留: {src} ({e})", file=sys.stderr)
-import shutil
 shutil.move = _safe_move_hijack
 
 from datetime import datetime, timezone

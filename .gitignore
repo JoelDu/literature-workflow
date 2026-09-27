@@ -27,9 +27,8 @@ obsidian_vault/
 # 只忽略仓库根目录的运行时数据目录（DB_PATH 默认 ./data/...）；以前的 `data/` 会连带
 # 忽略任意层级下名为 data 的目录。
 /data/
-# tests/data/ 是引文解析的金/银标评测集（JSON），是否纳入版本库还没定，先显式忽略。
-# 缺失时 tests/test_dev_evaluation.py 等会带原因 skip。决定入库后删掉下面这一行即可。
-tests/data/
+# 上一行的 /data/ 只匹配仓库根；*.xlsx 已在上方全局忽略。
+# tests/data/ 的引文金/银标评测集 JSON 入库；同目录的人工审核 xlsx 不入库。
 # 本地运行时目录（pipeline / 书籍通道的输入输出，默认都相对仓库根）
 /input_pdfs/
 /mineru_output/

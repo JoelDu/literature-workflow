@@ -23,6 +23,7 @@ from datetime import datetime
 from litreview.ref_parser import parse_reference_mention, normalize_title, extract_first_author_surname
 from litreview.chunker import split_markdown
 from litreview.snowball import init_cache_db
+from litreview.fetcher import USER_AGENT
 from litreview.sqlite_runtime import connect_sqlite
 
 
@@ -268,68 +269,6 @@ def approve_candidates(
     }
 
 
-def _download_via_browser(target_url: str, doi: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str]]:
-    """使用真实 Chrome 浏览器 (Playwright) 自动化下载 PDF，支持绕过反爬、PMC POW 质询与代理调度。"""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None, "Playwright is not installed"
-
-    urls_to_try = [target_url]
-    if doi:
-        try:
-            epmc_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{doi}&format=json"
-            req = urllib.request.Request(epmc_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read())
-                results = data.get("resultList", {}).get("result", [])
-                if results and results[0].get("pmcid"):
-                    pmcid = results[0]["pmcid"]
-                    urls_to_try.append(f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/")
-        except Exception:
-            pass
-
-    proxy_server = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-    chrome_path = "/usr/bin/google-chrome" if os.path.exists("/usr/bin/google-chrome") else None
-
-    try:
-        with sync_playwright() as p:
-            launch_args = ["--no-sandbox", "--disable-setuid-sandbox", "--ignore-certificate-errors"]
-            if proxy_server:
-                launch_args.append(f"--proxy-server={proxy_server}")
-
-            browser = p.chromium.launch(
-                executable_path=chrome_path,
-                headless=True,
-                args=launch_args
-            )
-            context_args: Dict[str, Any] = {
-                "ignore_https_errors": True,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            }
-            if proxy_server:
-                context_args["proxy"] = {"server": proxy_server}
-
-            context = browser.new_context(**context_args)
-            page = context.new_page()
-
-            for u in urls_to_try:
-                try:
-                    page.goto(u, wait_until="domcontentloaded", timeout=25000)
-                    time.sleep(4)
-                    resp = context.request.get(page.url if page.url.endswith(".pdf") else u)
-                    body = resp.body()
-                    if len(body) >= 100 and body[:4] == b"%PDF":
-                        browser.close()
-                        return body, None
-                except Exception:
-                    continue
-            browser.close()
-    except Exception as e:
-        return None, str(e)
-    return None, "Browser automation could not retrieve valid PDF"
-
-
 def acquire_fulltext(
     cache_db_path: str,
     candidate_ids: Optional[List[str]] = None,
@@ -367,7 +306,7 @@ def acquire_fulltext(
 
     results = []
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": USER_AGENT,
         "Accept": "application/pdf,application/xhtml+xml,text/html"
     }
 
@@ -444,17 +383,9 @@ def acquire_fulltext(
             except Exception as e:
                 error_msg = str(e)
 
-        # 2. 若直接下载失败或被拦截，自动降级至真实 Chrome 浏览器自动化驱动
-        if not download_success:
-            browser_bytes, b_err = _download_via_browser(target_url or "", doi=doi)
-            if browser_bytes and browser_bytes[:4] == b"%PDF":
-                pdf_bytes = browser_bytes
-                with open(dest_file, "wb") as f:
-                    f.write(browser_bytes)
-                download_success = True
-                error_msg = None
-            elif b_err:
-                error_msg = f"{error_msg} | Browser: {b_err}"
+        # 只走合法 OA 直链；拿不到的不绕反爬，留给用户经 /api/pipeline/upload_pdf 手动补传
+        if not download_success and not target_url:
+            error_msg = "No OA URL; upload the PDF manually"
 
         if download_success:
             try:

@@ -152,11 +152,9 @@ def test_api_audit_events_assets(client):
     assert {f"asset_{d[:8]}" for d in (seed.DOC_A, seed.DOC_B, seed.DOC_C)} <= asset_ids
 
 
-@pytest.mark.xfail(strict=False, reason=(
-    "web_server.api_audit_events 连接 discovered_candidates 时取 c.canonical_title，"
-    "该表没有这一列，查询异常被吞掉，decisions 恒为空"))
 def test_api_audit_events_lists_decisions(client):
     client.post("/api/discovery/candidates/decision",
                 json={"candidate_ids": [seed.CAND_DISCOVERED], "action": "APPROVE"})
     decisions = client.get("/api/audit/events").json()["data"]["decisions"]
     assert [d["candidate_id"] for d in decisions] == [seed.CAND_DISCOVERED]
+    assert decisions[0]["title"]

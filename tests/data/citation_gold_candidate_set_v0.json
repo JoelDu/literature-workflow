@@ -1,0 +1,1133 @@
+{
+  "dataset_name": "citation_gold_candidate_set_v0",
+  "dataset_version": "0.2.0",
+  "created_at": "2026-08-18T15:26:00+08:00",
+  "summary": {
+    "total_records": 35,
+    "dev_partition_count": 16,
+    "locked_test_partition_count": 16,
+    "negative_control_partition_count": 3,
+    "unique_work_clusters": 31,
+    "short_suspect_mentions_covered": 10
+  },
+  "annotation_guidelines": {
+    "boundary_criteria": "以原文物理排版与作者-年份/序号标头对齐为准，span 级切分",
+    "field_extraction_rules": "DOI优先正则完全匹配；第一作者姓名规范化；年份提取4位西元历；题名规范化剔除尾部标点",
+    "resolution_classes": [
+      "LINK (High confidence)",
+      "NO_MATCH (Out of library)",
+      "DEFER (Low confidence / Ambiguous)",
+      "REJECT (Corrupted entry)"
+    ],
+    "data_leakage_policy": "LOCKED_TEST 分区严禁在解析规则编写与阈值调优中作为调试输入，必须在规则冻结后由独立评测脚本单次调用"
+  },
+  "dev_partition": [
+    {
+      "doc_id": "1255f7df8b256aba5e7d4a41284d8673b2d75e671cef8f288e99655140a3c9a4",
+      "canonical_cluster_id": "1255f7df",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "通过压碎强度测量实验确定毛细力",
+      "doi": "",
+      "authors": "X. Rondeau, C. Affolter, L. Komunjer, D. Clausse, P. Guigon",
+      "journal": "Elsevier Science",
+      "year": "2003",
+      "pdf_path": "./processed_pdfs/Experimental determination of capillary forces.pdf",
+      "raw_ref_count": 22,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] L.D. Hansen, F. Hoffmann, G. Strathdee, Effects of anticaking agents on the thermodynamics and kinetics of water sorption by potash fertilizers, Powder Technol. 98 (1998) 79 – 82.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] Y.L. Chen, J.Y. Chou, Selection of anti-caking agents through crystallization, Powder Technol. 77 (1993) 1 – 6.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] M. Peleg, The mechanism of caking of powdered onion, J. Food Process. Preserv. 1 (1977) 3 – 11.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] G.M. Walker, T.R.A. Magee, C.R. Holland, M.N. Ahmad, J.N. Fox, N.A. Moffatt, A.G. Kells, Caking processes in Granular NPK fertilizer, Ind. Eng. Chem. Res. 37 (1998) 435 – 438.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] S.M. Iveson, J.D. Litster, K. Hapgood, B.J. Ennis, Nucleation, growth and breakage phenomena in agitated wet granulation processes: a review, Powder Technol. 117 (2001) 3 – 39.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "1470d81b91c098cfd25b3d030285187caacc1243d11d4c0adff6f0e86c23bb95",
+      "canonical_cluster_id": "1470d81b",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "淀粉包封微量营养素作为增效肥料",
+      "doi": "10.1016/j.carbpol.2021.118419",
+      "authors": "Camila Gruber Chiaregato, Roselena Faez",
+      "journal": "",
+      "year": "",
+      "pdf_path": "./processed_pdfs/淀粉包封微量营养素作为增效肥料.pdf",
+      "raw_ref_count": 92,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "Abdullah, A. H. D., Chalimah, S., Primadona, I., & Hanantyo, M. H. G. (2018). Physical and chemical properties of corn, cassava, and potato starchs. In , Vol. 160. IOP conference series: Earth and environmental science. Institute of Physics Publishing. https://doi.org/10.1088/1755-1315/160/1/012003.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "Abedi-Koupai, J., Varshosaz, J., Mesforoosh, M., & Khoshgoftarmanesh, A. H. (2012). Controlled release of fertilizer microcapsules using ethylene vinyl acetate polymer to enhance micronutrient and water use efficiency. Journal of Plant Nutrition, 35(8), 1130–1138, https://doi.org/10.1080/01904167.2012.676126",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "Alfaro-Galarza, O., Lopez-Villegas, ´ E. O., Rivero-Perez, N., Tapia-Maruri, D., Jim´enez Aparicio, A. R., Palma-Rodríguez, H. M., & Vargas-Torres, A. (2020). Protective effects of the use of taro and rice starch as wall material on the viability of encapsulated Lactobacillus paracasei subsp. paracasei. LWT, 117. https://doi.org 10.1016/i.lwt.2019.108686",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "Atkins, P. W., Overton, T. L., Rourke, J. P., & Weller, M. T. (2010). Shriver and Atkins inorganic chemistry (5th ed.). Great Britain: Oxford University Press. https://doi.org 10.1016/0375-9601(91)90960-G",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "Baker, R. W., & Lonsdale, H. K. (1974). Controlled release: Mechanisms and rates. In A. C. Tanquary, & R. Lacey (Eds.), Controlled release of biologically active agents (47th ed., pp. 15–71). Springer US. https://doi.org/10.1007/978-1-4684-7239-4\\_2.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "4984e3b267e133e644a2457b35e2a4e85fb7260c9657d113b2d1aa130b63ff83",
+      "canonical_cluster_id": "4984e3b2",
+      "partition": "DEV",
+      "doc_type": "book",
+      "title": "工业脂肪酸及其应用",
+      "doi": "",
+      "authors": "R.W.约翰逊, E.弗里兹",
+      "journal": "",
+      "year": "1989",
+      "pdf_path": "./books/工业脂肪酸及其应用.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "4c35adf6f82611b90131291c98bb53930a7929fbf69a8d0a2baa3adff7940c36",
+      "canonical_cluster_id": "4c35adf6",
+      "partition": "DEV",
+      "doc_type": "patent",
+      "title": "一种快速评价颗粒肥料表面泛白程度的方法",
+      "doi": "",
+      "authors": "李淑华 阮自斌 吴初柱 陈凯",
+      "journal": "",
+      "year": "2019",
+      "pdf_path": "./processed_pdfs/一种快速评价颗粒肥料表面泛白程度的方法.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "5324d9ddc3139415b68c494d7f64063aed9378c1241005a0a1cc4c9b95728f19",
+      "canonical_cluster_id": "5324d9dd",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "防结块剂对高效有机涂层防止硝酸铵肥料结块的影响",
+      "doi": "10.3390/coatings10111093",
+      "authors": "Aleksandra Tyc, Dominik Niewes, Szymon Penkala, Ryszard Grzesik, Krystyna Hoffmann, Józef Hoffmann",
+      "journal": "",
+      "year": "2020",
+      "pdf_path": "./processed_pdfs/Influence of Anti-Caking Agents on the Highly.pdf",
+      "raw_ref_count": 12,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "1. World Fertilizer Trends and Outlook to 2022; Food and Agriculture Organization of the United Nations: Rome, Italy, 2019; Available online: http://www.fao.org/3/ca6746en/CA6746EN.pdf?eloutlink=imf2fao (accessed on 23 October 2020).",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "2. Gezerman, A.O.; Corbacioglu, B.D. Efects of sodium silicate, calcium carbonate, and silicic acid on ammonium nitrate degradation, and analytical investigations of the degradation process on an industrial scale. Chem. Ind. Chem. Eng. Q. 2015, 21, 359–367. [CrossRef]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "3. Tyc, A.; Hofmann, J.; Biskupski, A. Anti-caking agents for ammonium nitrate fertilizers. Part 1. Caking phenomenon. Przem. Chem. 2019, 98, 771–776. [CrossRef]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "4. Gezerman, A.O.; Corbacioglu, B.D.; Cevik, H. Improvement of surface features of nitrogenous fertilisers and influence of surfactant composition on fertiliser surface. Int. J. Chem. 2011, 3, 201–209. [CrossRef]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "5. Rutland, D.W. Fertilizer caking: Mechanisms, influential factors and method of prevention. Fertil. Res. 1991, 30, 99–114. [CrossRef]",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "648cf9d6296b154a2a01c3582cf52b74ec06dc831f13db5f04bab02cf1687475",
+      "canonical_cluster_id": "648cf9d6",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "影响含磷颗粒肥料结块的变量",
+      "doi": "",
+      "authors": "J. A. González-León, F. Simon, C. Besson, P. Nicol",
+      "journal": "",
+      "year": "",
+      "pdf_path": "./processed_pdfs/Variables affecting caking on granular phosphorous containing.pdf",
+      "raw_ref_count": 8,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] Walker, G. M. et al “Caking Process in Granular NPK fertilizer”. Ind. Eng. Chem. Res, 1998, 37, 435-438.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] Walker G.M. et al. “ Granular Fertilizer Agglomertation in Accelerated Caking Tests” Ind. Eng. Chem. Res, 1999, 38, 4101-4103",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] UNIDO and IFDC “Fertilizer Manual”. Kluwer Academic Publishers, 1998, The Netherlands",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] Rutland,D.W. “Fertilizer caking: mechanisms, influential factors and methods of prevention” Fertilizer Research, 30, 9-114, 1991.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] Ohlsson, A.,”Fertilizer coatings” IFS procedings No. 453, International Fertilizer Society, York UK,1-32",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "6a3736deaa4e3dc7772f65b9910300813d6061a763e8cbb49efadfe69fecf11b",
+      "canonical_cluster_id": "6a3736de",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "粉体结块综述",
+      "doi": "10.1016/j.powtec.2017.02.024",
+      "authors": "",
+      "journal": "",
+      "year": "",
+      "pdf_path": "./processed_pdfs/A review of bulk powder caking.pdf",
+      "raw_ref_count": 121,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "Adhikari, B., Howes, T., Bhandari, B.R., and Truong, V., (2001). Stickiness in Foods: A Review of Mechanisms and Test Methods, International Journal of Food Properties, 4(1), 1-33.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "Aguilera, J.M., del Valle, J.M., and Karel, M. (1995). Caking Phenomena in Amorphous Food Powders, Trends in Food Science and Technology, 149-155.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "Bagster, D.F., (1985). A Study of the Caking Behaviour of Raw Sugar under Storage, Bulk Solids Handling, 5(2), 437-441.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "Bhandari, B.R., and Howes, T., (1999). Implication of Glass Transition for the Drying and Stability of Dried Foods, Journal of Food Engineering, 40(1-2), 71-79.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "Bika, D., Tardos, G.I., Panmai, S., Farber, L., and Michaels, J., (2005). Strength and Morphology of Solid Bridges in Dry Granules of Pharmaceutical Powders, Powder Technology, 150(2), 104-116.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "9948f9ee57a429ab341f710d7bd0a65091a14ef70cfb2f5f18ecff27ba4361ba",
+      "canonical_cluster_id": "9948f9ee",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "两亲性防结块系统的固体颗粒设计",
+      "doi": "",
+      "authors": "Hangsheng Li",
+      "journal": "",
+      "year": "2009",
+      "pdf_path": "./processed_pdfs/Design of amphiphilic anti-caking systems for solid.pdf",
+      "raw_ref_count": 194,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "1. Scherer, H.W.; Mengel, K. Ullmann’s Agrochemicals: Fertilizers Wiley-Vch, 2007.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "2. Krase, N.W.; Gaddy, V.L. Ind. Eng. Chem. 1922, 14, 611-615.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "3. Meessen, J.H.; Petersen, H. Ullmann’s Encyclopedia of Industrial Chemistry VCH Weinheim, 1996, 27, 333-365.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "4. Nelson, D.W.; Huber, D. Nitrification Inhibitors for Corn Production National Corn Handbook, 1992, 55.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "5. Pratt, C.J.; Noyes, R. Ureaform in Nitrogen Fertilizer Chemical Process Noyes Development Corp, 1965, 232-234.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "9c9761daad2138d0401b129a496bcc4d626451e62ea75764f132fef1018a703d",
+      "canonical_cluster_id": "9c9761da",
+      "partition": "DEV",
+      "doc_type": "patent",
+      "title": "热法磷酸全热能回收系统",
+      "doi": "",
+      "authors": "梅毅 杜加磊 杨亚斌 梁慧力王政伟 何锦林 蒋波 翟持朱远蹠 聂云祥",
+      "journal": "",
+      "year": "2021",
+      "pdf_path": "./input_books/热法磷酸全热能回收系统.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "9e80ce84c9a3a78dd8a0ab08e0f0f674574968d1168ae7e1a412ef8f0c6e7b03",
+      "canonical_cluster_id": "9e80ce84",
+      "partition": "DEV",
+      "doc_type": "standard",
+      "title": "增塑剂环氧值的测定",
+      "doi": "",
+      "authors": "安方",
+      "journal": "中华人民共和国国家标准",
+      "year": "2008",
+      "pdf_path": "./processed_pdfs/环氧值测定标准GBT1677-2008.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "b037b06e06af477001ebd56a9f156c89085aaa5283c78f4d8fa4d310a3fa2122",
+      "canonical_cluster_id": "b037b06e",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "脂肪醇磷酸酯在复合肥防结块剂中的应用",
+      "doi": "",
+      "authors": "林祥斌, 马继伟, 史铁京",
+      "journal": "",
+      "year": "2015",
+      "pdf_path": "./processed_pdfs/脂肪醇磷酸酯在复合肥防结块剂中的应用.pdf",
+      "raw_ref_count": 8,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] 张春霞, 张应军, 徐杨, 等. 表面活性剂在化肥防结块剂中的应用 [J]. 日用化学工业, 2002, 12(6): 44-48.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] 徐刚. 最新磷化工工艺技术手册 [M]. 北京: 中国知识出版社, 2011.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] 赖红敏, 余宪虎, 胡家军. 混合脂肪醇磷酸酯渗透剂的合成与性能研究 [J]. 化工技术与开发, 2010, 39(3): 7-9.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] 杜延军, 唐云, 李平, 等. 表面活性剂在高塔造粒复混肥防结块剂中的应用 [J]. 化工生产与技术, 2006, 13(6): 53-54, 57.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] 藤本武彦. 新表面活性剂入门 [M]. 北京: 化学工业出版社, 1998: 65-67.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "b1841cecd9a81a7ebb43adfbd12bf770d125d1f54470fc0650bf29ef40cf79fb",
+      "canonical_cluster_id": "b1841cec",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "无定形和湿度结块：综述",
+      "doi": "10.1016/j.cjche.2019.02.004",
+      "authors": "Mingyang Chen, Dejiang Zhang, Weibing Dong, Zhilong Luo, Chao Kang, Haichao Li, Gang Wang, Junbo Gong",
+      "journal": "Particuology",
+      "year": "2019",
+      "pdf_path": "./processed_pdfs/Amorphous and humidity caking.pdf",
+      "raw_ref_count": 116,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] T. Freeman, K. Brockbank, B. Armstrong, Measurement and quantification of caking in powders Procedia Eng, 102 (2015) 35–44",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] T.M. Lowry, F.C. Hemmings, Properties of powders. I. Caking of salts, London Sect. Soc Chem Ind Faradav Soc, 39 (1920) 101–110.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] J.R. Adams, A.R. Merz, Hygroscopicity of fertilizer materials and mixtures, Ind. Eng. Chem. 21 (1929) 305–307.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] J. Aguilera, J.D. Valle, M. Karel, Caking phenomena in amorphous food powders Trends Food Sci. Technol. 6 (5) (1995) 149–155.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] M. Carpin, H. Bertelsen, J.K. Bech, R. Jeantet, J. Risbo, P. Schuck, Caking of lactose: A critical review, Trends Food Sci. Technol. 53 (2016) 1–12.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "c09f16434d5ef35a1ffb92d5733150a95a31e3ed76d5064a478e20d2789b6cab",
+      "canonical_cluster_id": "c09f1643",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "包膜有机和无机缓释肥料的研制及其对土壤培肥的机理研究",
+      "doi": "",
+      "authors": "余佳卉",
+      "journal": "",
+      "year": "2022",
+      "pdf_path": "./processed_pdfs/包膜有机和无机缓释肥料的研制及其对土壤培肥的机理研究_余佳卉.pdf",
+      "raw_ref_count": 139,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "1. 鲍士旦．土壤农化分析．北京：农业出版社，2000．71-76",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "2. 薄瀛，袁铭，刘安强.我国磷肥产业现状、问题及发展建议.磷肥与复肥，2016，31(4):16-19",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "3. 陈冠霖，赵其国，Danso Prince Ofori，鲁亚普，王张民，尹雪斌.包膜型缓/控释肥料研究现状及其在功能农业中的应用展望.肥料与健康，2021，48(3):1-6",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "4. 陈宏坤，徐广飞，高璐阳，郑磊，张素素，德州金正大生态工程有限公司，金正大生态工程集团股份有限公司，广东金正大生态工程有限公司.缓控释肥包膜材料的研究进展.磷肥与复肥，2016，31(12):19-21",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "5. 程玉刚，张忠辉，兰尧中.我国钾盐制钾肥开发利用现状.现代矿业，2011，27(02):92-94",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "cea42a5074a118190b3309e6671baf3362f335dd0613d7c30ed79457378eb7da",
+      "canonical_cluster_id": "cea42a50",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "包膜有机和无机缓释肥料的研制及其对土壤培肥的机理研究",
+      "doi": "",
+      "authors": "余佳卉",
+      "journal": "",
+      "year": "2022",
+      "pdf_path": "./processed_pdfs/包膜有机和无机缓释肥料的研制及其对土壤培肥的机理研究_余佳卉.pdf",
+      "raw_ref_count": 138,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "1. 鲍士旦．土壤农化分析．北京：农业出版社，2000．71-76",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "2. 薄瀛，袁铭，刘安强.我国磷肥产业现状、问题及发展建议.磷肥与复肥，2016，31(4):16-19",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "3. 陈冠霖，赵其国，Danso Prince Ofori，鲁亚普，王张民，尹雪斌.包膜型缓/控释肥料研究现状及其在功能农业中的应用展望.肥料与健康，2021，48(3):1-6",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "4. 陈宏坤，徐广飞，高璐阳，郑磊，张素素，德州金正大生态工程有限公司，金正大生态工程集团股份有限公司，广东金正大生态工程有限公司.缓控释肥包膜材料的研究进展.磷肥与复肥，2016，31(12):19-21",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "5. 程玉刚，张忠辉，兰尧中.我国钾盐制钾肥开发利用现状.现代矿业，2011，27(02):92-94",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "df9a839c68a3479debc5b48c24423d25323d75ac0d38fe442e896ae4c5f868d5",
+      "canonical_cluster_id": "df9a839c",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "生物基氨基油制备的控释磷酸氢二铵肥料的性质",
+      "doi": "10.1002/aocs.12360",
+      "authors": "Asma Sofyane, Mohammed Lahcini, Abdellatif El Meziane, Mehdi Khouloud, Abdelmalek Dahchour, Sylvain Caillol, Mustapha Raihane",
+      "journal": "J Am Oil Chem Soc",
+      "year": "2020",
+      "pdf_path": "./processed_pdfs/生物基氨基油制备的控释磷酸氢二铵肥料的性质.pdf",
+      "raw_ref_count": 67,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "Aboudzadeh, A., Fernandez, M., Munoz, M. E., Santamaria, A., & Mecerreyes, D. (2014) Ionic supramolecular networks fully based on chemicals coming from renewable sources. Macromolecular Rapid Communications, 35:460–465. https://doi.org/10.1002/marc. 201300732",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "AFNOR T90-023, NF EN ISO 6878. (2005) Water qualitydetermination of phosphorus–ammonium molybdate spectrometric method. Recueil de normes françaises eau, méthodes d’essai. Editor Association Francaise de Normalization, Paris, France.̧",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "Ahmad, N. N. R., Fernando, W. J. N., & Uzir, M. H. (2014) Parametric evaluation using mechanistic model for release rate of phosphate ions from chitosan- coated phosphorus fertiliser pellets. Biosystems Engineering, 129:78–86. https://doi.org/10.1016/j.biosystemseng. 2014.09.015",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "Alexandratos, N., & Bruinsma, J. (2012) World agriculture towards 2030/2050: The 2012 revision (ESA Working paper No. 12-03). FAO, Rome, Italy.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "Arnold, S. M., Collins, M. A., Graham, C., Jolly, A. T., Parod, R. J., Poole, A., … Woolhiser, M. R. (2012) Risk assessment for consumer exposure to toluene diisocyanate (TDI) derived from polyurethane <sup>fl</sup>exible foam. Regulatory Toxicology and Pharmacology, 64:504–515. https://doi.org/10.1016/j.yrtph.2012.07.006",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "fdd5482fdbd50f5612ddbfd72abbd3cfd94774df0c945fa7c497b26c4eacd6a3",
+      "canonical_cluster_id": "fdd5482f",
+      "partition": "DEV",
+      "doc_type": "paper",
+      "title": "生物基氨基油制备控释磷酸二铵肥料性能",
+      "doi": "10.1002/aocs.12360",
+      "authors": "Asma Sofyane, Mohammed Lahcini, Abdellatif El Meziane, Mehdi Khouloud, Abdelmalek Dahchour, Sylvain Caillol, Mustapha Raihane",
+      "journal": "J Am Oil Chem Soc",
+      "year": "2020",
+      "pdf_path": "./processed_pdfs/生物基氨基油制备控释磷酸二铵肥料性能.pdf",
+      "raw_ref_count": 67,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "Aboudzadeh, A., Fernandez, M., Munoz, M. E., Santamaria, A., & Mecerreyes, D. (2014) Ionic supramolecular networks fully based on chemicals coming from renewable sources. Macromolecular Rapid Communications, 35:460–465. https://doi.org/10.1002/marc. 201300732",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "AFNOR T90-023, NF EN ISO 6878. (2005) Water qualitydetermination of phosphorus–ammonium molybdate spectrometric method. Recueil de normes françaises eau, méthodes d’essai. Editor Association Francaise de Normalization, Paris, France.̧",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "Ahmad, N. N. R., Fernando, W. J. N., & Uzir, M. H. (2014) Parametric evaluation using mechanistic model for release rate of phosphate ions from chitosan- coated phosphorus fertiliser pellets. Biosystems Engineering, 129:78–86. https://doi.org/10.1016/j.biosystemseng. 2014.09.015",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "Alexandratos, N., & Bruinsma, J. (2012) World agriculture towards 2030/2050: The 2012 revision (ESA Working paper No. 12-03). FAO, Rome, Italy.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "Arnold, S. M., Collins, M. A., Graham, C., Jolly, A. T., Parod, R. J., Poole, A., … Woolhiser, M. R. (2012) Risk assessment for consumer exposure to toluene diisocyanate (TDI) derived from polyurethane <sup>fl</sup>exible foam. Regulatory Toxicology and Pharmacology, 64:504–515. https://doi.org/10.1016/j.yrtph.2012.07.006",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    }
+  ],
+  "locked_test_partition": [
+    {
+      "doc_id": "00ab1a9834c17927288b4d84528233fc469500a3b1b023e8eded91416f5b37c1",
+      "canonical_cluster_id": "00ab1a98",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "大豆油生物柴油氧化稳定性：合成抗氧化剂与天然抗氧化剂的比较",
+      "doi": "10.1016/j.fuel.2016.05.056",
+      "authors": "Gabriela Menegon Buosi, Elisangela Tavares da Silva, Kelly Spacino, Lívia Ramazzoti Chanan Silva, Bruna Aparecida Denobi Ferreira, Dionisio Borsato",
+      "journal": "Fuel Processing Technology",
+      "year": "2016",
+      "pdf_path": "./processed_pdfs/大豆油生物柴油氧化稳定性.pdf",
+      "raw_ref_count": 28,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] Maia ECR, Borsato D, Moreira I, Spacino KR, Rodrigues PRP, Gallina AL. Study of the biodiesel B100 oxidative stability in mixture with antioxidants. Fuel Process Technol 2011;92:1750–5.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] Rizwanul Fattah IM. Masiuki HH. Kalam MA. Mofiiur M. Abedin MI. Effect of antioxidant on the performance and emission characteristics of a diesel engine fueled with palm biodiesel blends. Energy Convers Manage 2014;79:265–72.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] Ong HC, Silitonga AS, Masjuki HH, Mahlia TH, Chong WT, Boosro HMH. Production and comparative fuel properties of biodiesel from non-edible oils: Jatropha curcas, Sterculia foetida and Ceiba pantandra. Energy Convers Manage 2013;73:245–55.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] Atabani AE, Silitonga AS, Ong HC, Mahlia TMI, Masjuli HH, Basruddin IA. Nonedible vegetable oils: a critical evolution of oil extraction, fatty acid compositions, biodiesel production, characteristics, engine performance and emissions production. Renew Sustain Energy Rev 2013;18:211–45.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] Dantas MB, Albuquerque AR, Barros AK, Rodrigues Filho MG, Antoniosi Filho NR, Sinfrônio FSM, et al. Evaluation of the oxidative stability of corn biodiesel Fuel2011:90:773–8",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "1b7caad9f021097a36f5e8cae7ab125169f447416dc3e6468760c075869b9c10",
+      "canonical_cluster_id": "1b7caad9",
+      "partition": "LOCKED_TEST",
+      "doc_type": "standard",
+      "title": "肥料中多环芳烃含量的测定气相色谱-质谱法",
+      "doi": "",
+      "authors": "李晨, 费旭东, 张继东, 孙明星, 梁振芬, 王文青, 屠虹, 杨一, 闵红, 沈国清, 陈平",
+      "journal": "中华人民共和国国家标准",
+      "year": "2016",
+      "pdf_path": "./processed_pdfs/肥料中多环芳烃的检测.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "502b47e0c19d323a92d18f9c682ea92e6152a0576b9979ca18482bae6bb4129f",
+      "canonical_cluster_id": "502b47e0",
+      "partition": "LOCKED_TEST",
+      "doc_type": "patent",
+      "title": "一种化肥防结块剂",
+      "doi": "",
+      "authors": "招志谋",
+      "journal": "",
+      "year": "2010",
+      "pdf_path": "./processed_pdfs/CN101781150B_肥料防结块剂_广东新绿源.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "6138acc32bf488f47e9ae16635bec9a66a7620347eb1b31e0e2b4cc2a9cc85af",
+      "canonical_cluster_id": "6138acc3",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "淀粉基高吸水性聚合物缓释肥料的制备及表征",
+      "doi": "10.1016/j.carbpol.2016.04.010",
+      "authors": "Dongling Qiao, Hongsheng Liu, Long Yu, Xianyang Bao, George P. Simon, Eustathios Petinakis, Ling Chen",
+      "journal": "Carbohydrate Polymers",
+      "year": "2016",
+      "pdf_path": "./processed_pdfs/淀粉基高吸水性聚合物缓释肥料的制备及表征.pdf",
+      "raw_ref_count": 54,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "AOAC. (1990). Official methods of analysis. Washingtong, DC: Association of Analytical Chemistry, Inc.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "Azeem, B. S., KuShaari, K., Man, Z. B., Basit, A., & Thanh, T. H. (2014). Review on materials & methods to produce controlled release coated urea fertilizer Journal of Controlled Release, 181 11–21.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "Bao, X.-y., Ali, A., Qiao, D.-l., Liu, H.-s., Chen, L., & Yu, L. (2015). Application of polymer materials in developing slow/control release fertilizer. Acta Polymerica Sinica, 9, 1010–1019.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "Beaucage, G. (1996). Small-angle scattering from polymeric mass fractals of arbitrary mass-fractal dimension. Journal of Applied Crystallography, 29(2), 134-146",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "Bortolin, A., Aouada, E. A., Mattoso, L. H., & Ribeiro, C. (2013). Nanocomposite PAAm/methyl cellulose/montmorillonite hydrogel: evidence of synergistic effects for the slow release of fertilizers. Journal of Agricultural and Food Chemistry, 61(31), 7431–7439.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "63f5872917f6038b40be81ee0e35d76dcaca2ce4a771bb9a5f1fae5f600798f7",
+      "canonical_cluster_id": "63f58729",
+      "partition": "LOCKED_TEST",
+      "doc_type": "standard",
+      "title": "石油蜡中稠环芳烃试验法",
+      "doi": "",
+      "authors": "国家标准化管理委员会",
+      "journal": "中华人民共和国国家标准 GB/T 7363-2021",
+      "year": "2021",
+      "pdf_path": "./processed_pdfs/石蜡中稠环芳烃的测试方法.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "6e1c51a8bd8951279f71bca28e6a1c59f7b079bb134cf9a7ecc861c4b7b434aa",
+      "canonical_cluster_id": "6e1c51a8",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "生物柴油氧化安定性研究",
+      "doi": "10.1016/j.rser.2014.03.055",
+      "authors": "Zahira Yaakob, Binitha N. Narayanan, Silija Padikkaparambil, Surya Unni K., Mohammed Akbar P.",
+      "journal": "",
+      "year": "2014",
+      "pdf_path": "./processed_pdfs/生物柴油氧化安定性研究.pdf",
+      "raw_ref_count": 201,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] Jain S, Sharma MP. Stability of biodiesel and its blends: a review. Renew Sustain Energy Rev 2010;14:667–78.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] Jain S, Sharma MP. Oxidation stability of blends of Jatropha biodiesel with diesel. Fuel 2011;90:3014–20.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] Pullen J, Saeed K. An overview of biodiesel oxidation stability. Renew Sustain Energy Rev 2012;16:5924–50.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] Krahl J, Münack A, Bahadir M, Schumacher L, Elser N. Survey about biodiesel exhaust emissions and their environmental benefits, Ibid., p. 136–48.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] Yaakob Z, Mohammad M, Mohammad A, Alam Z, Sopian K. Overview of the production of biodiesel from waste cooking oil. Renew Sustain Energy Rev 2013;18:184–93.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "8e11398f973af1c65939fa7219e01d18f666e677cb6e1de95401cd46df4c2b37",
+      "canonical_cluster_id": "8e11398f",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "磷肥生产中包裹油的质量检测方法探讨",
+      "doi": "10.16341/j.cnki.spbmh.000397",
+      "authors": "徐林林",
+      "journal": "磷肥与复肥",
+      "year": "2019",
+      "pdf_path": "./processed_pdfs/磷肥生产中包裹油的质量检测方法探讨_徐林林.pdf",
+      "raw_ref_count": 3,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "［<sup>1</sup>］ 李永清<sup>．</sup> 复混肥包裹剂的作用与应用［<sup>J</sup>］<sup>．</sup>硫磷设计与粉体工",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "［<sup>2</sup>］ 毕先钧，江 华，殷照江，等<sup>．</sup>硅藻土作包裹剂的缓释复合肥的 研制［<sup>J</sup>］<sup>．</sup>云南师范大学学报( 自然科学版) ，<sup>2004</sup>( <sup>3</sup>) :<sup>20～21</sup>",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "［<sup>3</sup>］ 陈秋雪，石元亮，苏 壮，等<sup>．</sup>化肥防结块剂的类型及应用［<sup>J</sup>］<sup>．</sup> <sub>磷肥与复肥，</sub>2006<sub>(</sub> 6<sub>)</sub> <sub>:</sub> 76～ 79．",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "b2d67cb95eba66221dc9fb5a9bb901a1e74c0790f68ae2a1d6784457bfe6523c",
+      "canonical_cluster_id": "b2d67cb9",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "肥料材料及混合物的吸湿性",
+      "doi": "",
+      "authors": "J. Richard Adams, Albert R. Merz",
+      "journal": "Journal of the American Chemical Society",
+      "year": "1928",
+      "pdf_path": "./processed_pdfs/Hygroscopicity of Fertilizer Materials and Mixtures'.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "bab0f6601ecbc4f43d0825ad528aeb1dda4aae995cf17c5d7170b29926d6491c",
+      "canonical_cluster_id": "bab0f660",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "有机单体包膜缓释肥料：现状认识与未来展望",
+      "doi": "10.1016/i.iibiomac.2024.133320",
+      "authors": "Abreeta Kalita, M. Elayarajan, P. Janaki, S. Suganya, A. Sankari, E. Parameswari",
+      "journal": "",
+      "year": "",
+      "pdf_path": "./processed_pdfs/有机单体包膜缓释肥料：现状认识与未来展望.pdf",
+      "raw_ref_count": 211,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] HLEF Global Agriculture Towards 2050. [(accessed on 29 April 2020)]; Available online:http://www.fao.org/fileadmin/templates/wsfs/docs/Issues\\_papers /HLEF2050 Global Agriculture,pdf",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] W. FAO, IFAD, and W. UNICEF, building climate resilience for food security and nutrition. The state of food security and nutrition in the world 2018. FAO. Rome doi:https://doi.org/10.1093/cjres/rst006.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] R.D. Graham, R.M. Welch, H.E. Bouis, Addressing micronutrient malnutrition through enhancing the nutritional quality of staple foods: principles, perspectives and knowledge gaps, Adv. Agron. 70 (2001) 77–142.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] FAO, World Fertilizer Trends and Outlook to 2022: Summary Report, 2019.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] A. Karthik, M.U. Maheswari, Smart fertilizer strategy for better crop production,",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "c116baa81ba76c027c4bbc57ed6cd282c7e72a02cab63138d5a33eabe252d459",
+      "canonical_cluster_id": "c116baa8",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "通过机械化学途径制备的羟基磷灰石纳米溶胶",
+      "doi": "",
+      "authors": "S. Nakamura, T. Isobe, M. Senna",
+      "journal": "Journal of Nanoparticle Research",
+      "year": "2001",
+      "pdf_path": "./processed_pdfs/Hydroxyapatite nano sol prepared via a mechanochemical route.pdf",
+      "raw_ref_count": 11,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "Fujiwara Y., T. Isobe, M. Senna & J. Tanaka, 1999. J. Phys. Chem. 103, 9842.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "Hamada K., S. Yamamoto, M. Nagao & M. Senna, 1997. J. Chem. Eng. Jpn. 30, 756.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "Iijima M., H. Kamemizu, N. Wakamatsu & T. Goto, 1997. J. Cryst. Growth 181, 70.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "Lazic S. 1995. J. Cryst. Growth 147(1995), 147.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "Peiser H.S., H.P. Rooksby & A.J.C. Wilson, 1955. X-ray diffraction by polycrystalline materials, The Institute of Physics, London.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "ccd5b7fbf632a63039a0b58c326fcbe5e2e4659aa815341af31392000361637e",
+      "canonical_cluster_id": "ccd5b7fb",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "确保塞拉利昂农民使用优质肥料",
+      "doi": "10.9790/2380-1305014857",
+      "authors": "Abdul R. Conteh",
+      "journal": "IOSR Journal of Agriculture and Veterinary Science",
+      "year": "2020",
+      "pdf_path": "./processed_pdfs/EnsuringQualityFertilizerforFarmers in Sierra Leone.pdf",
+      "raw_ref_count": 41,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1]. AAPFCO. 2019. AAPFCO Product Label Guide. Association of American Plant Food Control Officials. www.aapfco.org",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2]. Amara Denis, M. K., Kamara A., & Momoh, E. J. J. (2013). Soil Fertility Status of Three Chiefdoms in Pujehun District of Southern Sierra Leone. Research Journal of Agricultural Science, 4(4), 461-464.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3]. Ashour, M., Billings, L., Gilligan, D.O., &Karachiwalla (2015). Evaluation of the Impact of E-verification Counterfeit Agricultural Inputs and Technology Adoption in Uganda: Baseline Report. Washington, DC: International Food Policy Research Institute.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4]. AU. 2006. Abuja Declaration on Fertilizer for an African Green Revolution. Africa Fertilizer Summit. African Union Special Summit of the Heads of State and Government Abuja, Nigeria, 13 June 2006",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5]. Ayoola, G. B., Chude,V.O., and A. A. Abdulsalaam. 2002. Toward a Fertilizer Regulatory Policy for Nigeria: An Inventorization of the Fertilizer Sector. A study commissioned by the Federal Fertilizer Department (FFD), Federal Ministry of Agriculture and Rural development, Abuja. May, 2002",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "cf693c6c782dbf50731618121d2357a023a6f0f982fc74e72c26d937e78547f1",
+      "canonical_cluster_id": "cf693c6c",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "晶体结块：表征、机制和预防",
+      "doi": "10.1016/i.powtec",
+      "authors": "Mingyang Chen, Songgu Wu, Shijie Xu, Bo Yu, Mohannad Shilbayeh, Ya Liu, Xiaowen Zhu, Jingkang Wang, Junbo Gong",
+      "journal": "",
+      "year": "2017",
+      "pdf_path": "./processed_pdfs/Caking of crystals Characterization mechanisms and prevention.pdf",
+      "raw_ref_count": 126,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] J.J. Fitzpatrick, N. Descamps, K. O'Meara, C. Jones, D. Walsh, M. Spitere, Comparing the caking behaviours of skim milk powder, amorphous maltodextrin and crystalline common salt, Powder Technol. 204 (2010) 131–137.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] U. Bröckel, M. Wahl, R. Kirsch, H.J. Feise, Formation and growth of crystal bridges in bulk solids, Chem. Eng. Technol. 29 (6) (2006) 691–695.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] M. Wahl, U. Bröckel, L. Brendel, H.J. Feise, B. Weigl, M. Röck, Understanding powder caking: predicting caking strength from individual particle contacts, Powder Technol, 188 (2) (2008) 147–152.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] E.K. Silva, S.V. Borges, J.M.G.D. Costa, F. Queiroz, Thermodynamic properties, kinetics and adsorption mechanisms of swiss cheese bioaroma powder Powder Technol. 272 (2015) 181–188.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] S. Palzer, Agglomeration of pharmaceutical, detergent, chemical and food powders-similarities and differences of materials and processes, Powder Technol. 206 (1–2) (2011) 2–17.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "d2178c40f0c45da6ff3140cf0a39e392ca80ee8339b4c5a4363f0650a5efa5fd",
+      "canonical_cluster_id": "d2178c40",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "刺激响应性淀粉基生物聚合物涂层用于智能和可持续肥料",
+      "doi": "10.3390/gels11090681",
+      "authors": "Babar Azeem",
+      "journal": "Gels",
+      "year": "2025",
+      "pdf_path": "./processed_pdfs/europepmc_PMID_41002456.pdf",
+      "raw_ref_count": 162,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "1. Prabha, M.; Tiwari, P.; Yadav, P.K.; Singh, V.; Tripathi, D.N.; Malviya, T. Biopolymeric starch-based matrix: A sustainable platform for slow release fertilizers. Carbohydr. Res. 2025, 552, 109474. [CrossRef]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "2. Lee, J.H.; Ku, H.H. Optimizing Nitrogen Use Efficiency and Reducing Nutrient Losses in Maize Using Controlled-Release Coated Fertilizers. Agrochemicals 2025, 4, 10. [CrossRef]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "3. Azeem, B. Effect of process parameters on coating mass variability and nitrogen-release kinetics of controlled-release urea granules produced in a Wurster fluidized-bed. Particuology 2025, 98, 67–82. [CrossRef]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "4. Lv, Y.; Cui, Y.; Zhang, W.; Xiang, Y.; Hu, B.; Wei, J.; Bian, H. Preparation and application of water-soluble oxidized starch-based h d l f l l Int. J. Biol. Macromol. 2025 315 [ f] [ b d]",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "5. Goncharuk, O.; Siryk, O.; Fr ˛ac, M.; Guzenko, N.; Samchenko, K.; Terpiłowski, K.; Sternik, D.; Szewczuk-Karpisz, K. Syn thesis, characterization and biocompatibility of hybrid hydrogels based on alginate, κ-carrageenan, and chitosan filled with montmorillonite clav. Int. I. Biol. Macromol. 2024. 278. 134703. [CrossRef]",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "db6b9e8f2140eda847ffb9fecc6baf54d36ec45aa9ae5179021a16ece8d2ebdb",
+      "canonical_cluster_id": "db6b9e8f",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "磷肥生产中包裹油的质量检测方法探讨",
+      "doi": "10.16341/j.cnki.spbmh.000397",
+      "authors": "徐林林",
+      "journal": "硫磷设计与粉体工程",
+      "year": "2019",
+      "pdf_path": "./processed_pdfs/磷肥生产中包裹油的质量检测方法探讨_徐林林.pdf",
+      "raw_ref_count": 3,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "［<sup>1</sup>］ 李永清<sup>．</sup> 复混肥包裹剂的作用与应用［<sup>J</sup>］<sup>．</sup>硫磷设计与粉体工",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "［<sup>2</sup>］ 毕先钧，江 华，殷照江，等<sup>．</sup>硅藻土作包裹剂的缓释复合肥的 研制［<sup>J</sup>］<sup>．</sup>云南师范大学学报( 自然科学版) ，<sup>2004</sup>( <sup>3</sup>) :<sup>20～21</sup>",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "［<sup>3</sup>］ 陈秋雪，石元亮，苏 壮，等<sup>．</sup>化肥防结块剂的类型及应用［<sup>J</sup>］<sup>．</sup> <sub>磷肥与复肥，</sub>2006<sub>(</sub> 6<sub>)</sub> <sub>:</sub> 76～ 79．",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "e541008cbade64e08ac1aa66a139805b26716adbae69f09b6ffd19e72ad4b0d5",
+      "canonical_cluster_id": "e541008c",
+      "partition": "LOCKED_TEST",
+      "doc_type": "book",
+      "title": "有机化学基础知识速记",
+      "doi": "",
+      "authors": "黄福堂",
+      "journal": "",
+      "year": "2005",
+      "pdf_path": "/mnt/ripe/literature_analyzer_data/input_books/有机化学基础知识速记 (黄福堂) (Z-Library).epub",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "e6f0eeaacd21b08232b4668eb6e9d83b24a59cb55df99d6b77a787ae157260ab",
+      "canonical_cluster_id": "e6f0eeaa",
+      "partition": "LOCKED_TEST",
+      "doc_type": "paper",
+      "title": "不同造粒工艺复合肥料理化性质及其作物效应",
+      "doi": "",
+      "authors": "方爽",
+      "journal": "",
+      "year": "2023",
+      "pdf_path": "./processed_pdfs/不同造粒工艺复合肥料理化性质及其作物效应_方爽.pdf",
+      "raw_ref_count": 124,
+      "raw_references_sample": [
+        {
+          "index": 1,
+          "raw_text": "[1] 赵晨光,牛司耘,陈勋,等.复合肥料对茶叶产量、品质及茶园土壤肥力的影响[J].中国农业科技导报, 2022,24(06):206-217.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 2,
+          "raw_text": "[2] 郑秀兴.复合肥料生产工艺的创新发展[J].磷肥与复肥,2021,36(11):1-6.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 3,
+          "raw_text": "[3] 李守芳.复合肥料生产工艺的创新发展探究[J].中国盐业,2022(13):42-46.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 4,
+          "raw_text": "[4] 陈冠霖,赵其国,DansoPrince Ofori,等.包膜型缓/控释肥料研究现状及其在功能农业中的应用展望[J].肥料与健康,2021,48(03):1-6.",
+          "is_short_suspect": false
+        },
+        {
+          "index": 5,
+          "raw_text": "[5] 郝青. 复合肥料的造粒技术及颗粒特性研究[D].山西师范大学,2012.",
+          "is_short_suspect": false
+        }
+      ],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    }
+  ],
+  "negative_control_partition": [
+    {
+      "doc_id": "8d73f8800ac3c066d7fdcf12e9d1c187332d61377dbd75adf8f410b7b79e36c0",
+      "canonical_cluster_id": "8d73f880",
+      "partition": "NEGATIVE_CONTROL",
+      "doc_type": "paper",
+      "title": "复合肥防结块剂的应用",
+      "doi": "",
+      "authors": "朱云芳",
+      "journal": "",
+      "year": "",
+      "pdf_path": "./processed_pdfs/复合肥防结块剂的应用_朱云芳.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "a562003908bf128083a21a7f19db03c9baaceb4462cacbeb51d0e6e48908d775",
+      "canonical_cluster_id": "a5620039",
+      "partition": "NEGATIVE_CONTROL",
+      "doc_type": "paper",
+      "title": "明胶—葡甘聚糖—聚乙烯醇肥料包膜的制备及性能",
+      "doi": "",
+      "authors": "张伟, 李芳, 王强",
+      "journal": "电子学报",
+      "year": "2022",
+      "pdf_path": "./processed_pdfs/明胶—葡甘聚糖—聚乙烯醇肥料包膜的制备及性能_汪兰.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    },
+    {
+      "doc_id": "a93f17408bbbbcfa6592781414eaabd7eacc8f768dc75c58c4839ea6cdfdc649",
+      "canonical_cluster_id": "a93f1740",
+      "partition": "NEGATIVE_CONTROL",
+      "doc_type": "paper",
+      "title": "明胶—葡甘聚糖—聚乙烯醇肥料包膜的制备及性能",
+      "doi": "",
+      "authors": "汪兰",
+      "journal": "",
+      "year": "",
+      "pdf_path": "./processed_pdfs/明胶—葡甘聚糖—聚乙烯醇肥料包膜的制备及性能_汪兰.pdf",
+      "raw_ref_count": 0,
+      "raw_references_sample": [],
+      "annotation_status": "PENDING_EXPERT_ANNOTATION"
+    }
+  ]
+}

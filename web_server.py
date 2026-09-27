@@ -45,7 +45,8 @@ from litreview.library_store import (
     get_dashboard_stratified_stats,
     list_library_documents,
     get_document_full_detail,
-    list_discovery_candidates_paginated
+    list_discovery_candidates_paginated,
+    enrich_document_metadata,
 )
 from litreview.citation_network import (
     query_citation_network,
@@ -1976,7 +1977,7 @@ async def api_audit_events(request: Request) -> JSONResponse:
             conn = sqlite3.connect(cache_db)
             conn.row_factory = sqlite3.Row
             dec_rows = conn.execute("""
-                SELECT d.*, c.canonical_title as title
+                SELECT d.*, c.title as title
                 FROM candidate_decisions d
                 LEFT JOIN discovered_candidates c ON d.candidate_id = c.candidate_id
                 ORDER BY d.decided_at DESC LIMIT 50

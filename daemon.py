@@ -11,6 +11,7 @@ from rich.console import Console
 import pipeline
 import batch_pipeline
 from utils import get_settings, init_dirs
+from litreview.intake_lock import intake_lock, IntakeBusyError
 
 # ── 强前置配置校验 ──────────────────────────────────────────────────────────
 settings = get_settings()
@@ -66,7 +67,8 @@ def send_notification(title, message):
 
 def realtime_job():
     try:
-        processed_count = pipeline.main()
+        with intake_lock(settings.DB_PATH):
+            processed_count = pipeline.main()
         if processed_count == 0:
             # 无新文件时只打印一行淡色日志，降低噪音
             console.print(f"[dim][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 目录扫描完毕，暂无新文件。[/dim]")
@@ -74,6 +76,8 @@ def realtime_job():
             # 有文件处理时保留醒目输出
             console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 实时扫描完成，已处理 {processed_count} 篇文献。[/bold cyan]")
             send_notification("实时文献处理完成", f"已成功处理并归档 {processed_count} 篇新文献。")
+    except IntakeBusyError:
+        console.print("[dim]入库锁被 Web 手动触发的任务占用，本轮跳过。[/dim]")
     except Exception as e:
         console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始执行实时扫描...[/bold cyan]")
         console.print(f"[red]实时处理发生异常: {e}")
@@ -83,7 +87,8 @@ def realtime_job():
 def batch_prepare_job():
     console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始提交 Batch 任务...[/bold cyan]")
     try:
-        report = batch_pipeline.prepare_batch()
+        with intake_lock(settings.DB_PATH):
+            report = batch_pipeline.prepare_batch()
         
         # 静默通知：当且仅当发生新提交、本地解析失败、或向云端 API 提交失败时触发通知
         has_action = report["submitted"] > 0 or report["pdf_parsed_failed"] > 0 or report["submit_failed"] > 0
@@ -97,6 +102,8 @@ def batch_prepare_job():
             send_notification("Batch 任务提交报告", msg)
         else:
             console.print("[dim]无任何待提交或报错文献，守护进程保持静默。")
+    except IntakeBusyError:
+        console.print("[dim]入库锁被 Web 手动触发的任务占用，本轮跳过。[/dim]")
     except Exception as e:
         console.print(f"[red]Batch 提交发生异常: {e}")
         send_notification("Batch 提交异常", f"发生错误:\n{str(e)}")
@@ -143,7 +150,8 @@ def book_intake_job():
 def batch_fetch_job():
     console.print(f"\n[bold cyan][{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始拉取 Batch 结果...[/bold cyan]")
     try:
-        report = batch_pipeline.fetch_batch()
+        with intake_lock(settings.DB_PATH):
+            report = batch_pipeline.fetch_batch()
         
         # 静默通知：仅在从云端成功拉取到结果、或者有云端任务宣布夭折、或者成功导出到知识库时通知
         has_action = report["completed"] > 0 or report["failed"] > 0 or report["exported"] > 0
@@ -157,6 +165,8 @@ def batch_fetch_job():
             send_notification("Batch 拉取与导出报告", msg)
         else:
             console.print("[dim]云端任务处理中或目前无已完成文献，守护进程保持静默。")
+    except IntakeBusyError:
+        console.print("[dim]入库锁被 Web 手动触发的任务占用，本轮跳过。[/dim]")
     except Exception as e:
         console.print(f"[red]Batch 拉取发生异常: {e}")
         send_notification("Batch 拉取异常", f"发生错误:\n{str(e)}")
