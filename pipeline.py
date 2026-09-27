@@ -209,8 +209,10 @@ def main():
                 console.print(f"[yellow]归档 PDF 失败 {filename}, 回退记录原路径: {e}")
                 dest_pdf_path = pdf_path
 
+            # 此处只回写归档路径，状态仍为 COMPLETED；EXPORTED 等 Excel 落盘后统一标记，
+            # 避免「数据库已 EXPORTED 但 Excel 里没有」的孤儿（残留 COMPLETED 可被 Batch 导出补齐）
             with closing(sqlite3.connect(settings.DB_PATH)) as conn, conn:
-                conn.execute("UPDATE papers SET pdf_path=?, status='EXPORTED' WHERE id=?",
+                conn.execute("UPDATE papers SET pdf_path=? WHERE id=?",
                              (dest_pdf_path, doc_id))
 
             # Step 5: 收集 Excel 行（通过深模块自动格式化）
@@ -234,6 +236,11 @@ def main():
     if excel_rows:
         export_to_excel(excel_rows, settings.EXCEL_OUTPUT_PATH)
         console.print(f"[green]✅ 已写入 {len(excel_rows)} 条记录到 {settings.EXCEL_OUTPUT_PATH}")
+
+        # Excel 已落盘，单事务移至导出终态（向量索引只认 EXPORTED，须在建索引前完成）
+        with closing(sqlite3.connect(settings.DB_PATH)) as conn, conn:
+            conn.executemany("UPDATE papers SET status='EXPORTED' WHERE id=?",
+                             [(r["文献ID"],) for r in excel_rows])
 
         # Step 7: 自动就地建立 4096 维 Qwen3 向量索引（云端 SiliconFlow 立即处理，无需等待夜间）
         try:

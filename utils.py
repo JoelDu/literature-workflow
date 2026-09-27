@@ -9,6 +9,8 @@ import time
 import hashlib
 import shutil
 import sqlite3
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -366,31 +368,86 @@ def generate_obsidian_note(
 
 # ── Excel 导出（批量写入，文献ID去重）─────────────────────────────────────────
 
+try:
+    import fcntl as _fcntl  # Linux/macOS；Windows CI 上不可用时退化为无锁
+except ImportError:  # pragma: no cover - 仅 Windows
+    _fcntl = None
+
+
+@contextmanager
+def _excel_lock(excel_path: str):
+    """跨进程独占锁：在同目录的 <excel>.lock 旁路文件上 flock。
+
+    实时管道、Batch 管道、书籍入库可能并发「读-合并-覆盖」同一张总表，不加锁
+    会互相吞掉对方刚写入的行。fcntl 不可用（Windows）时为空操作。
+    """
+    if _fcntl is None:
+        yield
+        return
+    with open(excel_path + ".lock", "a") as lock_f:
+        _fcntl.flock(lock_f.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_f.fileno(), _fcntl.LOCK_UN)
+
+
+def _atomic_write_excel(df: "pd.DataFrame", excel_path: str) -> None:
+    """先写同目录临时文件，再 os.replace 原子替换；写一半崩溃时原文件完好无损。"""
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(excel_path)}.", suffix=".tmp.xlsx",
+        dir=os.path.dirname(os.path.abspath(excel_path)),
+    )
+    os.close(fd)
+    try:
+        df.to_excel(tmp_path, index=False, engine="openpyxl")
+        # mkstemp 默认 0600；沿用原文件权限（新建时按 umask），避免替换后其他用户/同步盘读不了
+        try:
+            if os.path.exists(excel_path):
+                mode = os.stat(excel_path).st_mode & 0o777
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                mode = 0o666 & ~umask
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, excel_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def export_to_excel(rows: list[dict], excel_path: str) -> None:
     """
     将多行数据批量写入 Excel，并与现有数据合并。
     优先根据"文献ID"去重，保留最新记录，完美保留同标题的多版本论文。
+    整个「读-合并-写」过程持有跨进程锁，并以临时文件 + os.replace 原子落盘。
     """
     if not rows:
         return
 
     # 自动创建父目录存放数据文件
-    os.makedirs(os.path.dirname(excel_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(excel_path)), exist_ok=True)
 
     new_df = pd.DataFrame(rows)
-    if os.path.exists(excel_path):
-        existing_df = pd.read_excel(excel_path, engine="openpyxl")
-        combined = pd.concat([existing_df, new_df], ignore_index=True)
-        
-        # 优先用唯一主键"文献ID"去重
-        if "文献ID" in combined.columns:
-            combined = combined.drop_duplicates(subset=["文献ID"], keep="last")
-        elif "标题" in combined.columns:
-            combined = combined.drop_duplicates(subset=["标题"], keep="last")
-            
-        combined.to_excel(excel_path, index=False, engine="openpyxl")
-    else:
-        new_df.to_excel(excel_path, index=False, engine="openpyxl")
+    with _excel_lock(excel_path):
+        if os.path.exists(excel_path):
+            existing_df = pd.read_excel(excel_path, engine="openpyxl")
+            combined = pd.concat([existing_df, new_df], ignore_index=True)
+
+            # 优先用唯一主键"文献ID"去重
+            if "文献ID" in combined.columns:
+                combined = combined.drop_duplicates(subset=["文献ID"], keep="last")
+            elif "标题" in combined.columns:
+                combined = combined.drop_duplicates(subset=["标题"], keep="last")
+
+            _atomic_write_excel(combined, excel_path)
+        else:
+            _atomic_write_excel(new_df, excel_path)
 
 
 def remove_from_excel(doc_ids: list | set, excel_path: str) -> int:
@@ -399,14 +456,15 @@ def remove_from_excel(doc_ids: list | set, excel_path: str) -> int:
         return 0
     id_set = set(doc_ids)
     try:
-        df = pd.read_excel(excel_path, engine="openpyxl")
-        if "文献ID" not in df.columns:
-            return 0
-        initial_len = len(df)
-        df = df[~df["文献ID"].isin(id_set)]
-        removed_count = initial_len - len(df)
-        if removed_count > 0:
-            df.to_excel(excel_path, index=False, engine="openpyxl")
+        with _excel_lock(excel_path):
+            df = pd.read_excel(excel_path, engine="openpyxl")
+            if "文献ID" not in df.columns:
+                return 0
+            initial_len = len(df)
+            df = df[~df["文献ID"].isin(id_set)]
+            removed_count = initial_len - len(df)
+            if removed_count > 0:
+                _atomic_write_excel(df, excel_path)
         return removed_count
     except Exception as e:
         print(f"[Warning] 更新 Excel 异常: {e}")
@@ -464,7 +522,8 @@ def sync_excel_with_db(db_path: str, excel_path: str) -> int:
         })
     os.makedirs(os.path.dirname(excel_path), exist_ok=True)
     df = pd.DataFrame(excel_rows)
-    df.to_excel(excel_path, index=False, engine="openpyxl")
+    with _excel_lock(excel_path):
+        _atomic_write_excel(df, excel_path)
     return len(excel_rows)
 
 
