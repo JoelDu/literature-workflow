@@ -1,5 +1,14 @@
 # 磷化工文献解析器 (Literature Analyzer) - 项目交接文档
 
+## 2026-09-27（第二轮）目标核对修复与发布日志
+
+- 按「功能是否真正可用」核对后分四条线修复并合并：Batch 失败重试上限与额度短事务、综述 `paused_quota` 暂停/自动续跑与溯源闸门、Web/MCP 的 CSRF 与 Host 白名单、入库互斥锁、测试隔离与 CI、容器非 root 运行。详见 [第二轮修复记录](docs/project-purpose-fixes-2026-09-27.md)。
+- 收尾联调：daemon 接入入库锁；修复 enrich 端点 NameError 与审计查询错列；删除 Playwright 兜底；CLI 大纲阶段额度暂停以退出码 75 退出；MCP 大纲阶段暂停的任务可续跑；Web 综述页只读展示 MCP 任务；`REVIEW_TRACK_A_MAX_DOCS` 接入 Settings。
+- ADR-0002/0003 改为「部分实施」（Facade、JobRegistry、统一入库引擎未接入生产入口），见各 ADR 的「实施现状」。
+- 验证：隔离全量测试 497 passed、8 deselected；未发起收费调用，未写生产数据。
+- 21:10 左右（Asia/Shanghai）发布：重启前 MCP 无 running/queued 任务、Web 无任务，daemon 空闲。旧镜像保留为 `lit-analyzer:rollback-20260928`；全量重建 `lit-analyzer:1.0` 并重建容器，容器现以 `app`(uid 1000) 运行，healthy，心跳文件正常更新；6 个关键文件 SHA-256 与工作区一致。用户级 `literature-review-mcp.service` 已重启，`/sse` 与 `/mcp` initialize 均 200，伪造 Host 返回 421。系统级 `literature-web.service` 需 sudo 重启（本次由用户手动执行）。
+- 回滚：`docker tag lit-analyzer:rollback-20260928 lit-analyzer:1.0 && docker compose up -d`，并 `git checkout 3c81af4` 后重启两个服务。
+
 ## 2026-09-27 修复与发布日志
 
 - 完成目的与实现审核的八项修复：实时正文持久化、发现库联合检索、教材嵌入客户端隔离、UTC 配额延期、Web 转发头鉴权、MCP HTTP/SSE 守卫、Web 逐章检查点恢复、真实向量入库状态。
