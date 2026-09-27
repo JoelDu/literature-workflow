@@ -1854,14 +1854,19 @@ class McpServerHost:
             import uvicorn
             from starlette.applications import Starlette
             from starlette.middleware import Middleware
-            from litreview.guard import RemoteAccessGuardMiddleware
+            from litreview.guard import RemoteAccessGuardMiddleware, build_mcp_transport_security
 
             mcp.settings.host = args.host
             mcp.settings.port = args.port
-            if hasattr(mcp.settings, "transport_security") and mcp.settings.transport_security:
-                mcp.settings.transport_security.enable_dns_rebinding_protection = False
-                mcp.settings.transport_security.allowed_hosts = ["*"]
-                mcp.settings.transport_security.allowed_origins = ["*"]
+            # DNS rebinding 防护：Host 只接受 localhost/本机网卡 IP (含 Tailscale、LAN)/本机主机名
+            # 及 REMOTE_ALLOWED_HOSTS；Origin 只接受上述主机与 WEB_CORS_ORIGINS。
+            # 判定口径与 RemoteAccessGuardMiddleware 一致（IP 字面量/单标签名均放行）。REMOTE_ALLOWED_HOSTS=* 显式关闭。
+            mcp.settings.transport_security = build_mcp_transport_security(args.host, args.port)
+            _ts = mcp.settings.transport_security
+            if _ts.enable_dns_rebinding_protection:
+                logger.info(f"🛡️ MCP DNS rebinding 防护已启用 (IP/单标签名/本机主机名 + {len(_ts.allowed_hosts)} 条显式 Host)")
+            else:
+                logger.warning("⚠️ REMOTE_ALLOWED_HOSTS=*：MCP DNS rebinding 防护已关闭")
 
             sse_app = mcp.sse_app()
             http_app = mcp.streamable_http_app()
