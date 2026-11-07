@@ -224,6 +224,17 @@ python review.py baseline-list [--json] # 【基线列表】查看注册表中�
 - **输出格式**：标准论文式章节编号（`1 引言` → `2..N` 正文各章 → `N+1 结论与展望`），末尾 `参考文献` 不编号；不含摘要/关键字块。生成 Markdown（写入 Obsidian `reviews` 目录）的同时，用 pandoc 自动导出同名 `.docx`（导出前去掉 Obsidian wikilink 后缀，参考文献逐条独立成段），Word 导出失败不影响 markdown 主流程。参考文献按 GB/T 7714-2015 的**文献类型标识码**区分，8 种类型各走各的著录格式（见下文「文献类型」一节）。
 - 配置见 `.env.example` 的 litreview 段；嵌入和重排依赖 `SILICONFLOW_API_KEY` / `SILICONFLOW_API_BASE`，生成调用依赖 `OPENAI_API_KEY`；Word 导出依赖系统装有 `pandoc`。
 
+### 表格与公式结构切块试验
+
+可离线预览 RAGFlow 启发的结构切块：表格与正文分流，保留可识别的表题、脚注和章节路径；大表按完整行组拆分、重复表头，公式保持完整并与邻近正文合并。该模式不调用模型、不写数据库，默认生产索引仍使用原算法。
+
+```bash
+python -m litreview.chunk_preview /path/to/mineru/full.md
+python -m litreview.chunk_preview /path/to/mineru/full.md --table-chunk-size 2500 --output /tmp/chunks-preview.json
+```
+
+输出比较新旧块数、字符预算、小数断行及结构碎片，并可保存新块与来源文本偏移。`--output` 必须是新文件；遇到不安全的超长结构或不配平公式，退出码为 2、状态为 `needs_source_review`，不会静默丢弃内容。偏移针对清洗后的 Markdown，不是 PDF 页码/bbox。表头推断标记、完整表回退警告一并记录，需人工核查。试验来源与适用边界见 [研究笔记](docs/research/ragflow-evaluation-2026-10-12.md)。
+
 ### 📖 教材/书籍入库（轻量检索语料）
 
 教材、图书可作为**检索语料**加入文献库，供 `search` 与综述引用——但**不做 LLM 全文分析、不生成 Obsidian 笔记**（省钱），解析成文本入检索库、抽图入 `paper_assets`（综述可引用教材里的图）、并写一行 Excel。支持 **PDF**（走 MinerU）与 **EPUB**（走 pandoc，无需 MinerU），按扩展名自动分流：

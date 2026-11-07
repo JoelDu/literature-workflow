@@ -106,8 +106,15 @@ def _tail_overlap(text: str, overlap: int) -> str:
     return tail
 
 
-def split_markdown(doc_id: str, md: str, chunk_size: int = 1000, overlap: int = 150) -> list:
+def split_markdown(doc_id: str, md: str, chunk_size: int = 1000, overlap: int = 150,
+                   *, strategy: str = "legacy", max_chars: int = 5000,
+                   table_chunk_size: int | None = None) -> list:
     """清洗后按标题分节、递归切分为带重叠的 Chunk 列表。"""
+    if strategy == "structured":
+        from .structured_chunker import split_structured
+        return split_structured(doc_id, md, chunk_size, overlap, max_chars, table_chunk_size)
+    if strategy != "legacy":
+        raise ValueError(f"Unknown chunk strategy: {strategy}")
     text = clean_markdown(md)
     if not text:
         return []
